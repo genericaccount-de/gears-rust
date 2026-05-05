@@ -74,30 +74,30 @@ STANDARDS ALIGNMENT:
 
 `serverless-runtime-sdk` is the single engine-agnostic, stable Rust library of the
 CyberFabric Serverless Runtime module. It defines the types and traits shared by the
-host and by runtime plugins.
+host and by runtime adapters.
 
 The invocation flow:
 
 ```mermaid
 flowchart LR
     host([host])
-    plugin([runtime plugin])
+    adapter([runtime adapter])
     user([user handler])
 
-    host -- "call via RuntimeAdapter" --> plugin
-    plugin -- "call via FunctionHandler / WorkflowHandler" --> user
-    plugin -. "index events via ServerlessRuntimeClient" .-> host
+    host -- "call via RuntimeAdapter" --> adapter
+    adapter -- "call via FunctionHandler / WorkflowHandler" --> user
+    adapter -. "index events via ServerlessRuntimeClient" .-> host
 ```
 
 **Traits — who implements, who calls:**
 
 | Trait | Implemented by | Called by |
 |---|---|---|
-| `RuntimeAdapter` | runtime plugin | host |
-| `ServerlessRuntimeClient` | host | plugin (to emit index-update events) |
-| `FunctionHandler<I, O>` / `WorkflowHandler<I, O>` | runtime plugin (wraps the function author's authoring asset) | plugin |
+| `RuntimeAdapter` | runtime adapter | host |
+| `ServerlessRuntimeClient` | host | adapter (to emit index-update events) |
+| `FunctionHandler<I, O>` / `WorkflowHandler<I, O>` | runtime adapter (wraps the function author's authoring asset) | adapter |
 
-> **Note on "who implements `FunctionHandler`".** The `impl FunctionHandler<I, O> for …` lives inside the runtime plugin: the plugin provides a Rust type that wraps a function author's authoring asset (a Starlark script, a Rust activity fn, a compiled WASM module, a deployed Lambda function, …) and executes it from inside `call`. Function authors do not implement SDK traits directly; they author in the plugin's own authoring model and the plugin bridges that into a `FunctionHandler`. A plugin could expose `FunctionHandler` directly as its authoring model for power users, but that's a minority case.
+> **Note on "who implements `FunctionHandler`".** The `impl FunctionHandler<I, O> for …` lives inside the runtime adapter: the adapter provides a Rust type that wraps a function author's authoring asset (a Starlark script, a Rust activity fn, a compiled WASM module, a deployed Lambda function, …) and executes it from inside `call`. Function authors do not implement SDK traits directly; they author in the adapter's own authoring model and the adapter bridges that into a `FunctionHandler`. An adapter could expose `FunctionHandler` directly as its authoring model for power users, but that's a minority case.
 
 **Shared domain** (used across all three parties): `InvocationRecord`,
 `CompensationContext`, `RuntimeErrorCategory`, `RuntimeErrorPayload`, `RetryPolicy`,
@@ -109,19 +109,19 @@ flowchart LR
 
 **Other modules**: `environment` (the `Environment` trait with a standard
 `CredStoreEnvironment` implementation for synchronous config/secret access), `trace`
-(plugin-only helper that emits `TimelineEventType` events around handler calls).
+(adapter-only helper that emits `TimelineEventType` events around handler calls).
 
 Invocation plumbing (`Context` construction from `InvocationRecord`, `Environment`
 population from the credstore, typed handler-input deserialisation) is performed by each
-runtime plugin using its backend-native primitives. This SDK does not centralise a
+runtime adapter using its backend-native primitives. This SDK does not centralise a
 `dispatch` helper; uniform user-visible semantics are enforced by the typed contracts
 in this crate (trait shapes, error mapping, timeline event taxonomy) together with
-per-plugin integration tests.
+per-adapter integration tests.
 
-Workflow checkpointing, suspend/resume, and step-level compensation are plugin-specific
-concerns — each plugin uses its backend's native compensation primitives (Temporal saga
+Workflow checkpointing, suspend/resume, and step-level compensation are adapter-specific
+concerns — each adapter uses its backend's native compensation primitives (Temporal saga
 patterns, SQS DLQ + compensation queue, Azure Durable compensation activities, etc.) and
-these are out of scope for this crate. Plugins write checkpoints; the SDK only reads
+these are out of scope for this crate. Adapters write checkpoints; the SDK only reads
 checkpoint state during compensation via `CompensationInput.workflow_state_snapshot`.
 
 ### 1.2 Background / Problem Statement
@@ -162,9 +162,9 @@ _Baseline: module is new (no prior implementation). All targets apply at first s
 | **FunctionHandler** | A Rust type that implements the `FunctionHandler<I, O>` trait to service function invocations. |
 | **WorkflowHandler** | A `FunctionHandler` that additionally implements compensation for durable workflow rollback. |
 | **Context** | Read-only invocation metadata (ID, tenant, attempt, deadline) derived from `InvocationRecord`. |
-| **Environment** | Abstraction over configuration and secret access for a handler invocation. |
-| **Compensation** | The rollback contract for durable workflows in CyberFabric. Two layers: function-level compensation is implemented by the adapter author via `WorkflowHandler::compensate` and invoked by the platform as a standard invocation with a `CompensationInput` payload; step-level compensation (sub-step rollback within a workflow execution) is owned by the runtime plugin using its backend's native compensation primitives, not the SDK. |
-| **Runtime Plugin (Adapter)** | A CyberFabric runtime plugin crate that implements the `RuntimeAdapter` trait from this SDK and drives handlers. Each plugin uses its backend's native primitives (Temporal signals/schedules, cloud-FaaS workflows, etc.) for invocation, scheduling, and event-triggered dispatch. |
+| **Environment** | Read-only abstraction over configuration and secret access for a handler invocation. |
+| **Compensation** | The rollback contract for durable workflows in CyberFabric. Two layers: function-level compensation is implemented by the adapter author via `WorkflowHandler::compensate` and invoked by the platform as a standard invocation with a `CompensationInput` payload; step-level compensation (sub-step rollback within a workflow execution) is owned by the runtime adapter using its backend's native compensation primitives, not the SDK. |
+| **Runtime Adapter** | A CyberFabric runtime adapter crate that implements the `RuntimeAdapter` trait from this SDK and drives handlers. Each adapter uses its backend's native primitives (Temporal signals/schedules, cloud-FaaS workflows, etc.) for invocation, scheduling, and event-triggered dispatch. |
 | **GTS ID** | An opaque Global Type System identifier string; the SDK carries these as `String` without interpretation. |
 | **Timeline Event** | A structured tracing event mapping to `InvocationTimelineEvent` in the runtime domain. |
 
@@ -233,18 +233,18 @@ _Baseline: module is new (no prior implementation). All targets apply at first s
 
 **Traits**:
 
-- `RuntimeAdapter` — *implemented by each runtime plugin, called by the host*.
+- `RuntimeAdapter` — *implemented by each runtime adapter, called by the host*.
   Methods for invocation, control (cancel/suspend/resume), schedule, and event-trigger.
-- `ServerlessRuntimeClient` — *implemented by the host, called by plugins* to emit
+- `ServerlessRuntimeClient` — *implemented by the host, called by adapters* to emit
   events for the lightweight invocation index (invocation_id, function_id, adapter,
   tenant, owner, status, timestamps, error summary).
-- `FunctionHandler<I, O>` — *implemented by the runtime plugin (wrapping the function
-  author's authoring asset), called by the plugin*. Contract for stateless function
+- `FunctionHandler<I, O>` — *implemented by the runtime adapter (wrapping the function
+  author's authoring asset), called by the adapter*. Contract for stateless function
   invocations.
-- `WorkflowHandler<I, O>` — *implemented by the runtime plugin (wrapping the function
-  author's authoring asset), called by the plugin*. Extends `FunctionHandler` with
+- `WorkflowHandler<I, O>` — *implemented by the runtime adapter (wrapping the function
+  author's authoring asset), called by the adapter*. Extends `FunctionHandler` with
   compensation.
-- `Environment` — *implemented by the plugin (via `CredStoreEnvironment` or a custom
+- `Environment` — *implemented by the adapter (via `CredStoreEnvironment` or a custom
   impl), called from inside the `FunctionHandler::call` execution* for synchronous
   config and secret access.
 
@@ -257,7 +257,7 @@ _Baseline: module is new (no prior implementation). All targets apply at first s
 
 **Other modules**:
 
-- `trace` module — plugin-only instrumentation utilities that emit
+- `trace` module — adapter-only instrumentation utilities that emit
   `tracing` spans and `TimelineEventType` events.
 
 ### 4.2 Out of Scope
@@ -267,17 +267,17 @@ _Baseline: module is new (no prior implementation). All targets apply at first s
 - `TenantRuntimePolicy`, `Schedule`, `Trigger`, `Webhook` — owned by the runtime (host).
 - Retry *execution* — the `RetryPolicy` *type* (max attempts, backoff, non-retryable
   error classification) is in scope and exported from this SDK's `domain` module so every
-  plugin honours it consistently, but actually *applying* the policy — scheduling retries,
-  dead-lettering after exhaustion — is performed by each plugin using its backend-native
+  adapter honours it consistently, but actually *applying* the policy — scheduling retries,
+  dead-lettering after exhaustion — is performed by each adapter using its backend-native
   retry mechanism (Temporal retry policy, SQS retry + DLQ, Step Functions catcher, etc.).
   The SDK also exposes `attempt_number` in `Context` so handlers can be retry-aware.
-- Durability primitives for in-process runtimes (Starlark, WASM) — in-process plugins
+- Durability primitives for in-process runtimes (Starlark, WASM) — in-process adapters
   that lack native durable timers, event signals, or checkpointing will consume a shared
-  plugin-level helper crate (out of scope for this SDK). Keeping those primitives outside
-  the SDK scopes the complexity to the plugins that need it instead of forcing every
-  plugin to depend on a runtime-neutral substrate.
+  adapter-level helper crate (out of scope for this SDK). Keeping those primitives outside
+  the SDK scopes the complexity to the adapters that need it instead of forcing every
+  adapter to depend on a runtime-neutral substrate.
 - `JobTransport` and `ExecutionContext` host-callback abstractions — explicitly excluded
-  per `cpt-cf-serverless-runtime-adr-thin-host`. Plugins are autonomous; the host dispatches
+  per `cpt-cf-serverless-runtime-adr-thin-host`. Adapters are autonomous; the host dispatches
   through `dyn RuntimeAdapter` and receives index updates through `ServerlessRuntimeClient`.
 
 
@@ -327,7 +327,7 @@ returning success or a `ServerlessSdkError`.
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-fr-compensation-input`
 
 The crate MUST provide a `CompensationInput` struct that carries all fields from the runtime's
-`CompensationContext` (`gts.x.core.sless.compensation_context.v1~`) required for
+`CompensationContext` (`gts.cf.core.sless.compensation_context.v1~`) required for
 idempotent rollback: `trigger`, `original_workflow_invocation_id`, `failed_step_id`,
 `failed_step_error` (typed: `error_type`, `message`, `error_metadata`),
 `workflow_state_snapshot`, `timestamp`, `function_id`,
@@ -385,8 +385,9 @@ and query the remaining time before forced termination.
 
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-fr-environment-trait`
 
-The SDK MUST provide an `Environment` trait for synchronous key-based access to
-configuration values and secrets, populated before each invocation. The SDK MUST
+The SDK MUST provide an `Environment` trait for synchronous, **read-only**
+key-based access to configuration values and secrets, populated before each
+invocation. The SDK MUST
 provide a standard `Environment` implementation backed by the platform credstore
 (`CredStoreClientV1`). Custom `Environment` implementations remain possible for
 testing or non-standard secret sources.
@@ -462,13 +463,13 @@ SDK consumers.
 
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-sdk-fr-conformance-suite`
 
-The crate MUST ship an adapter conformance test suite that every runtime plugin runs
+The crate MUST ship an adapter conformance test suite that every runtime adapter runs
 against its `RuntimeAdapter` implementation. Coverage MUST include: invocation status
 transitions, retry semantics, compensation triggering, suspension/resume visibility,
 and error taxonomy.
 
 - **Rationale**: Required by `cpt-cf-serverless-runtime-adr-thin-host`. With invocation,
-  scheduling, retry, and compensation execution distributed across plugins, the conformance
+  scheduling, retry, and compensation execution distributed across adapters, the conformance
   suite is the load-bearing mechanism for guaranteeing uniform user-visible semantics
   across backends.
 - **Actors**: `cpt-cf-serverless-runtime-sdk-actor-adapter-dev`

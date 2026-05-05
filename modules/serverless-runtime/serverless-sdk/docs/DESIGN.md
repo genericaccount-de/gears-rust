@@ -313,7 +313,7 @@ The SDK constructs `Context` from the record before calling the handler via
 #### CompensationContext → CompensationInput Field Mapping
 
 `CompensationInput` is the SDK's projection of the runtime's `CompensationContext`
-(`gts.x.core.sless.compensation_context.v1~`). The adapter deserialises the
+(`gts.cf.core.sless.compensation_context.v1~`). The adapter deserialises the
 runtime's JSON envelope and populates this struct.
 
 | `CompensationInput` field | Source in Runtime's `CompensationContext` | Type |
@@ -344,9 +344,9 @@ Adapters use this mapping to produce the correct `RuntimeErrorPayload` from a
 
 | `ServerlessSdkError` | `RuntimeErrorCategory` | GTS Error Type Hint |
 |----------------------|------------------------|---------------------|
-| `UserError(msg)` | `NonRetryable` | `gts.x.core.sless.err.v1~x.core.sless.err.validation.v1~` |
-| `InvalidInput(msg)` | `NonRetryable` | `gts.x.core.sless.err.v1~x.core.sless.err.validation.v1~` |
-| `Timeout` | `Timeout` | `gts.x.core.sless.err.v1~x.core.sless.err.runtime_timeout.v1~` |
+| `UserError(msg)` | `NonRetryable` | `gts.cf.core.sless.err.v1~cf.core.sless.err.validation.v1~` |
+| `InvalidInput(msg)` | `NonRetryable` | `gts.cf.core.sless.err.v1~cf.core.sless.err.validation.v1~` |
+| `Timeout` | `Timeout` | `gts.cf.core.sless.err.v1~cf.core.sless.err.runtime_timeout.v1~` |
 | `NotSupported(msg)` | `NonRetryable` | adapter-defined |
 | `Internal(msg)` | `Retryable` | adapter-defined |
 
@@ -841,7 +841,7 @@ This crate is the single shared SDK of the serverless-runtime module. It owns bo
 - **Projections used by handler code**:
   - `Context` is a projection of `InvocationRecord`.
   - `CompensationInput` is a projection of `CompensationContext`
-    (`gts.x.core.sless.compensation_context.v1~`).
+    (`gts.cf.core.sless.compensation_context.v1~`).
   - `ServerlessSdkError` variants map to `RuntimeErrorCategory` values (see §3.1).
   - `trace.rs` timeline events correspond to `TimelineEventType` values.
 
