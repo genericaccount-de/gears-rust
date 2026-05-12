@@ -543,6 +543,7 @@ mod tests {
             policy_version_applied: 1,
             web_search_calls: 0,
             code_interpreter_calls: 0,
+            file_search_calls: 0,
             timestamp: OffsetDateTime::now_utc(),
             requester_type: "user".to_owned(),
             dedupe_key: None,

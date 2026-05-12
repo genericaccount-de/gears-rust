@@ -11,8 +11,8 @@ use crate::domain::repos::{
 };
 use crate::domain::service::test_helpers::{
     MockThreadSummaryRepo, NoopOutboxEnqueuer, inmem_db, mock_db_provider, mock_enforcer,
-    mock_model_resolver, mock_tenant_only_enforcer, mock_thread_summary_repo, test_security_ctx,
-    test_security_ctx_with_id,
+    mock_model_resolver, mock_provider_resolver, mock_tenant_only_enforcer,
+    mock_thread_summary_repo, test_security_ctx, test_security_ctx_with_id,
 };
 use crate::infra::db::repo::attachment_repo::AttachmentRepository as OrmAttachmentRepository;
 use crate::infra::db::repo::chat_repo::ChatRepository as OrmChatRepository;
@@ -43,6 +43,7 @@ fn build_chat_service(
         Arc::new(NoopOutboxEnqueuer),
         mock_enforcer(),
         mock_model_resolver(),
+        mock_provider_resolver(),
     )
 }
 

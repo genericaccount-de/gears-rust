@@ -75,6 +75,8 @@ pub struct UpdatePreflightParams {
 pub enum ToolCallType {
     WebSearch,
     CodeInterpreter,
+    /// Knowledge search (RAG) via the `search_knowledge` function tool.
+    FileSearch,
 }
 
 /// Repository trait for turn persistence operations.

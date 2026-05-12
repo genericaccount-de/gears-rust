@@ -194,12 +194,21 @@ pub struct FileSearchResult {
 }
 
 /// An output item from the provider response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OutputItem {
     #[serde(default)]
     pub r#type: String,
     #[serde(default)]
     pub content: Vec<ResponseContentPart>,
+    /// Present on `type == "function_call"` items.
+    #[serde(default)]
+    pub call_id: Option<String>,
+    /// Present on `type == "function_call"` items.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// JSON-encoded arguments string. Present on `type == "function_call"` items.
+    #[serde(default)]
+    pub arguments: Option<String>,
 }
 
 /// A content part within an output item.
@@ -505,6 +514,45 @@ pub(super) fn translate_provider_event(
         }
 
         ProviderEvent::ResponseCompleted { response } => {
+            // Check for function_call output items first (agentic loop).
+            // The Responses API embeds function calls as output items of
+            // type "function_call" rather than via a separate SSE event.
+            for item in &response.output {
+                if item.r#type == "function_call"
+                    && let (Some(call_id), Some(name)) = (&item.call_id, &item.name)
+                {
+                    let raw_args = item.arguments.as_deref().unwrap_or("{}");
+                    // Surface malformed arguments as a provider protocol
+                    // error rather than silently coercing to `{}` — that
+                    // would route the tool call to the wrong inputs (e.g.
+                    // `search_knowledge` querying an empty string instead
+                    // of failing the turn).
+                    let input: serde_json::Value = match serde_json::from_str(raw_args) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return TranslatedEvent::Terminal(TerminalOutcome::Failed {
+                                error: LlmProviderError::InvalidResponse {
+                                    detail: format!(
+                                        "function_call arguments were not valid JSON: {e}"
+                                    ),
+                                },
+                                usage: Some(response.usage.to_usage()),
+                                partial_content: accumulated_text.to_owned(),
+                            });
+                        }
+                    };
+                    tracing::debug!(
+                        call_id = %call_id,
+                        name = %name,
+                        "provider signalled function call -- starting agentic loop iteration"
+                    );
+                    return TranslatedEvent::Terminal(TerminalOutcome::ToolUse {
+                        tool_use_id: call_id.clone(),
+                        name: name.clone(),
+                        input,
+                    });
+                }
+            }
             let citations = extract_citations(response, accumulated_text);
             let usage = response.usage.to_usage();
             let raw = serde_json::to_value(response).unwrap_or_default();
@@ -659,8 +707,16 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
             })
         })
         .collect();
-    if !input.is_empty() {
-        body["input"] = serde_json::Value::Array(input);
+    // Append raw input items (function_call + function_call_output for agentic loop).
+    let combined_input = if request.raw_input_items.is_empty() {
+        input
+    } else {
+        let mut combined = input;
+        combined.extend(request.raw_input_items.iter().cloned());
+        combined
+    };
+    if !combined_input.is_empty() {
+        body["input"] = serde_json::Value::Array(combined_input);
     }
 
     if let Some(ref instructions) = request.system_instructions {
@@ -684,11 +740,11 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
         body["metadata"] = serde_json::to_value(metadata).unwrap_or_default();
     }
 
-    // Map tools: FileSearch → file_search, WebSearch → web_search, Function → drop
+    // Map tools: FileSearch → file_search, WebSearch → web_search, Function → function
     let tools: Vec<serde_json::Value> = request
         .tools
         .iter()
-        .filter_map(|tool| match tool {
+        .map(|tool| match tool {
             LlmTool::FileSearch {
                 vector_store_ids,
                 filters,
@@ -706,49 +762,70 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
                 if let Some(n) = max_num_results {
                     tool["max_num_results"] = serde_json::json!(n);
                 }
-                Some(tool)
+                tool
             }
             LlmTool::WebSearch {
                 search_context_size,
-            } => Some(serde_json::json!({
+            } => serde_json::json!({
                 "type": "web_search",
                 "search_context_size": search_context_size
-            })),
-            LlmTool::CodeInterpreter { file_ids } => Some(serde_json::json!({
+            }),
+            LlmTool::CodeInterpreter { file_ids } => serde_json::json!({
                 "type": "code_interpreter",
                 "container": {
                     "type": "auto",
                     "file_ids": file_ids
                 }
-            })),
-            LlmTool::Function { name, .. } => {
-                debug!(tool_name = %name, "Function tool not supported by Responses API, dropping");
-                None
-            }
+            }),
+            LlmTool::Function {
+                name,
+                description,
+                parameters,
+            } => serde_json::json!({
+                "type": "function",
+                "name": name,
+                "description": description,
+                "parameters": parameters
+            }),
         })
         .collect();
     if !tools.is_empty() {
         body["tools"] = serde_json::Value::Array(tools);
     }
 
-    // Merge additional params
+    // Inference params from the typed model-policy channel. The Responses API
+    // wraps reasoning effort under `reasoning: { effort }` rather than using
+    // the Chat Completions–style top-level `reasoning_effort`.
+    if let Some(p) = request.api_params.as_ref() {
+        body["temperature"] = serde_json::json!(p.temperature);
+        body["top_p"] = serde_json::json!(p.top_p);
+        body["frequency_penalty"] = serde_json::json!(p.frequency_penalty);
+        body["presence_penalty"] = serde_json::json!(p.presence_penalty);
+        if !p.stop.is_empty() {
+            body["stop"] = serde_json::json!(&p.stop);
+        }
+        if let Some(ref effort) = p.reasoning_effort {
+            body["reasoning"] = serde_json::json!({ "effort": effort });
+        }
+        // `extra_body` is merged at the top level; policy author's escape
+        // hatch for fields not covered by `ModelApiParams`.
+        if let Some(ref extra) = p.extra_body
+            && let (Some(body_obj), Some(extra_obj)) = (body.as_object_mut(), extra.as_object())
+        {
+            for (k, v) in extra_obj {
+                body_obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+
+    // Adapter-specific extras (e.g. fields outside the typed `api_params`
+    // surface). Merged last so it takes precedence on key collision.
     if let Some(ref extra) = request.additional_params
         && let (Some(body_obj), Some(extra_obj)) = (body.as_object_mut(), extra.as_object())
     {
         for (k, v) in extra_obj {
             body_obj.insert(k.clone(), v.clone());
         }
-    }
-
-    // Responses API uses `reasoning: { effort: "..." }` instead of the
-    // top-level `reasoning_effort` key used by Chat Completions.
-    if let Some(body_obj) = body.as_object_mut()
-        && let Some(effort) = body_obj.remove("reasoning_effort")
-    {
-        body_obj.insert(
-            "reasoning".to_owned(),
-            serde_json::json!({ "effort": effort }),
-        );
     }
 
     body

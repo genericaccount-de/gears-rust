@@ -16,8 +16,8 @@ use crate::domain::repos::{
 };
 use crate::domain::service::test_helpers::{
     MockThreadSummaryRepo, NoopOutboxEnqueuer, inmem_db, mock_db_provider, mock_enforcer,
-    mock_model_resolver, mock_tenant_only_enforcer, mock_thread_summary_repo, test_security_ctx,
-    test_security_ctx_with_id,
+    mock_model_resolver, mock_provider_resolver, mock_tenant_only_enforcer,
+    mock_thread_summary_repo, test_security_ctx, test_security_ctx_with_id,
 };
 use crate::infra::db::entity::attachment::{
     ActiveModel as AttAm, AttachmentKind, AttachmentStatus, Entity as AttEntity,
@@ -52,6 +52,7 @@ fn build_chat_service(
         Arc::new(NoopOutboxEnqueuer),
         mock_enforcer(),
         mock_model_resolver(),
+        mock_provider_resolver(),
     )
 }
 
@@ -97,6 +98,7 @@ fn build_chat_service_tenant_only_authz(
         Arc::new(NoopOutboxEnqueuer),
         mock_tenant_only_enforcer(),
         mock_model_resolver(),
+        mock_provider_resolver(),
     )
 }
 
@@ -590,6 +592,11 @@ async fn insert_attachment(
         cleanup_attempts: Set(0),
         last_cleanup_error: Set(None),
         cleanup_updated_at: Set(None),
+        secondary_file_id: Set(None),
+        secondary_status: Set(
+            crate::infra::db::entity::attachment::SecondaryUploadStatus::NotAttempted,
+        ),
+        secondary_provider_kind: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
         deleted_at: Set(None),

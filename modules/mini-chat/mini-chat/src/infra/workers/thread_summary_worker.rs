@@ -387,6 +387,7 @@ impl LeasedMessageHandler for ThreadSummaryHandler {
                         policy_version_applied: 0,
                         web_search_calls: 0,
                         code_interpreter_calls: 0,
+                        file_search_calls: 0,
                         timestamp: time::OffsetDateTime::now_utc(),
                         requester_type: "system".to_owned(),
                         dedupe_key: Some(format!(

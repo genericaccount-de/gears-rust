@@ -62,6 +62,11 @@ pub struct MiniChatMetricsMeter {
     // ── P1: Tool call counters ──────────────────────────────────────────
     code_interpreter_calls: Counter<u64>,
 
+    // ── P1: Knowledge Search ───────────────────────────────────────────
+    knowledge_search: Counter<u64>,
+    knowledge_search_latency_ms: Histogram<f64>,
+    knowledge_search_chunks: Histogram<f64>,
+
     // ════════════════════════════════════════════════════════════════════
     // DEFERRED INSTRUMENTS — declared but not wired to the domain port.
     // ════════════════════════════════════════════════════════════════════
@@ -147,6 +152,7 @@ pub struct MiniChatMetricsMeter {
     #[allow(dead_code)] // gauge is recorded but not read back; the OTel SDK exports it
     cleanup_backlog: Gauge<i64>,
     cleanup_vs_with_failed_attachments: Counter<u64>,
+    secondary_cleanup_skipped: Counter<u64>,
 
     // ── P3: Summary regen (deferred) ──
     #[allow(dead_code)]
@@ -339,6 +345,20 @@ impl MiniChatMetricsMeter {
                 .with_description("Code interpreter call completions")
                 .build(),
 
+            // ── P1: Knowledge Search ───────────────────────────────────
+            knowledge_search: meter
+                .u64_counter(format!("{prefix}_knowledge_search"))
+                .with_description("Knowledge search (RAG) call outcomes")
+                .build(),
+            knowledge_search_latency_ms: meter
+                .f64_histogram(format!("{prefix}_knowledge_search_latency_ms"))
+                .with_description("Knowledge search call latency (ms)")
+                .build(),
+            knowledge_search_chunks: meter
+                .f64_histogram(format!("{prefix}_knowledge_search_chunks"))
+                .with_description("Chunks returned per knowledge search call")
+                .build(),
+
             // ════════════════════════════════════════════════════════════
             // DEFERRED INSTRUMENTS
             // ════════════════════════════════════════════════════════════
@@ -501,6 +521,13 @@ impl MiniChatMetricsMeter {
                     "{prefix}_cleanup_vector_store_with_failed_attachments"
                 ))
                 .with_description("Vector store deletions with at least one failed attachment")
+                .build(),
+            secondary_cleanup_skipped: meter
+                .u64_counter(format!("{prefix}_secondary_cleanup_skipped"))
+                .with_description(
+                    "Secondary-provider cleanup skipped because the corresponding client is not \
+                     configured (permanent orphan upstream)",
+                )
                 .build(),
 
             // deferred: summary feature not implemented
@@ -905,6 +932,28 @@ impl MiniChatMetricsPort for MiniChatMetricsMeter {
 
     fn record_cleanup_vs_with_failed_attachments(&self) {
         self.cleanup_vs_with_failed_attachments.add(1, &[]);
+    }
+
+    fn record_secondary_cleanup_skipped(&self, provider_kind: &str) {
+        self.secondary_cleanup_skipped.add(
+            1,
+            &[KeyValue::new(key::PROVIDER_KIND, provider_kind.to_owned())],
+        );
+    }
+
+    // ── P1: Knowledge Search ─────────────────────────────────────────
+
+    fn record_knowledge_search(&self, result: &str) {
+        self.knowledge_search
+            .add(1, &[KeyValue::new(key::RESULT, result.to_owned())]);
+    }
+
+    fn record_knowledge_search_latency_ms(&self, ms: f64) {
+        self.knowledge_search_latency_ms.record(ms, &[]);
+    }
+
+    fn record_knowledge_search_chunks(&self, count: f64) {
+        self.knowledge_search_chunks.record(count, &[]);
     }
 }
 

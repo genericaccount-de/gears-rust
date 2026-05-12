@@ -1,3 +1,11 @@
+#![allow(
+    clippy::doc_markdown,
+    clippy::map_unwrap_or,
+    clippy::redundant_closure_for_method_calls,
+    clippy::cast_precision_loss,
+    clippy::non_ascii_literal
+)]
+
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -7,6 +15,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, warn};
 
 use crate::domain::llm::ToolPhase;
+use crate::domain::ports::knowledge_retriever::{
+    KnowledgeRetriever, RetrievalRequest, RetrievedChunk,
+};
 use crate::domain::ports::metric_labels::{stage, trigger};
 use crate::domain::repos::{MessageRepository, ToolCallType, TurnRepository};
 use crate::domain::stream_events::{DoneData, ErrorData, StreamEvent};
@@ -22,6 +33,23 @@ use super::types::{
     ActiveStreamGuard, FinalizationCtx, PROGRESS_UPDATE_INTERVAL, StreamOutcome, StreamTerminal,
     determine_features, normalize_error,
 };
+
+/// Parameters for knowledge search (RAG) within the agentic loop.
+pub(super) struct KnowledgeSearchParams {
+    pub retriever: Arc<dyn KnowledgeRetriever>,
+    pub vector_store_id: String,
+    /// Pre-resolved OAGW upstream alias for the knowledge provider.
+    pub upstream_alias: String,
+    pub api_version: String,
+    pub top_k: usize,
+    pub max_calls: u32,
+    /// Maximum characters kept per chunk after post-processing (text truncation).
+    pub max_chunk_chars: usize,
+    /// When `true`, format chunks as a JSON array of `search_result` blocks
+    /// (required by Anthropic Messages API for citations). When `false`, use
+    /// plain `[SOURCE_N]` text labels (OpenAI / Azure providers).
+    pub use_search_result_blocks: bool,
+}
 
 /// Model and provider configuration for a single provider task invocation.
 #[domain_model]
@@ -39,6 +67,12 @@ pub(super) struct ProviderTaskConfig {
     pub code_interpreter_max_calls: u32,
     pub api_params: mini_chat_sdk::ModelApiParams,
     pub provider_file_id_map: std::collections::HashMap<String, crate::domain::llm::AttachmentRef>,
+    /// `provider_file_id → anthropic_file_id` lookup for chat attachments
+    /// uploaded to Anthropic Files API. Forwarded to the Anthropic adapter
+    /// via `LlmRequest::anthropic_file_ids`. Empty for non-Anthropic chats.
+    pub anthropic_file_ids: std::collections::HashMap<String, String>,
+    /// Knowledge search parameters; `None` when the feature is disabled.
+    pub knowledge_search: Option<KnowledgeSearchParams>,
 }
 
 /// All five terminal paths (provider done, incomplete, provider error,
@@ -72,6 +106,8 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
         code_interpreter_max_calls,
         api_params,
         provider_file_id_map,
+        anthropic_file_ids,
+        knowledge_search,
     } = config;
 
     let span = if let Some(ref fctx) = fin_ctx {
@@ -101,17 +137,125 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
             None
         };
 
+        // ── Agentic-level mutable state (persists across search_knowledge iterations) ──
+        let mut accumulated_text = String::new();
+        let mut cancelled = false;
+        let mut web_search_call_count: u32 = 0;
+        let mut web_search_completed_count: u32 = 0;
+        let mut code_interpreter_call_count: u32 = 0;
+        let mut code_interpreter_completed_count: u32 = 0;
+        // raw_input_items grows with each search_knowledge call/output pair.
+        let mut raw_input_items: Vec<serde_json::Value> = Vec::new();
+        let mut knowledge_call_count: u32 = 0;
+
+        // Hard cap on agentic-loop iterations. Without it, a model that keeps
+        // emitting `search_knowledge` after the soft per-message limit fires
+        // would loop forever (each iteration injects another "limit reached"
+        // notice but never terminates). The cap is `max_calls + 2`: the
+        // searches themselves, plus one buffer iteration so the model can
+        // summarise after the soft notice, plus one more in case the model
+        // ignores the notice once. Iterations beyond that are forced into
+        // a `Failed` terminal via `agentic_iterations_exceeded` below.
+        //
+        // When knowledge_search is None the loop body always returns inside
+        // the first iteration (any ToolUse falls through to `unexpected_tool_use`),
+        // so the cap is effectively 1.
+        let max_agentic_iterations: u32 = knowledge_search
+            .as_ref()
+            .map_or(1, |ks| ks.max_calls.saturating_add(2));
+        let mut agentic_iteration: u32 = 0;
+
+        'agentic: loop {
+            agentic_iteration = agentic_iteration.saturating_add(1);
+            if agentic_iteration > max_agentic_iterations {
+                warn!(
+                    agentic_iteration,
+                    max_agentic_iterations,
+                    knowledge_call_count,
+                    "agentic loop iteration cap exceeded; finalizing as failed"
+                );
+                let code = "agentic_iterations_exceeded".to_owned();
+                let message = "Model exceeded the maximum number of tool-use iterations \
+                               for this message"
+                    .to_owned();
+                if let Some(ref fctx) = fin_ctx {
+                    let elapsed = stream_start.elapsed();
+                    let finput = fctx.to_finalization_input(
+                        TurnState::Failed,
+                        &accumulated_text,
+                        None,
+                        Some(code.clone()),
+                        None,
+                        None,
+                        web_search_completed_count,
+                        code_interpreter_completed_count,
+                        knowledge_call_count,
+                        first_token_time.map(|d| d.as_millis() as u64),
+                        Some(elapsed.as_millis() as u64),
+                    );
+                    match fctx.finalization_svc.finalize_turn_cas(finput).await {
+                        Ok(outcome) if outcome.won_cas => {
+                            let _ = tx
+                                .send(StreamEvent::Error(ErrorData {
+                                    code: code.clone(),
+                                    message,
+                                }))
+                                .await;
+                        }
+                        Ok(_) => {}
+                        Err(fe) => {
+                            warn!(error = %fe, "finalization failed on agentic iteration cap");
+                            let _ = tx
+                                .send(StreamEvent::Error(ErrorData {
+                                    code: code.clone(),
+                                    message,
+                                }))
+                                .await;
+                        }
+                    }
+                    let ms = stream_start.elapsed().as_secs_f64() * 1000.0;
+                    fctx.metrics.record_stream_failed(
+                        &fctx.provider_id,
+                        &fctx.effective_model,
+                        &code,
+                    );
+                    fctx.metrics.record_stream_total_latency_ms(
+                        &fctx.provider_id,
+                        &fctx.effective_model,
+                        ms,
+                    );
+                } else {
+                    let _ = tx
+                        .send(StreamEvent::Error(ErrorData {
+                            code: code.clone(),
+                            message,
+                        }))
+                        .await;
+                }
+                let has_partial = !accumulated_text.is_empty();
+                return StreamOutcome {
+                    terminal: StreamTerminal::Failed,
+                    accumulated_text,
+                    usage: None,
+                    effective_model: model,
+                    error_code: Some(code),
+                    provider_response_id: None,
+                    provider_partial_usage: has_partial,
+                };
+            }
+
         // Build the LLM request using provider_model_id (the actual provider-facing name)
         let mut builder = LlmRequestBuilder::new(&provider_model_id)
-            .messages(messages)
+            .messages(messages.clone())
             .max_output_tokens(u64::from(max_output_tokens))
-            .max_tool_calls(max_tool_calls);
-        if let Some(instructions) = system_instructions {
-            builder = builder.system_instructions(instructions);
+            .max_tool_calls(max_tool_calls)
+            .raw_input_items(raw_input_items.clone());
+        if let Some(ref instructions) = system_instructions {
+            builder = builder.system_instructions(instructions.clone());
         }
         let features = determine_features(&tools);
-        for tool in tools {
-            builder = builder.tool(tool);
+        for tool in &tools {
+            builder = builder.tool(tool.clone());
         }
         let metadata = RequestMetadata {
             tenant_id: ctx.subject_tenant_id().to_string(),
@@ -124,25 +268,16 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
         };
         builder = builder.metadata(metadata);
 
-        // Forward model-policy API params (temperature, top_p, etc.) to the
-        // provider adapter via the generic `additional_params` escape hatch.
-        {
-            let mut params = serde_json::json!({
-                "temperature": api_params.temperature,
-                "top_p": api_params.top_p,
-                "frequency_penalty": api_params.frequency_penalty,
-                "presence_penalty": api_params.presence_penalty,
-            });
-            if !api_params.stop.is_empty() {
-                params["stop"] = serde_json::json!(api_params.stop);
-            }
-            if let Some(extra_body) = api_params.extra_body {
-                params["extra_body"] = extra_body;
-            }
-            if let Some(ref effort) = api_params.reasoning_effort {
-                params["reasoning_effort"] = serde_json::json!(effort);
-            }
-            builder = builder.additional_params(params);
+        // Forward typed model-policy API params; each adapter selects the
+        // fields its protocol supports.
+        builder = builder.api_params(api_params.clone());
+
+        // Forward the Anthropic file-id substitution map so the Anthropic
+        // adapter can replace primary `provider_file_id` references in image /
+        // document blocks with the actual `anthropic_file_id`. Empty for
+        // non-Anthropic chats — other adapters ignore the field.
+        if !anthropic_file_ids.is_empty() {
+            builder = builder.anthropic_file_ids(anthropic_file_ids.clone());
         }
 
         let request = builder.build_streaming();
@@ -155,7 +290,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
 
         // Call the provider to start streaming
         let stream_result = llm
-            .stream(ctx, request, &upstream_alias, provider_cancel)
+            .stream(ctx.clone(), request, &upstream_alias, provider_cancel)
             .await;
 
         let mut provider_stream = match stream_result {
@@ -179,6 +314,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                         None,
                         0,
                         0,
+                        knowledge_call_count,
                         None,
                         None,
                     );
@@ -232,18 +368,12 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
         };
 
         // Read events from provider, translate and forward through channel
-        let mut accumulated_text = String::new();
-        let mut cancelled = false;
         let mut last_progress_update = std::time::Instant::now();
-        let mut web_search_call_count: u32 = 0;
         // TODO(P2): web_search_call_count (Start) is used for enforcement,
         // web_search_completed_count (Done) is used for settlement. If a search
         // starts but never completes (provider error between Start/Done), the
         // daily quota under-counts by one. Acceptable for P1 since OpenAI always
         // pairs searching→completed; revisit if we add providers that don't.
-        let mut web_search_completed_count: u32 = 0;
-        let mut code_interpreter_call_count: u32 = 0;
-        let mut code_interpreter_completed_count: u32 = 0;
 
         loop {
             tokio::select! {
@@ -350,6 +480,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                                                     None,
                                                     web_search_completed_count,
                                                     code_interpreter_completed_count,
+                                                    knowledge_call_count,
                                                     None,
                                                     None,
                                                 );
@@ -451,6 +582,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                                                     None,
                                                     web_search_completed_count,
                                                     code_interpreter_completed_count,
+                                                    knowledge_call_count,
                                                     None,
                                                     None,
                                                 );
@@ -559,6 +691,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                                     None,
                                     web_search_completed_count,
                                     code_interpreter_completed_count,
+                                    knowledge_call_count,
                                     first_token_time.map(|d| d.as_millis() as u64),
                                     Some(mid_elapsed.as_millis() as u64),
                                 );
@@ -638,6 +771,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                     None,
                     web_search_completed_count,
                     code_interpreter_completed_count,
+                    knowledge_call_count,
                     first_token_time.map(|d| d.as_millis() as u64),
                     Some(elapsed.as_millis() as u64),
                 );
@@ -694,6 +828,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                         Some(response_id.clone()),
                         web_search_completed_count,
                         code_interpreter_completed_count,
+                        knowledge_call_count,
                         first_token_time.map(|d| d.as_millis() as u64),
                         Some(elapsed.as_millis() as u64),
                     );
@@ -787,7 +922,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                     fctx.metrics.record_stream_total_latency_ms(&fctx.provider_id, &fctx.effective_model, ms);
                 }
 
-                StreamOutcome {
+                return StreamOutcome {
                     terminal: StreamTerminal::Completed,
                     accumulated_text,
                     usage: Some(usage),
@@ -795,7 +930,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                     error_code: None,
                     provider_response_id: Some(response_id),
                     provider_partial_usage: false,
-                }
+                };
             }
             TerminalOutcome::Incomplete { usage, reason, .. } => {
                 let elapsed = stream_start.elapsed();
@@ -819,6 +954,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                         None,
                         web_search_completed_count,
                         code_interpreter_completed_count,
+                        knowledge_call_count,
                         first_token_time.map(|d| d.as_millis() as u64),
                         Some(elapsed.as_millis() as u64),
                     );
@@ -885,7 +1021,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                     fctx.metrics.record_stream_total_latency_ms(&fctx.provider_id, &fctx.effective_model, ms);
                 }
 
-                StreamOutcome {
+                return StreamOutcome {
                     terminal: StreamTerminal::Incomplete,
                     accumulated_text,
                     usage: Some(usage),
@@ -893,7 +1029,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                     error_code: Some(format!("incomplete:{reason}")),
                     provider_response_id: None,
                     provider_partial_usage: false,
-                }
+                };
             }
             TerminalOutcome::Failed { error, usage, .. } => {
                 let raw_detail = error.raw_detail().map(ToOwned::to_owned);
@@ -918,6 +1054,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                         None,
                         web_search_completed_count,
                         code_interpreter_completed_count,
+                        knowledge_call_count,
                         first_token_time.map(|d| d.as_millis() as u64),
                         Some(elapsed.as_millis() as u64),
                     );
@@ -957,7 +1094,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                     fctx.metrics.record_stream_total_latency_ms(&fctx.provider_id, &fctx.effective_model, ms);
                 }
 
-                StreamOutcome {
+                return StreamOutcome {
                     terminal: StreamTerminal::Failed,
                     accumulated_text,
                     usage,
@@ -965,8 +1102,510 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                     error_code: Some(code),
                     provider_response_id: None,
                     provider_partial_usage: usage.is_some(),
+                };
+            }
+            TerminalOutcome::ToolUse {
+                tool_use_id,
+                name,
+                input,
+            } => {
+                if name == "search_knowledge"
+                    && let Some(ref ks) = knowledge_search
+                {
+                        // Enforce per-message call limit — graceful degradation.
+                        // Instead of failing the turn, inject a soft limit notice as a
+                        // function_call_output so the model can still answer from whatever
+                        // it has already retrieved.
+                        if knowledge_call_count >= ks.max_calls {
+                            warn!(
+                                knowledge_call_count,
+                                limit = ks.max_calls,
+                                "knowledge search per-message limit reached, injecting soft limit response"
+                            );
+                            let raw_arguments =
+                                serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_owned());
+                            raw_input_items.push(serde_json::json!({
+                                "type": "function_call",
+                                "call_id": tool_use_id,
+                                "name": "search_knowledge",
+                                "arguments": raw_arguments,
+                            }));
+                            raw_input_items.push(serde_json::json!({
+                                "type": "function_call_output",
+                                "call_id": tool_use_id,
+                                "output": "Search limit reached for this message. \
+                                           Please answer based on the information already retrieved.",
+                            }));
+                            continue 'agentic;
+                        }
+
+                        knowledge_call_count += 1;
+
+                        // Extract arguments. top_k from the model is capped at
+                        // ks.top_k so the model cannot inflate retrieval cost.
+                        let query = input
+                            .get("query")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_owned();
+                        let top_k = input
+                            .get("top_k")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| (v as usize).min(ks.top_k))
+                            .unwrap_or(ks.top_k);
+                        let raw_arguments =
+                            serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_owned());
+
+                        // Append the model's function_call item to replay history.
+                        raw_input_items.push(serde_json::json!({
+                            "type": "function_call",
+                            "call_id": tool_use_id,
+                            "name": "search_knowledge",
+                            "arguments": raw_arguments,
+                        }));
+
+                        // Call the retriever.
+                        let retrieval_start = std::time::Instant::now();
+                        let retrieval_result = ks
+                            .retriever
+                            .retrieve(
+                                ctx.clone(),
+                                RetrievalRequest {
+                                    query,
+                                    top_k,
+                                    chat_id: fin_ctx
+                                        .as_ref()
+                                        .map_or_else(String::new, |f| f.chat_id.to_string()),
+                                    vector_store_id: ks.vector_store_id.clone(),
+                                    upstream_alias: ks.upstream_alias.clone(),
+                                    api_version: ks.api_version.clone(),
+                                },
+                            )
+                            .await;
+                        let retrieval_ms =
+                            retrieval_start.elapsed().as_secs_f64() * 1000.0;
+
+                        let output_text = match retrieval_result {
+                            Ok(raw_chunks) => {
+                                let chunks =
+                                    post_process_chunks(raw_chunks, ks.max_chunk_chars);
+                                if let Some(ref fctx) = fin_ctx {
+                                    fctx.metrics.record_knowledge_search("ok");
+                                    fctx.metrics
+                                        .record_knowledge_search_latency_ms(retrieval_ms);
+                                    fctx.metrics
+                                        .record_knowledge_search_chunks(chunks.len() as f64);
+
+                                    // Persist increment to chat_turns so the
+                                    // orphan watchdog can recover the count if
+                                    // the pod dies before stream finalization.
+                                    // Same pattern as web_search / code_interpreter.
+                                    if let Ok(conn) = fctx.db.conn() {
+                                        if let Err(e) = fctx.turn_repo.increment_tool_calls(
+                                            &conn,
+                                            &fctx.scope,
+                                            fctx.turn_id,
+                                            ToolCallType::FileSearch,
+                                        ).await {
+                                            warn!(
+                                                turn_id = %fctx.turn_id,
+                                                error = %e,
+                                                "failed to persist file_search_completed_count"
+                                            );
+                                        }
+                                    } else {
+                                        warn!(
+                                            turn_id = %fctx.turn_id,
+                                            "failed to acquire DB conn for file_search_completed_count"
+                                        );
+                                    }
+                                }
+                                if ks.use_search_result_blocks {
+                                    format_chunks_as_search_result_json(&chunks)
+                                } else {
+                                    format_chunks_as_text(&chunks)
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "knowledge retrieval failed");
+                                if let Some(ref fctx) = fin_ctx {
+                                    fctx.metrics.record_knowledge_search("error");
+                                    fctx.metrics
+                                        .record_knowledge_search_latency_ms(retrieval_ms);
+                                }
+                                // Distinct from the legitimate "empty result"
+                                // message so the model can tell a retriever
+                                // failure from a zero-hit query and adjust.
+                                "Knowledge search failed; answer without retrieved context."
+                                    .to_owned()
+                            }
+                        };
+
+                        // Append the function_call_output item to replay history.
+                        raw_input_items.push(serde_json::json!({
+                            "type": "function_call_output",
+                            "call_id": tool_use_id,
+                            "output": output_text,
+                        }));
+
+                        continue 'agentic;
                 }
+
+                // Unrecognised tool or feature disabled — treat as a provider failure.
+                warn!(tool = %name, "unexpected ToolUse outcome; finalizing as failed");
+                let code = "unexpected_tool_use".to_owned();
+                let message = "Provider requested an unsupported function tool".to_owned();
+                if let Some(ref fctx) = fin_ctx {
+                    let elapsed = stream_start.elapsed();
+                    let finput = fctx.to_finalization_input(
+                        TurnState::Failed,
+                        &accumulated_text,
+                        None,
+                        Some(code.clone()),
+                        None,
+                        None,
+                        web_search_completed_count,
+                        code_interpreter_completed_count,
+                        knowledge_call_count,
+                        first_token_time.map(|d| d.as_millis() as u64),
+                        Some(elapsed.as_millis() as u64),
+                    );
+                    match fctx.finalization_svc.finalize_turn_cas(finput).await {
+                        Ok(outcome) if outcome.won_cas => {
+                            let _ = tx
+                                .send(StreamEvent::Error(ErrorData {
+                                    code: code.clone(),
+                                    message,
+                                }))
+                                .await;
+                        }
+                        Ok(_) => {}
+                        Err(fe) => {
+                            warn!(error = %fe, "finalization failed on unexpected tool use");
+                            let _ = tx
+                                .send(StreamEvent::Error(ErrorData {
+                                    code: code.clone(),
+                                    message,
+                                }))
+                                .await;
+                        }
+                    }
+                    let ms = stream_start.elapsed().as_secs_f64() * 1000.0;
+                    fctx.metrics
+                        .record_stream_failed(&fctx.provider_id, &fctx.effective_model, &code);
+                    fctx.metrics.record_stream_total_latency_ms(
+                        &fctx.provider_id,
+                        &fctx.effective_model,
+                        ms,
+                    );
+                } else {
+                    let _ = tx
+                        .send(StreamEvent::Error(ErrorData {
+                            code: code.clone(),
+                            message,
+                        }))
+                        .await;
+                }
+                let has_partial = !accumulated_text.is_empty();
+                return StreamOutcome {
+                    terminal: StreamTerminal::Failed,
+                    accumulated_text,
+                    usage: None,
+                    effective_model: model,
+                    error_code: Some(code),
+                    provider_response_id: None,
+                    provider_partial_usage: has_partial,
+                };
             }
         }
+
+        } // end 'agentic loop
     }.instrument(span))
+}
+
+/// Post-process raw retrieval results before injecting them into the model context.
+///
+/// Steps applied in order:
+/// 1. **Sort** by relevance score descending (highest score first).
+/// 2. **Deduplicate** — remove chunks whose text is identical to an earlier chunk.
+///    Prevents wasting tokens on overlapping windows from the same document.
+/// 3. **Assign stable chunk indices** — appends `#chunk/{i}` to each `source_uri`
+///    so citations are traceable back to a specific chunk position.
+/// 4. **Truncate** each chunk's text to `max_chars` to bound context token cost.
+fn post_process_chunks(mut chunks: Vec<RetrievedChunk>, max_chars: usize) -> Vec<RetrievedChunk> {
+    // 1. Sort by score descending.
+    chunks.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // 2. Deduplicate by exact text content.
+    let mut seen = std::collections::HashSet::new();
+    chunks.retain(|c| seen.insert(c.text.clone()));
+
+    // 3. Assign stable chunk index to source_uri.
+    for (i, chunk) in chunks.iter_mut().enumerate() {
+        // Strip any existing fragment before appending so re-runs are idempotent.
+        if let Some(base) = chunk.source_uri.split_once('#') {
+            chunk.source_uri = format!("{}#chunk/{i}", base.0);
+        } else {
+            chunk.source_uri = format!("{}#chunk/{i}", chunk.source_uri);
+        }
+    }
+
+    // 4. Truncate text at a valid UTF-8 char boundary.
+    for chunk in &mut chunks {
+        if chunk.text.len() > max_chars {
+            let mut boundary = max_chars;
+            while !chunk.text.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            chunk.text.truncate(boundary);
+        }
+    }
+
+    chunks
+}
+
+/// Format retrieved knowledge chunks as Anthropic `search_result` JSON blocks.
+///
+/// Produces a JSON array of `search_result` objects. When this string is set as
+/// `function_call_output.output`, the Anthropic adapter's `parse_tool_result_content`
+/// recognises the typed-block array and forwards it verbatim as `tool_result` content,
+/// enabling Anthropic's native citation machinery.
+fn format_chunks_as_search_result_json(chunks: &[RetrievedChunk]) -> String {
+    if chunks.is_empty() {
+        return serde_json::json!([{
+            "type": "text",
+            "text": "No relevant content found."
+        }])
+        .to_string();
+    }
+    let blocks: Vec<serde_json::Value> = chunks
+        .iter()
+        .map(|chunk| {
+            serde_json::json!({
+                "type": "search_result",
+                "source": chunk.source_uri,
+                "title": chunk.title,
+                "content": [{"type": "text", "text": chunk.text}]
+            })
+        })
+        .collect();
+    serde_json::Value::Array(blocks).to_string()
+}
+
+/// Format retrieved knowledge chunks as a text block for the LLM.
+///
+/// Uses `[SOURCE_N]` labels so the model can inline-cite them naturally.
+/// The Responses API does not support Anthropic-style `search_result` content
+/// blocks, so plain text with explicit source labels is the correct approach
+/// for OpenAI/Azure providers.
+fn format_chunks_as_text(chunks: &[RetrievedChunk]) -> String {
+    use std::fmt::Write as _;
+    if chunks.is_empty() {
+        return "No relevant content found.".to_owned();
+    }
+    chunks
+        .iter()
+        .enumerate()
+        .fold(String::new(), |mut out, (i, chunk)| {
+            write!(
+                out,
+                "[SOURCE_{}] \"{}\"\n{}\n\n",
+                i + 1,
+                chunk.title,
+                chunk.text,
+            )
+            .ok();
+            out
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk(source_uri: &str, title: &str, text: &str) -> RetrievedChunk {
+        RetrievedChunk {
+            source_uri: source_uri.to_owned(),
+            title: title.to_owned(),
+            text: text.to_owned(),
+            score: 1.0,
+        }
+    }
+
+    #[test]
+    fn format_search_result_empty_returns_text_block_with_no_content_message() {
+        let json = format_chunks_as_search_result_json(&[]);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.is_array());
+        assert_eq!(v[0]["type"], "text");
+        assert_eq!(v[0]["text"], "No relevant content found.");
+    }
+
+    #[test]
+    fn format_search_result_single_chunk_has_correct_fields() {
+        let chunks = [chunk("kb://doc/1#chunk/0", "Doc 1", "Some text")];
+        let json = format_chunks_as_search_result_json(&chunks);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(v[0]["type"], "search_result");
+        assert_eq!(v[0]["source"], "kb://doc/1#chunk/0");
+        assert_eq!(v[0]["title"], "Doc 1");
+        assert_eq!(v[0]["content"][0]["type"], "text");
+        assert_eq!(v[0]["content"][0]["text"], "Some text");
+    }
+
+    #[test]
+    fn format_search_result_multiple_chunks_all_present() {
+        let chunks = [
+            chunk("kb://doc/1#chunk/0", "Doc 1", "Text one"),
+            chunk("kb://doc/2#chunk/1", "Doc 2", "Text two"),
+        ];
+        let json = format_chunks_as_search_result_json(&chunks);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 2);
+        assert_eq!(v[0]["type"], "search_result");
+        assert_eq!(v[1]["source"], "kb://doc/2#chunk/1");
+        assert_eq!(v[1]["title"], "Doc 2");
+    }
+
+    #[test]
+    fn format_search_result_all_blocks_have_type_field_for_passthrough() {
+        // parse_tool_result_content in anthropic_messages forwards a JSON array
+        // verbatim only when every element has a "type" field.
+        let chunks = [
+            chunk("kb://doc/1#chunk/0", "Doc 1", "Hello"),
+            chunk("kb://doc/2#chunk/1", "Doc 2", "World"),
+        ];
+        let json = format_chunks_as_search_result_json(&chunks);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = v.as_array().unwrap();
+        assert!(arr.iter().all(|block| block.get("type").is_some()));
+    }
+
+    // ── format_chunks_as_text ──
+
+    fn chunk_with_score(source_uri: &str, title: &str, text: &str, score: f32) -> RetrievedChunk {
+        RetrievedChunk {
+            source_uri: source_uri.to_owned(),
+            title: title.to_owned(),
+            text: text.to_owned(),
+            score,
+        }
+    }
+
+    #[test]
+    fn format_text_empty_returns_no_content_message() {
+        let out = format_chunks_as_text(&[]);
+        assert_eq!(out, "No relevant content found.");
+    }
+
+    #[test]
+    fn format_text_single_chunk_uses_source_1_label() {
+        let chunks = [chunk("kb://doc/1", "Title", "Body text")];
+        let out = format_chunks_as_text(&chunks);
+        assert!(out.contains("[SOURCE_1]"));
+        assert!(out.contains("\"Title\""));
+        assert!(out.contains("Body text"));
+    }
+
+    #[test]
+    fn format_text_multiple_chunks_numbered_sequentially() {
+        let chunks = [
+            chunk("kb://doc/1", "First", "aaa"),
+            chunk("kb://doc/2", "Second", "bbb"),
+            chunk("kb://doc/3", "Third", "ccc"),
+        ];
+        let out = format_chunks_as_text(&chunks);
+        assert!(out.contains("[SOURCE_1]"));
+        assert!(out.contains("[SOURCE_2]"));
+        assert!(out.contains("[SOURCE_3]"));
+        // Labels must appear in order.
+        let p1 = out.find("[SOURCE_1]").unwrap();
+        let p2 = out.find("[SOURCE_2]").unwrap();
+        let p3 = out.find("[SOURCE_3]").unwrap();
+        assert!(p1 < p2 && p2 < p3);
+    }
+
+    // ── post_process_chunks ──
+
+    #[test]
+    fn post_process_sorts_by_score_descending() {
+        let chunks = vec![
+            chunk_with_score("kb://a", "A", "text-a", 0.1),
+            chunk_with_score("kb://b", "B", "text-b", 0.9),
+            chunk_with_score("kb://c", "C", "text-c", 0.5),
+        ];
+        let out = post_process_chunks(chunks, 1000);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].text, "text-b");
+        assert_eq!(out[1].text, "text-c");
+        assert_eq!(out[2].text, "text-a");
+    }
+
+    #[test]
+    fn post_process_deduplicates_identical_text() {
+        let chunks = vec![
+            chunk_with_score("kb://a", "A", "same", 0.9),
+            chunk_with_score("kb://b", "B", "same", 0.8),
+            chunk_with_score("kb://c", "C", "different", 0.5),
+        ];
+        let out = post_process_chunks(chunks, 1000);
+        assert_eq!(out.len(), 2);
+        // Sort happens first → dedup keeps the highest-scoring duplicate.
+        assert_eq!(out[0].text, "same");
+        assert_eq!(out[0].source_uri, "kb://a#chunk/0");
+        assert_eq!(out[1].text, "different");
+    }
+
+    #[test]
+    fn post_process_assigns_stable_chunk_index_to_source_uri() {
+        let chunks = vec![
+            chunk_with_score("kb://doc/x", "X", "first", 0.9),
+            chunk_with_score("kb://doc/y", "Y", "second", 0.5),
+        ];
+        let out = post_process_chunks(chunks, 1000);
+        assert_eq!(out[0].source_uri, "kb://doc/x#chunk/0");
+        assert_eq!(out[1].source_uri, "kb://doc/y#chunk/1");
+    }
+
+    #[test]
+    fn post_process_replaces_existing_fragment_when_reassigning_index() {
+        // Idempotence: if post_process_chunks runs twice, the existing
+        // `#chunk/{i}` fragment is stripped and re-assigned instead of
+        // doubling up (e.g., `#chunk/0#chunk/0`).
+        let chunks = vec![chunk_with_score("kb://doc/x#chunk/9", "X", "once", 0.9)];
+        let out = post_process_chunks(chunks, 1000);
+        assert_eq!(out[0].source_uri, "kb://doc/x#chunk/0");
+    }
+
+    #[test]
+    fn post_process_truncates_text_to_max_chars() {
+        let chunks = vec![chunk_with_score("kb://doc/x", "X", "abcdefghij", 0.9)];
+        let out = post_process_chunks(chunks, 5);
+        assert_eq!(out[0].text, "abcde");
+    }
+
+    #[test]
+    fn post_process_truncates_at_utf8_char_boundary() {
+        // "héllo" — 'é' is two bytes (0xc3 0xa9) at positions 1..3.
+        // A naive truncate(2) would split inside 'é'. post_process_chunks
+        // must find a char boundary and truncate to a valid UTF-8 string.
+        let chunks = vec![chunk_with_score("kb://doc/x", "X", "héllo", 0.9)];
+        let out = post_process_chunks(chunks, 2);
+        // Must not panic and must be valid UTF-8. Boundary-safe truncation
+        // yields either 1 byte ("h") or stays at 2 if it lands on a boundary;
+        // the actual result here is "h" since byte 2 is inside 'é'.
+        assert!(out[0].text.is_char_boundary(out[0].text.len()));
+        assert_eq!(out[0].text, "h");
+    }
+
+    #[test]
+    fn post_process_empty_input_returns_empty() {
+        let out = post_process_chunks(vec![], 1000);
+        assert!(out.is_empty());
+    }
 }

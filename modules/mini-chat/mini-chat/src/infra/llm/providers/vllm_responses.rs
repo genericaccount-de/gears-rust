@@ -310,7 +310,30 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
         body["user"] = serde_json::json!(format!("{}:{}", identity.tenant_id, identity.user_id));
     }
 
-    // Merge additional provider-specific params (temperature, top_p, etc.).
+    // Inference params from the typed model-policy channel.
+    if let Some(p) = request.api_params.as_ref() {
+        body["temperature"] = serde_json::json!(p.temperature);
+        body["top_p"] = serde_json::json!(p.top_p);
+        body["frequency_penalty"] = serde_json::json!(p.frequency_penalty);
+        body["presence_penalty"] = serde_json::json!(p.presence_penalty);
+        if !p.stop.is_empty() {
+            body["stop"] = serde_json::json!(&p.stop);
+        }
+        if let Some(ref effort) = p.reasoning_effort {
+            body["reasoning"] = serde_json::json!({ "effort": effort });
+        }
+        // `extra_body` carries vLLM-specific kwargs (e.g. `top_k`,
+        // `chat_template_kwargs`); merged at the top level.
+        if let Some(ref extra) = p.extra_body
+            && let (Some(body_obj), Some(extra_obj)) = (body.as_object_mut(), extra.as_object())
+        {
+            for (k, v) in extra_obj {
+                body_obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+
+    // Adapter-specific extras outside the typed surface.
     if let Some(ref extra) = request.additional_params
         && let (Some(body_obj), Some(extra_obj)) = (body.as_object_mut(), extra.as_object())
     {

@@ -208,6 +208,15 @@ pub enum TerminalOutcome {
         usage: Usage,
         partial_content: String,
     },
+    /// Provider signalled a function tool call — agentic loop iteration.
+    ToolUse {
+        /// Provider-assigned call ID (used when replying with `function_call_output`).
+        tool_use_id: String,
+        /// Tool name (e.g. `"search_knowledge"`).
+        name: String,
+        /// Parsed arguments JSON (empty object if unparseable).
+        input: serde_json::Value,
+    },
 }
 
 // ════════════════════════════════════════════════════════════════════════════

@@ -97,7 +97,24 @@ pub struct LlmRequest<Mode = Streaming> {
     pub(crate) user_identity: Option<UserIdentity>,
     pub(crate) metadata: Option<RequestMetadata>,
     pub(crate) max_tool_calls: Option<u32>,
+    /// Typed model-policy inference params. Each adapter consumes only the
+    /// fields its protocol supports — e.g. Anthropic ignores
+    /// `frequency_penalty`/`presence_penalty` and renames `stop` to
+    /// `stop_sequences`. Use [`LlmRequestBuilder::additional_params`] for
+    /// adapter-specific extras outside this typed surface.
+    pub(crate) api_params: Option<mini_chat_sdk::ModelApiParams>,
+    /// Lookup map from primary `provider_file_id` (e.g. Azure Files API id) to
+    /// `anthropic_file_id` for attachments where the secondary upload to
+    /// Anthropic Files API succeeded. Consumed by the Anthropic adapter to
+    /// substitute the right id into outbound `image`/`document` content
+    /// blocks; ignored by other adapters. Empty when no chat attachments have
+    /// a uploaded Anthropic counterpart.
+    pub(crate) anthropic_file_ids: std::collections::HashMap<String, String>,
     pub(crate) additional_params: Option<serde_json::Value>,
+    /// Raw provider-format input items appended to the `input` array after
+    /// the normal messages. Used by the agentic loop to inject `function_call`
+    /// and `function_call_output` items when replaying with tool results.
+    pub(crate) raw_input_items: Vec<serde_json::Value>,
     pub(crate) _mode: PhantomData<Mode>,
 }
 
@@ -131,7 +148,10 @@ pub struct LlmRequestBuilder {
     user_identity: Option<UserIdentity>,
     metadata: Option<RequestMetadata>,
     max_tool_calls: Option<u32>,
+    api_params: Option<mini_chat_sdk::ModelApiParams>,
+    anthropic_file_ids: std::collections::HashMap<String, String>,
     additional_params: Option<serde_json::Value>,
+    raw_input_items: Vec<serde_json::Value>,
 }
 
 impl LlmRequestBuilder {
@@ -147,7 +167,10 @@ impl LlmRequestBuilder {
             user_identity: None,
             metadata: None,
             max_tool_calls: None,
+            api_params: None,
+            anthropic_file_ids: std::collections::HashMap::new(),
             additional_params: None,
+            raw_input_items: Vec::new(),
         }
     }
 
@@ -221,10 +244,45 @@ impl LlmRequestBuilder {
         self
     }
 
+    /// Set typed model-policy inference params. Adapters consume only the
+    /// fields their protocol supports.
+    #[must_use]
+    pub fn api_params(mut self, params: mini_chat_sdk::ModelApiParams) -> Self {
+        self.api_params = Some(params);
+        self
+    }
+
+    /// Set the `provider_file_id → anthropic_file_id` lookup map for chat
+    /// attachments uploaded to Anthropic's Files API. Only consumed by the
+    /// Anthropic adapter; ignored by other adapters.
+    #[must_use]
+    pub fn anthropic_file_ids(mut self, ids: std::collections::HashMap<String, String>) -> Self {
+        self.anthropic_file_ids = ids;
+        self
+    }
+
     /// Set additional provider-specific parameters (escape hatch).
+    ///
+    /// Use [`Self::api_params`] for fields covered by `ModelApiParams`. This
+    /// channel is reserved for adapter-specific extras outside the typed
+    /// surface (e.g. Anthropic's `thinking` block).
     #[must_use]
     pub fn additional_params(mut self, params: serde_json::Value) -> Self {
         self.additional_params = Some(params);
+        self
+    }
+
+    /// Append raw provider-format input items (for agentic loop replay).
+    ///
+    /// These are appended to the `input` array after the normal messages.
+    /// Used to inject `function_call` and `function_call_output` items.
+    ///
+    /// Successive calls accumulate — the builder owns prior items and adds
+    /// the new batch to the tail. Pass `clear_raw_input_items` (or rebuild
+    /// the builder) to start fresh.
+    #[must_use]
+    pub fn raw_input_items(mut self, items: Vec<serde_json::Value>) -> Self {
+        self.raw_input_items.extend(items);
         self
     }
 
@@ -238,7 +296,10 @@ impl LlmRequestBuilder {
             user_identity: self.user_identity,
             metadata: self.metadata,
             max_tool_calls: self.max_tool_calls,
+            api_params: self.api_params,
+            anthropic_file_ids: self.anthropic_file_ids,
             additional_params: self.additional_params,
+            raw_input_items: self.raw_input_items,
             _mode: PhantomData,
         }
     }

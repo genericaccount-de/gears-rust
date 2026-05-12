@@ -1,3 +1,5 @@
+#![allow(clippy::non_ascii_literal, clippy::cognitive_complexity)]
+
 pub(super) mod provider_task;
 mod types;
 
@@ -70,6 +72,8 @@ pub struct StreamService<
     context_config: ContextConfig,
     rag_config: crate::config::RagConfig,
     metrics: Arc<dyn MiniChatMetricsPort>,
+    knowledge_search_config: crate::config::KnowledgeSearchConfig,
+    knowledge_retriever: Option<Arc<dyn crate::domain::ports::KnowledgeRetriever>>,
 }
 
 impl<
@@ -103,6 +107,8 @@ impl<
         context_config: ContextConfig,
         rag_config: crate::config::RagConfig,
         metrics: Arc<dyn MiniChatMetricsPort>,
+        knowledge_search_config: crate::config::KnowledgeSearchConfig,
+        knowledge_retriever: Option<Arc<dyn crate::domain::ports::KnowledgeRetriever>>,
     ) -> Self {
         Self {
             db,
@@ -121,6 +127,8 @@ impl<
             context_config,
             rag_config,
             metrics,
+            knowledge_search_config,
+            knowledge_retriever,
         }
     }
 
@@ -160,6 +168,89 @@ impl<
     /// The configured ping interval in seconds.
     pub(crate) fn ping_interval_secs(&self) -> u64 {
         u64::from(self.streaming_config.sse_ping_interval_seconds)
+    }
+
+    /// Build [`provider_task::KnowledgeSearchParams`] for the current request,
+    /// resolving the upstream alias for the given tenant.
+    ///
+    /// Returns `None` when knowledge search is disabled or misconfigured.
+    /// Every misconfiguration path emits a `warn!` so operators can diagnose
+    /// why the feature silently disabled itself.
+    fn build_knowledge_search_params(
+        &self,
+        tenant_id_str: &str,
+    ) -> Option<provider_task::KnowledgeSearchParams> {
+        if !self.knowledge_search_config.enabled {
+            return None;
+        }
+        let Some(retriever) = self.knowledge_retriever.as_ref() else {
+            warn!(
+                "knowledge_search enabled but retriever is not wired; disabling for this request"
+            );
+            return None;
+        };
+        let Some(ks_provider_id) = self.knowledge_search_config.provider_id.as_deref() else {
+            warn!("knowledge_search.provider_id is not configured; disabling for this request");
+            return None;
+        };
+        // Only providers that emit TerminalOutcome::ToolUse support the agentic loop.
+        // Currently: OpenAI Responses API and Anthropic Messages API.
+        let provider_kind = self
+            .provider_resolver
+            .entries()
+            .get(ks_provider_id)
+            .map(|e| e.kind);
+        let use_search_result_blocks = match provider_kind {
+            Some(crate::infra::llm::providers::ProviderKind::OpenAiResponses) => false,
+            Some(crate::infra::llm::providers::ProviderKind::AnthropicMessages) => true,
+            other => {
+                warn!(
+                    provider_id = ks_provider_id,
+                    ?other,
+                    "knowledge_search requires openai_responses or anthropic_messages provider; \
+                     other provider kinds do not support function tool calls — disabling for this request"
+                );
+                return None;
+            }
+        };
+        let Some(vector_store_id) = self.knowledge_search_config.vector_store_id.clone() else {
+            warn!("knowledge_search.vector_store_id is not configured; disabling for this request");
+            return None;
+        };
+        let Some(upstream_alias) = self
+            .provider_resolver
+            .upstream_alias_for(ks_provider_id, Some(tenant_id_str))
+        else {
+            warn!(
+                provider_id = ks_provider_id,
+                tenant_id = tenant_id_str,
+                "knowledge_search provider has no upstream alias for this tenant; disabling for this request"
+            );
+            return None;
+        };
+        let api_version = self
+            .provider_resolver
+            .entries()
+            .get(ks_provider_id)
+            .and_then(|e| e.api_version.as_deref())
+            .unwrap_or("");
+        if api_version.is_empty() {
+            warn!(
+                provider_id = ks_provider_id,
+                "knowledge_search provider has no api_version configured; disabling for this request"
+            );
+            return None;
+        }
+        Some(provider_task::KnowledgeSearchParams {
+            retriever: Arc::clone(retriever),
+            vector_store_id,
+            upstream_alias: upstream_alias.to_owned(),
+            api_version: api_version.to_owned(),
+            top_k: self.knowledge_search_config.top_k,
+            max_calls: self.knowledge_search_config.max_calls_per_message,
+            max_chunk_chars: self.knowledge_search_config.max_chunk_chars,
+            use_search_result_blocks,
+        })
     }
 
     /// Perform pre-stream checks (idempotency, parallel guard, message/turn
@@ -425,6 +516,24 @@ impl<
             std::collections::HashMap::new()
         };
 
+        // For Anthropic-backed chats, also load the
+        // `provider_file_id → anthropic_file_id` map so the adapter can
+        // substitute the right id into outbound `image`/`document` blocks.
+        // Empty for non-Anthropic providers.
+        let anthropic_file_ids = if self.provider_resolver.is_anthropic_messages(&provider_id) {
+            self.attachment_repo
+                .build_secondary_file_id_map(
+                    &conn,
+                    &scope,
+                    chat_id,
+                    crate::infra::db::entity::attachment::secondary_provider_kind::ANTHROPIC,
+                )
+                .await
+                .map_err(|e| StreamError::TurnCreationFailed { source: e })?
+        } else {
+            std::collections::HashMap::new()
+        };
+
         // ── Code interpreter file IDs ──
         let (ci_file_ids, code_interpreter_enabled) = if pf.tool_support.code_interpreter
             && !computed.kill_switches.disable_code_interpreter
@@ -508,6 +617,13 @@ impl<
             web_search_enabled,
             code_interpreter_enabled,
         });
+        // file_search and knowledge_search are mutually exclusive — when both
+        // are configured, file_search wins (native vector-store tool, already
+        // billed via the adapter). knowledge_search would otherwise double-bill
+        // OpenAI/Responses traffic and silently drop on Anthropic.
+        let knowledge_search_enabled = self.knowledge_search_config.enabled
+            && self.knowledge_retriever.is_some()
+            && !file_search_enabled;
         let (assembled, summary_info) = self
             .gather_context(
                 tenant_id,
@@ -517,6 +633,7 @@ impl<
                 &content,
                 web_search_enabled,
                 file_search_enabled,
+                knowledge_search_enabled,
                 &vector_store_ids,
                 None, // file_search_filters: wired by P4-6
                 pf.web_search_context_size,
@@ -567,6 +684,8 @@ impl<
                 code_interpreter_max_calls: self.quota.code_interpreter_max_calls_per_message(),
                 api_params: pf.api_params,
                 provider_file_id_map,
+                anthropic_file_ids,
+                knowledge_search: self.build_knowledge_search_params(&tenant_id_str),
             },
             cancel,
             tx,
@@ -803,6 +922,7 @@ impl<
         user_message: &str,
         web_search_enabled: bool,
         file_search_enabled: bool,
+        knowledge_search_enabled: bool,
         vector_store_ids: &[String],
         file_search_filters: Option<crate::domain::llm::FileSearchFilter>,
         web_search_context_size: crate::domain::llm::WebSearchContextSize,
@@ -887,11 +1007,13 @@ impl<
                 system_prompt,
                 web_search_guard: &self.context_config.web_search_guard,
                 file_search_guard: &self.context_config.file_search_guard,
+                knowledge_search_guard: &self.knowledge_search_config.guard,
                 thread_summary: thread_summary.as_ref().map(|ts| ts.content.as_str()),
                 recent_messages: &context_messages,
                 user_message,
                 web_search_enabled,
                 file_search_enabled,
+                knowledge_search_enabled,
                 vector_store_ids,
                 file_search_filters,
                 web_search_context_size,
@@ -1171,6 +1293,20 @@ impl<
             std::collections::HashMap::new()
         };
 
+        let anthropic_file_ids = if self.provider_resolver.is_anthropic_messages(&provider_id) {
+            self.attachment_repo
+                .build_secondary_file_id_map(
+                    &conn,
+                    &scope,
+                    chat_id,
+                    crate::infra::db::entity::attachment::secondary_provider_kind::ANTHROPIC,
+                )
+                .await
+                .map_err(|e| StreamError::TurnCreationFailed { source: e })?
+        } else {
+            std::collections::HashMap::new()
+        };
+
         // ── Code interpreter file IDs ──
         let (ci_file_ids, code_interpreter_enabled) =
             if pf.tool_support.code_interpreter && !disable_code_interpreter {
@@ -1224,6 +1360,10 @@ impl<
             web_search_enabled,
             code_interpreter_enabled,
         });
+        // See `run_stream` for the mutual-exclusion rationale.
+        let knowledge_search_enabled = self.knowledge_search_config.enabled
+            && self.knowledge_retriever.is_some()
+            && !file_search_enabled;
         let (assembled, summary_info) = self
             .gather_context(
                 tenant_id,
@@ -1233,6 +1373,7 @@ impl<
                 &content,
                 web_search_enabled,
                 file_search_enabled,
+                knowledge_search_enabled,
                 &vector_store_ids,
                 None, // file_search_filters: wired by P4-6
                 pf.web_search_context_size,
@@ -1277,6 +1418,8 @@ impl<
                 code_interpreter_max_calls: self.quota.code_interpreter_max_calls_per_message(),
                 api_params: pf.api_params,
                 provider_file_id_map,
+                anthropic_file_ids,
+                knowledge_search: self.build_knowledge_search_params(&tenant_id_str),
             },
             cancel,
             tx,
@@ -1703,6 +1846,8 @@ mod tests {
                     reasoning_effort: None,
                 },
                 provider_file_id_map: std::collections::HashMap::new(),
+                anthropic_file_ids: std::collections::HashMap::new(),
+                knowledge_search: None,
             },
             cancel,
             tx,
@@ -1766,6 +1911,8 @@ mod tests {
                     reasoning_effort: None,
                 },
                 provider_file_id_map: std::collections::HashMap::new(),
+                anthropic_file_ids: std::collections::HashMap::new(),
+                knowledge_search: None,
             },
             cancel,
             tx,
@@ -1822,6 +1969,8 @@ mod tests {
                     reasoning_effort: None,
                 },
                 provider_file_id_map: std::collections::HashMap::new(),
+                anthropic_file_ids: std::collections::HashMap::new(),
+                knowledge_search: None,
             },
             cancel,
             tx,
@@ -1927,6 +2076,8 @@ mod tests {
                     reasoning_effort: None,
                 },
                 provider_file_id_map: std::collections::HashMap::new(),
+                anthropic_file_ids: std::collections::HashMap::new(),
+                knowledge_search: None,
             },
             cancel.clone(),
             tx,
@@ -2102,6 +2253,8 @@ mod tests {
             crate::config::ContextConfig::default(),
             crate::config::RagConfig::default(),
             metrics,
+            crate::config::KnowledgeSearchConfig::default(),
+            None,
         )
     }
 
@@ -2843,6 +2996,8 @@ mod tests {
             crate::config::ContextConfig::default(),
             crate::config::RagConfig::default(),
             metrics,
+            crate::config::KnowledgeSearchConfig::default(),
+            None,
         )
     }
 
@@ -3274,6 +3429,8 @@ mod tests {
                     reasoning_effort: None,
                 },
                 provider_file_id_map: std::collections::HashMap::new(),
+                anthropic_file_ids: std::collections::HashMap::new(),
+                knowledge_search: None,
             },
             cancel,
             tx,
@@ -3452,6 +3609,8 @@ mod tests {
                     reasoning_effort: None,
                 },
                 provider_file_id_map: std::collections::HashMap::new(),
+                anthropic_file_ids: std::collections::HashMap::new(),
+                knowledge_search: None,
             },
             cancel,
             tx,
@@ -3629,6 +3788,8 @@ mod tests {
                     reasoning_effort: None,
                 },
                 provider_file_id_map: std::collections::HashMap::new(),
+                anthropic_file_ids: std::collections::HashMap::new(),
+                knowledge_search: None,
             },
             cancel,
             tx,
@@ -3788,6 +3949,8 @@ mod tests {
             crate::config::ContextConfig::default(),
             crate::config::RagConfig::default(),
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
+            crate::config::KnowledgeSearchConfig::default(),
+            None,
         )
     }
 
@@ -4396,6 +4559,8 @@ mod tests {
                     reasoning_effort: None,
                 },
                 provider_file_id_map: std::collections::HashMap::new(),
+                anthropic_file_ids: std::collections::HashMap::new(),
+                knowledge_search: None,
             },
             cancel,
             tx,
@@ -4453,6 +4618,8 @@ mod tests {
                     reasoning_effort: None,
                 },
                 provider_file_id_map: std::collections::HashMap::new(),
+                anthropic_file_ids: std::collections::HashMap::new(),
+                knowledge_search: None,
             },
             cancel,
             tx,
@@ -4520,6 +4687,8 @@ mod tests {
                     reasoning_effort: None,
                 },
                 provider_file_id_map: std::collections::HashMap::new(),
+                anthropic_file_ids: std::collections::HashMap::new(),
+                knowledge_search: None,
             },
             cancel,
             tx,
@@ -4574,6 +4743,8 @@ mod tests {
                     reasoning_effort: None,
                 },
                 provider_file_id_map: std::collections::HashMap::new(),
+                anthropic_file_ids: std::collections::HashMap::new(),
+                knowledge_search: None,
             },
             cancel,
             tx,
@@ -4630,6 +4801,8 @@ mod tests {
                     reasoning_effort: None,
                 },
                 provider_file_id_map: std::collections::HashMap::new(),
+                anthropic_file_ids: std::collections::HashMap::new(),
+                knowledge_search: None,
             },
             cancel,
             tx,
@@ -4697,6 +4870,8 @@ mod tests {
                     reasoning_effort: None,
                 },
                 provider_file_id_map: std::collections::HashMap::new(),
+                anthropic_file_ids: std::collections::HashMap::new(),
+                knowledge_search: None,
             },
             cancel,
             tx,
@@ -5313,6 +5488,7 @@ mod tests {
             web_search_enabled: Set(false),
             web_search_completed_count: Set(0),
             code_interpreter_completed_count: Set(0),
+            file_search_completed_count: Set(0),
             deleted_at: Set(None),
             replaced_by_request_id: Set(None),
             started_at: Set(now),
@@ -5436,6 +5612,8 @@ mod tests {
             crate::config::ContextConfig::default(),
             crate::config::RagConfig::default(),
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
+            crate::config::KnowledgeSearchConfig::default(),
+            None,
         )
     }
 
@@ -5752,10 +5930,14 @@ mod tests {
         fn record_cleanup_retry(&self, _: &str, _: &str) {}
         fn record_cleanup_backlog(&self, _: &str, _: &str, _: i64) {}
         fn record_cleanup_vs_with_failed_attachments(&self) {}
+        fn record_secondary_cleanup_skipped(&self, _: &str) {}
         fn record_thread_summary_trigger(&self, _: &str) {}
         fn record_thread_summary_execution(&self, _: &str) {}
         fn record_thread_summary_cas_conflict(&self) {}
         fn record_summary_fallback(&self) {}
+        fn record_knowledge_search(&self, _: &str) {}
+        fn record_knowledge_search_latency_ms(&self, _: f64) {}
+        fn record_knowledge_search_chunks(&self, _: f64) {}
     }
 
     // ── Metric emission tests ────────────────────────────────────────────

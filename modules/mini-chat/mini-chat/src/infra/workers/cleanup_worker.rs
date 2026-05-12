@@ -54,6 +54,12 @@ pub struct AttachmentCleanupHandler {
     db: Arc<DbProvider>,
     max_attempts: u32,
     metrics: Arc<dyn crate::domain::ports::MiniChatMetricsPort>,
+    /// Used to issue secondary `DELETE /v1/files/{id}` against Anthropic's
+    /// Files API when the payload carries a secondary entry with
+    /// `provider_kind = "anthropic"`. `None` when no Anthropic provider is
+    /// configured — the Anthropic-side cleanup is skipped silently.
+    anthropic_files_client:
+        Option<Arc<crate::infra::llm::providers::anthropic_files_client::AnthropicFilesClient>>,
 }
 
 impl AttachmentCleanupHandler {
@@ -63,6 +69,9 @@ impl AttachmentCleanupHandler {
         chat_repo: ChatRepo,
         max_attempts: u32,
         metrics: Arc<dyn crate::domain::ports::MiniChatMetricsPort>,
+        anthropic_files_client: Option<
+            Arc<crate::infra::llm::providers::anthropic_files_client::AnthropicFilesClient>,
+        >,
     ) -> Self {
         Self {
             file_storage,
@@ -71,6 +80,7 @@ impl AttachmentCleanupHandler {
             db,
             max_attempts,
             metrics,
+            anthropic_files_client,
         }
     }
 }
@@ -88,6 +98,8 @@ struct AttachmentCleanupPayload {
     storage_backend: String,
     #[allow(dead_code)]
     attachment_kind: String,
+    #[serde(default)]
+    secondary_ref: Option<crate::domain::repos::SecondaryCleanupRef>,
 }
 
 #[async_trait]
@@ -164,6 +176,66 @@ impl LeasedMessageHandler for AttachmentCleanupHandler {
             return self
                 .record_failure(event.attachment_id, &e.to_string())
                 .await;
+        }
+
+        // 4b. Secondary-provider delete (best-effort).
+        //
+        // Only runs when the chat performed a secondary upload that
+        // succeeded — `secondary_ref` is set at enqueue time. Today only
+        // `provider_kind = secondary_provider_kind::ANTHROPIC` is wired;
+        // future providers add their own match arms. A failure here does NOT
+        // block the primary cleanup from being marked done: the primary file
+        // is already gone, and the secondary copy is orphaned but doesn't
+        // affect the user's chat. Orphans need a manual reaper or a future
+        // retry hook — better than blocking the user-visible cleanup on
+        // upstream flakes.
+        if let Some(ref sec) = event.secondary_ref {
+            use crate::infra::db::entity::attachment::secondary_provider_kind;
+            match sec.provider_kind.as_str() {
+                secondary_provider_kind::ANTHROPIC => {
+                    if let Some(client) = self.anthropic_files_client.as_ref() {
+                        let anth_ctx = tenant_security_context(event.tenant_id);
+                        match client
+                            .delete_file(anth_ctx, &sec.upstream_alias, &sec.file_id)
+                            .await
+                        {
+                            Ok(()) => {
+                                tracing::debug!(
+                                    attachment_id = %event.attachment_id,
+                                    anthropic_file_id = %sec.file_id,
+                                    "attachment cleanup: Anthropic file deleted"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    attachment_id = %event.attachment_id,
+                                    anthropic_file_id = %sec.file_id,
+                                    error = %e,
+                                    "attachment cleanup: Anthropic delete failed (orphaned); \
+                                     continuing with primary cleanup"
+                                );
+                            }
+                        }
+                    } else {
+                        warn!(
+                            attachment_id = %event.attachment_id,
+                            secondary_file_id = %sec.file_id,
+                            provider_kind = %sec.provider_kind,
+                            "attachment cleanup: payload references anthropic secondary but no \
+                             client configured; orphaned"
+                        );
+                        self.metrics
+                            .record_secondary_cleanup_skipped(&sec.provider_kind);
+                    }
+                }
+                other => {
+                    warn!(
+                        attachment_id = %event.attachment_id,
+                        provider_kind = %other,
+                        "attachment cleanup: unknown secondary_provider_kind; skipping"
+                    );
+                }
+            }
         }
 
         // 5. Success — mark cleanup as done.
@@ -254,6 +326,9 @@ pub struct ChatCleanupHandler {
     db: Arc<DbProvider>,
     max_attempts: u32,
     metrics: Arc<dyn crate::domain::ports::MiniChatMetricsPort>,
+    /// See [`AttachmentCleanupHandler::anthropic_files_client`].
+    anthropic_files_client:
+        Option<Arc<crate::infra::llm::providers::anthropic_files_client::AnthropicFilesClient>>,
 }
 
 impl ChatCleanupHandler {
@@ -265,6 +340,9 @@ impl ChatCleanupHandler {
         chat_repo: ChatRepo,
         max_attempts: u32,
         metrics: Arc<dyn crate::domain::ports::MiniChatMetricsPort>,
+        anthropic_files_client: Option<
+            Arc<crate::infra::llm::providers::anthropic_files_client::AnthropicFilesClient>,
+        >,
     ) -> Self {
         Self {
             file_storage,
@@ -275,6 +353,7 @@ impl ChatCleanupHandler {
             db,
             max_attempts,
             metrics,
+            anthropic_files_client,
         }
     }
 }
@@ -288,6 +367,8 @@ struct ChatCleanupPayload {
     chat_id: uuid::Uuid,
     #[allow(dead_code)]
     system_request_id: uuid::Uuid,
+    #[serde(default)]
+    secondary_upstream_alias: Option<String>,
 }
 
 #[async_trait]
@@ -389,6 +470,72 @@ impl LeasedMessageHandler for ChatCleanupHandler {
                         }
                     }
                     continue;
+                }
+            }
+
+            // Secondary-provider delete (best-effort).
+            //
+            // The chat-cleanup payload carries `secondary_upstream_alias`
+            // resolved at chat-delete time; the attachment row carries
+            // `secondary_file_id` and `secondary_provider_kind` from the
+            // parallel upload. Failure is logged but does NOT block marking
+            // this attachment done — the primary cleanup gates the
+            // user-visible state, and a secondary orphan needs a separate
+            // reaper. Today only `provider_kind = "anthropic"` is wired.
+            if let (Some(file_id), Some(provider_kind), Some(alias)) = (
+                att.secondary_file_id.as_deref(),
+                att.secondary_provider_kind.as_deref(),
+                event.secondary_upstream_alias.as_deref(),
+            ) {
+                use crate::infra::db::entity::attachment::{
+                    SecondaryUploadStatus, secondary_provider_kind,
+                };
+                if att.secondary_status == SecondaryUploadStatus::Uploaded {
+                    match provider_kind {
+                        secondary_provider_kind::ANTHROPIC => {
+                            if let Some(client) = self.anthropic_files_client.as_ref() {
+                                let anth_ctx = tenant_security_context(event.tenant_id);
+                                match client.delete_file(anth_ctx, alias, file_id).await {
+                                    Ok(()) => {
+                                        tracing::debug!(
+                                            chat_id = %chat_id,
+                                            attachment_id = %att.id,
+                                            anthropic_file_id = %file_id,
+                                            "chat cleanup: Anthropic file deleted"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            chat_id = %chat_id,
+                                            attachment_id = %att.id,
+                                            anthropic_file_id = %file_id,
+                                            error = %e,
+                                            "chat cleanup: Anthropic delete failed (orphaned); \
+                                             continuing"
+                                        );
+                                    }
+                                }
+                            } else {
+                                warn!(
+                                    chat_id = %chat_id,
+                                    attachment_id = %att.id,
+                                    secondary_file_id = %file_id,
+                                    provider_kind = %provider_kind,
+                                    "chat cleanup: attachment references anthropic secondary but \
+                                     no client configured; orphaned"
+                                );
+                                self.metrics.record_secondary_cleanup_skipped(provider_kind);
+                            }
+                        }
+                        other => {
+                            warn!(
+                                chat_id = %chat_id,
+                                attachment_id = %att.id,
+                                provider_kind = %other,
+                                "chat cleanup: unknown secondary_provider_kind on attachment; skipping"
+                            );
+                        }
+                    }
                 }
             }
 
@@ -554,6 +701,7 @@ mod tests {
             }),
             5,
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
+            None, // anthropic_files_client — Anthropic cleanup is exercised separately
         );
 
         let msg = make_msg(); // payload is "{}" — missing required fields
@@ -579,6 +727,7 @@ mod tests {
             }),
             5,
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
+            None, // anthropic_files_client — Anthropic cleanup is exercised separately
         );
 
         let msg = make_cleanup_payload(None);
@@ -636,6 +785,7 @@ mod tests {
             }),
             5,
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
+            None, // anthropic_files_client — Anthropic cleanup is exercised separately
         )
     }
 
@@ -868,6 +1018,7 @@ mod tests {
             }),
             5, // max_attempts
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
+            None, // anthropic_files_client
         );
 
         let msg = make_chat_cleanup_payload(chat_id);
@@ -920,6 +1071,7 @@ mod tests {
             }),
             1, // max_attempts = 1 → immediately terminal
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
+            None, // anthropic_files_client
         );
 
         let msg = make_chat_cleanup_payload(chat_id);

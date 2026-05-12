@@ -29,6 +29,7 @@ pub struct ChatService<CR: ChatRepository, AR: AttachmentRepository, TSR: Thread
     outbox_enqueuer: Arc<dyn OutboxEnqueuer>,
     enforcer: PolicyEnforcer,
     model_resolver: Arc<dyn ModelResolver>,
+    provider_resolver: Arc<crate::infra::llm::provider_resolver::ProviderResolver>,
 }
 
 impl<
@@ -37,6 +38,7 @@ impl<
     TSR: ThreadSummaryRepository + 'static,
 > ChatService<CR, AR, TSR>
 {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         db: Arc<DbProvider>,
         chat_repo: Arc<CR>,
@@ -45,6 +47,7 @@ impl<
         outbox_enqueuer: Arc<dyn OutboxEnqueuer>,
         enforcer: PolicyEnforcer,
         model_resolver: Arc<dyn ModelResolver>,
+        provider_resolver: Arc<crate::infra::llm::provider_resolver::ProviderResolver>,
     ) -> Self {
         Self {
             db,
@@ -54,6 +57,7 @@ impl<
             outbox_enqueuer,
             enforcer,
             model_resolver,
+            provider_resolver,
         }
     }
 
@@ -273,6 +277,62 @@ impl<
             .ensure_owner(ctx.subject_id());
 
         let tenant_id = ctx.subject_tenant_id();
+
+        // Pre-resolve the Anthropic upstream alias for the cleanup worker if
+        // this chat is Anthropic-backed. Doing this outside the TX means the
+        // cleanup handler doesn't need ProviderResolver, and a transient
+        // resolver miss does not fail the user's delete (alias resolves to
+        // `None` and Anthropic-side cleanup simply skips — same effect as a
+        // non-Anthropic chat). The chat's `model` is mapped through the model
+        // resolver to a provider id, then to an OAGW upstream alias.
+        let secondary_upstream_alias: Option<String> = {
+            let chat_opt = match self.db.conn() {
+                Ok(conn) => self
+                    .chat_repo
+                    .get(&conn, &chat_scope, id)
+                    .await
+                    .ok()
+                    .flatten(),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        chat_id = %id,
+                        "could not pre-resolve Anthropic alias for chat cleanup; continuing"
+                    );
+                    None
+                }
+            };
+            match chat_opt {
+                Some(chat) => match self
+                    .model_resolver
+                    .resolve_model(ctx.subject_id(), Some(chat.model.clone()))
+                    .await
+                {
+                    Ok(resolved)
+                        if self
+                            .provider_resolver
+                            .is_anthropic_messages(&resolved.provider_id) =>
+                    {
+                        let tenant_str = tenant_id.to_string();
+                        self.provider_resolver
+                            .upstream_alias_for(&resolved.provider_id, Some(&tenant_str))
+                            .map(str::to_owned)
+                    }
+                    Ok(_) => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            chat_id = %id,
+                            model = %chat.model,
+                            "could not resolve model to provider for Anthropic cleanup alias"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            }
+        };
+
         let chat_repo = Arc::clone(&self.chat_repo);
         let attachment_repo = Arc::clone(&self.attachment_repo);
         let outbox_enqueuer = Arc::clone(&self.outbox_enqueuer);
@@ -304,6 +364,7 @@ impl<
                         chat_id: id,
                         system_request_id: Uuid::new_v4(),
                         chat_deleted_at: time::OffsetDateTime::now_utc(),
+                        secondary_upstream_alias,
                     };
                     outbox_enqueuer
                         .enqueue_chat_cleanup(tx, event)

@@ -36,6 +36,22 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub last_cleanup_error: Option<String>,
     pub cleanup_updated_at: Option<OffsetDateTime>,
+    /// Provider-side file id for an optional secondary upload. Currently set
+    /// only by the Anthropic Files API parallel upload — see
+    /// `anthropic-provider-support.md` §8.0. Provider-agnostic name so a
+    /// future provider (Bedrock, Vertex) can reuse the slot. NULL when
+    /// `secondary_status = 'not_attempted'` or `'failed'`.
+    #[sea_orm(column_type = "String(StringLen::N(128))", nullable)]
+    pub secondary_file_id: Option<String>,
+    /// Lifecycle state of the secondary upload (see [`SecondaryUploadStatus`]).
+    #[sea_orm(column_type = "String(StringLen::N(16))")]
+    pub secondary_status: SecondaryUploadStatus,
+    /// Which provider's id sits in `secondary_file_id`. NULL while
+    /// `secondary_status = 'not_attempted'`; set together with the file id
+    /// on the `pending → uploaded | failed` transitions. Today only
+    /// `"anthropic"` is wired.
+    #[sea_orm(column_type = "String(StringLen::N(32))", nullable)]
+    pub secondary_provider_kind: Option<String>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
     pub deleted_at: Option<OffsetDateTime>,
@@ -129,6 +145,39 @@ impl From<AttachmentKind> for crate::domain::mime_validation::AttachmentKind {
             AttachmentKind::Image => Self::Image,
         }
     }
+}
+
+/// Secondary-upload lifecycle for the optional per-attachment provider-side
+/// upload (currently: Anthropic Files API).
+///
+/// Lifecycle: `not_attempted` → `pending` → `uploaded` | `failed`.
+#[derive(Clone, Debug, PartialEq, Eq, EnumIter, DeriveActiveEnum)]
+#[sea_orm(rs_type = "String", db_type = "String(StringLen::N(16))")]
+pub enum SecondaryUploadStatus {
+    /// Initial state — secondary upload never attempted for this attachment
+    /// (e.g. OpenAI-backed chat, or a pre-migration row).
+    #[sea_orm(string_value = "not_attempted")]
+    NotAttempted,
+    /// Upload in progress (or server crashed mid-upload — retry eligible).
+    #[sea_orm(string_value = "pending")]
+    Pending,
+    /// Successfully uploaded — `secondary_file_id` and
+    /// `secondary_provider_kind` are both set.
+    #[sea_orm(string_value = "uploaded")]
+    Uploaded,
+    /// Upload failed — `secondary_file_id` is NULL. The adapter skips blocks
+    /// that would reference this attachment.
+    #[sea_orm(string_value = "failed")]
+    Failed,
+}
+
+/// Provider-kind strings stored in `attachments.secondary_provider_kind`.
+/// Mirrors the CHECK constraint in
+/// `m20260417_000004_add_secondary_upload_fields`. Kept as `&str` constants
+/// rather than a sea-orm enum because the column is nullable and adapter
+/// code already discriminates on the string.
+pub mod secondary_provider_kind {
+    pub const ANTHROPIC: &str = "anthropic";
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -48,6 +48,7 @@ impl crate::domain::repos::TurnRepository for TurnRepository {
             web_search_enabled: Set(params.web_search_enabled),
             web_search_completed_count: Set(0),
             code_interpreter_completed_count: Set(0),
+            file_search_completed_count: Set(0),
             deleted_at: Set(None),
             replaced_by_request_id: Set(None),
             started_at: Set(now),
@@ -392,6 +393,7 @@ impl crate::domain::repos::TurnRepository for TurnRepository {
         let col = match tool {
             ToolCallType::WebSearch => Column::WebSearchCompletedCount,
             ToolCallType::CodeInterpreter => Column::CodeInterpreterCompletedCount,
+            ToolCallType::FileSearch => Column::FileSearchCompletedCount,
         };
         TurnEntity::update_many()
             .col_expr(col, Expr::col(col).add(1i32))

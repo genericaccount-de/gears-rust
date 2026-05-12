@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::llm::AttachmentRef;
-use crate::infra::db::entity::attachment::Model as AttachmentModel;
+use crate::infra::db::entity::attachment::{Model as AttachmentModel, SecondaryUploadStatus};
 
 /// Parameters for inserting a new attachment row in `pending` status.
 #[domain_model]
@@ -57,6 +57,24 @@ pub struct SetFailedParams {
     pub from_status: String,
 }
 
+/// Parameters for recording the outcome of a per-attachment secondary upload
+/// (currently: Anthropic Files API; see `anthropic-provider-support.md` §8.1).
+/// Status transitions: `not_attempted` → `pending` → `uploaded` | `failed`.
+#[domain_model]
+pub struct SetSecondaryUploadParams {
+    pub id: Uuid,
+    /// Provider-side file id when the upload succeeded; `None` on `pending`
+    /// or `failed`.
+    pub secondary_file_id: Option<String>,
+    /// New status — must be `Pending`, `Uploaded`, or `Failed`. The repo
+    /// rejects `NotAttempted` (set only at INSERT time).
+    pub secondary_status: SecondaryUploadStatus,
+    /// Provider-kind string (e.g. `"anthropic"`). Must be `Some` for
+    /// `Pending` and `Uploaded`; may be `None` only when transitioning to
+    /// `Failed` from a state where the provider was never recorded.
+    pub secondary_provider_kind: Option<String>,
+}
+
 /// Repository trait for attachment persistence operations.
 #[async_trait]
 #[allow(dead_code, clippy::too_many_arguments)]
@@ -85,6 +103,29 @@ pub trait AttachmentRepository: Send + Sync {
         scope: &AccessScope,
         params: SetFailedParams,
     ) -> Result<u64, DomainError>;
+    /// Update the secondary-upload state on an existing attachment.
+    ///
+    /// Independent of the primary `status` lifecycle — the row may be in any
+    /// primary status when this is called. Returns the number of rows updated
+    /// (0 if the attachment was not found or was soft-deleted).
+    async fn set_secondary_upload<C: DBRunner>(
+        &self,
+        runner: &C,
+        scope: &AccessScope,
+        params: SetSecondaryUploadParams,
+    ) -> Result<u64, DomainError>;
+    /// Build a `provider_file_id → secondary_file_id` lookup map for a chat,
+    /// restricted to attachments where `secondary_status = 'uploaded'` and
+    /// `secondary_provider_kind = provider_kind`. Used by adapters that need
+    /// to substitute provider-specific ids into outbound content blocks
+    /// (e.g. Anthropic Messages API image/document blocks).
+    async fn build_secondary_file_id_map<C: DBRunner>(
+        &self,
+        runner: &C,
+        scope: &AccessScope,
+        chat_id: Uuid,
+        provider_kind: &str,
+    ) -> Result<HashMap<String, String>, DomainError>;
     async fn get<C: DBRunner>(
         &self,
         runner: &C,

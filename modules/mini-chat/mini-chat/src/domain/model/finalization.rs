@@ -54,6 +54,8 @@ pub struct FinalizationInput {
     pub web_search_calls: u32,
     /// Number of completed code interpreter calls during this turn.
     pub code_interpreter_calls: u32,
+    /// Number of completed knowledge-search (RAG) tool calls during this turn.
+    pub file_search_calls: u32,
 
     /// Context window size of the effective model (tokens) — for summary trigger.
     pub context_window: u32,
@@ -131,4 +133,6 @@ pub struct OrphanFinalizationInput {
     pub web_search_completed_count: u32,
     /// Completed code interpreter tool calls persisted from the DB (0 if pod crashed before increment).
     pub code_interpreter_completed_count: u32,
+    /// Completed knowledge-search (RAG) tool calls persisted from the DB (0 if pod crashed before increment).
+    pub file_search_completed_count: u32,
 }

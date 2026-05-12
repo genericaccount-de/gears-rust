@@ -297,6 +297,9 @@ pub struct UsageEvent {
     pub policy_version_applied: i64,
     pub web_search_calls: u32,
     pub code_interpreter_calls: u32,
+    /// Number of completed knowledge-search (RAG) tool calls during this turn.
+    #[serde(default)]
+    pub file_search_calls: u32,
     #[serde(with = "time::serde::rfc3339")]
     pub timestamp: OffsetDateTime,
     /// `"user"` for normal turns, `"system"` for background system tasks.

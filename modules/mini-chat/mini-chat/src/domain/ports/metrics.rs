@@ -165,6 +165,15 @@ pub trait MiniChatMetricsPort: Send + Sync {
     /// `{prefix}_cleanup_vector_store_with_failed_attachments` — counter
     fn record_cleanup_vs_with_failed_attachments(&self);
 
+    /// `{prefix}_secondary_cleanup_skipped_total` — counter
+    ///
+    /// Incremented when a cleanup payload references a secondary-provider
+    /// file (e.g. Anthropic) but the corresponding client is not configured
+    /// on this replica. Each increment marks a permanent orphan on the
+    /// upstream side — operators should alert on a non-zero rate.
+    /// `provider_kind` mirrors `attachments.secondary_provider_kind`.
+    fn record_secondary_cleanup_skipped(&self, provider_kind: &str);
+
     // ── P1: Orphan Watchdog (3 metrics) ─────────────────────────────────
 
     /// `{prefix}_orphan_detected` — counter
@@ -198,6 +207,18 @@ pub trait MiniChatMetricsPort: Send + Sync {
 
     /// `{prefix}_code_interpreter_calls` — counter
     fn record_code_interpreter_calls(&self, model: &str, count: u32);
+
+    // ── P1: Knowledge Search (3 metrics) ─────────────────────────────
+
+    /// `{prefix}_knowledge_search_total` — counter
+    /// `result`: `ok`, `error`
+    fn record_knowledge_search(&self, result: &str);
+
+    /// `{prefix}_knowledge_search_latency_ms` — histogram
+    fn record_knowledge_search_latency_ms(&self, ms: f64);
+
+    /// `{prefix}_knowledge_search_chunks` — histogram (chunks returned per call)
+    fn record_knowledge_search_chunks(&self, count: f64);
 }
 
 /// No-op implementation for use in tests or when metrics are disabled.
@@ -241,6 +262,7 @@ impl MiniChatMetricsPort for NoopMetrics {
     fn record_cleanup_retry(&self, _: &str, _: &str) {}
     fn record_cleanup_backlog(&self, _: &str, _: &str, _: i64) {}
     fn record_cleanup_vs_with_failed_attachments(&self) {}
+    fn record_secondary_cleanup_skipped(&self, _: &str) {}
     fn record_orphan_detected(&self, _: &str) {}
     fn record_orphan_finalized(&self, _: &str) {}
     fn record_orphan_scan_duration_seconds(&self, _: f64) {}
@@ -248,4 +270,7 @@ impl MiniChatMetricsPort for NoopMetrics {
     fn record_thread_summary_execution(&self, _: &str) {}
     fn record_thread_summary_cas_conflict(&self) {}
     fn record_summary_fallback(&self) {}
+    fn record_knowledge_search(&self, _: &str) {}
+    fn record_knowledge_search_latency_ms(&self, _: f64) {}
+    fn record_knowledge_search_chunks(&self, _: f64) {}
 }

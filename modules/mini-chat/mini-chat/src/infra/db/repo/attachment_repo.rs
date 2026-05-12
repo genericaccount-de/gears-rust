@@ -14,11 +14,12 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::llm::AttachmentRef;
 use crate::domain::repos::{
-    InsertAttachmentParams, SetFailedParams, SetReadyParams, SetUploadedParams,
+    InsertAttachmentParams, SetFailedParams, SetReadyParams, SetSecondaryUploadParams,
+    SetUploadedParams,
 };
 use crate::infra::db::entity::attachment::{
     ActiveModel, AttachmentKind, AttachmentStatus, CleanupStatus, Column, Entity,
-    Model as AttachmentModel,
+    Model as AttachmentModel, SecondaryUploadStatus,
 };
 
 fn db_err(e: impl std::fmt::Display) -> DomainError {
@@ -71,6 +72,9 @@ impl crate::domain::repos::AttachmentRepository for AttachmentRepository {
             cleanup_attempts: Set(0),
             last_cleanup_error: Set(None),
             cleanup_updated_at: Set(None),
+            secondary_file_id: Set(None),
+            secondary_status: Set(SecondaryUploadStatus::NotAttempted),
+            secondary_provider_kind: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
             deleted_at: Set(None),
@@ -166,6 +170,47 @@ impl crate::domain::repos::AttachmentRepository for AttachmentRepository {
                 Condition::all()
                     .add(Column::Id.eq(params.id))
                     .add(Column::Status.eq(from_status))
+                    .add(Column::DeletedAt.is_null()),
+            )
+            .secure()
+            .scope_with(scope)
+            .exec(runner)
+            .await
+            .map_err(db_err)?;
+        Ok(result.rows_affected)
+    }
+
+    async fn set_secondary_upload<C: DBRunner>(
+        &self,
+        runner: &C,
+        scope: &AccessScope,
+        params: SetSecondaryUploadParams,
+    ) -> Result<u64, DomainError> {
+        let now = OffsetDateTime::now_utc();
+        // `NotAttempted` is the initial state set at INSERT time only — reject
+        // it here so the forward-transition contract is enforced.
+        if matches!(params.secondary_status, SecondaryUploadStatus::NotAttempted) {
+            return Err(DomainError::validation(
+                "set_secondary_upload cannot set status to not_attempted",
+            ));
+        }
+        let result = Entity::update_many()
+            .col_expr(
+                Column::SecondaryStatus,
+                Expr::value(params.secondary_status),
+            )
+            .col_expr(
+                Column::SecondaryFileId,
+                Expr::value(params.secondary_file_id),
+            )
+            .col_expr(
+                Column::SecondaryProviderKind,
+                Expr::value(params.secondary_provider_kind),
+            )
+            .col_expr(Column::UpdatedAt, Expr::value(now))
+            .filter(
+                Condition::all()
+                    .add(Column::Id.eq(params.id))
                     .add(Column::DeletedAt.is_null()),
             )
             .secure()
@@ -374,6 +419,45 @@ impl crate::domain::repos::AttachmentRepository for AttachmentRepository {
                     },
                 )
             })
+            .collect())
+    }
+
+    async fn build_secondary_file_id_map<C: DBRunner>(
+        &self,
+        runner: &C,
+        scope: &AccessScope,
+        chat_id: Uuid,
+        provider_kind: &str,
+    ) -> Result<HashMap<String, String>, DomainError> {
+        #[derive(Debug, FromQueryResult)]
+        struct SecondaryIdRow {
+            provider_file_id: String,
+            secondary_file_id: String,
+        }
+
+        let rows: Vec<SecondaryIdRow> = Entity::find()
+            .filter(
+                Condition::all()
+                    .add(Column::ChatId.eq(chat_id))
+                    .add(Column::DeletedAt.is_null())
+                    .add(Column::ProviderFileId.is_not_null())
+                    .add(Column::SecondaryFileId.is_not_null())
+                    .add(Column::SecondaryStatus.eq(SecondaryUploadStatus::Uploaded))
+                    .add(Column::SecondaryProviderKind.eq(provider_kind)),
+            )
+            .secure()
+            .scope_with(scope)
+            .project_all(runner, |q| {
+                q.select_only()
+                    .column(Column::ProviderFileId)
+                    .column(Column::SecondaryFileId)
+                    .into_model::<SecondaryIdRow>()
+            })
+            .await
+            .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.provider_file_id, r.secondary_file_id))
             .collect())
     }
 

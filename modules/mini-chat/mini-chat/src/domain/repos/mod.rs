@@ -14,7 +14,7 @@ mod vector_store_repo;
 
 pub(crate) use attachment_repo::{
     AttachmentRepository, InsertAttachmentParams, SetFailedParams, SetReadyParams,
-    SetUploadedParams,
+    SetSecondaryUploadParams, SetUploadedParams,
 };
 pub(crate) use chat_repo::ChatRepository;
 pub(crate) use message_attachment_repo::{
@@ -26,7 +26,7 @@ pub(crate) use message_repo::{
 pub(crate) use model_resolver::ModelResolver;
 pub(crate) use outbox_enqueuer::{
     AttachmentCleanupEvent, ChatCleanupEvent, CleanupOutcome, CleanupReason, OutboxEnqueuer,
-    ThreadSummaryTaskPayload,
+    SecondaryCleanupRef, ThreadSummaryTaskPayload,
 };
 pub(crate) use policy_snapshot_provider::PolicySnapshotProvider;
 pub(crate) use quota_usage_repo::{IncrementReserveParams, QuotaUsageRepository, SettleParams};

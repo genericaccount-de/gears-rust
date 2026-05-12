@@ -94,6 +94,11 @@ struct OutboxDeferred {
     provider_resolver: Arc<crate::infra::llm::provider_resolver::ProviderResolver>,
     model_resolver: Arc<dyn crate::domain::repos::ModelResolver>,
     thread_summary_config: crate::config::background::ThreadSummaryWorkerConfig,
+    /// `Some` when at least one configured provider uses the
+    /// `anthropic_messages` adapter. Cleanup handlers use it for the
+    /// secondary `DELETE /v1/files/{id}` after the primary delete succeeds.
+    anthropic_files_client:
+        Option<Arc<crate::infra::llm::providers::anthropic_files_client::AnthropicFilesClient>>,
 }
 
 impl Default for MiniChatModule {
@@ -141,6 +146,8 @@ impl Module for MiniChatModule {
                 .validate(id)
                 .map_err(|e| anyhow::anyhow!("providers config: {e}"))?;
         }
+        cfg.validate_provider_refs()
+            .map_err(|e| anyhow::anyhow!("providers config: {e}"))?;
         cfg.orphan_watchdog
             .validate()
             .map_err(|e| anyhow::anyhow!("orphan_watchdog config: {e}"))?;
@@ -156,6 +163,9 @@ impl Module for MiniChatModule {
         cfg.rag
             .validate()
             .map_err(|e| anyhow::anyhow!("rag config: {e}"))?;
+        cfg.knowledge_search
+            .validate()
+            .map_err(|e| anyhow::anyhow!("knowledge_search config: {e}"))?;
 
         let vendor = cfg.vendor.trim().to_owned();
         if vendor.is_empty() {
@@ -344,6 +354,46 @@ impl Module for MiniChatModule {
             cfg.outbox.num_partitions,
         ));
 
+        // ── Knowledge retriever ─────────────────────────────────────────────
+
+        let knowledge_retriever: Option<Arc<dyn crate::domain::ports::KnowledgeRetriever>> = if cfg
+            .knowledge_search
+            .enabled
+        {
+            Some(Arc::new(
+                    crate::infra::llm::providers::azure_knowledge_retriever::AzureKnowledgeRetriever::new(
+                        Arc::clone(&rag_client),
+                    ),
+                ))
+        } else {
+            None
+        };
+
+        // ── Anthropic Files API client ──────────────────────────────────────
+        //
+        // Constructed only when at least one provider entry uses the
+        // `anthropic_messages` adapter — `AttachmentService` uses it for the
+        // parallel "secondary" upload of attachments to Anthropic's Files API
+        // (see `anthropic-provider-support.md` §8.0). The client itself is
+        // upstream-agnostic; the upstream alias is passed per-call from the
+        // resolved `UploadContext`. The same client is reused by the cleanup
+        // worker to issue `DELETE /v1/files/{id}` on attachment / chat
+        // deletion.
+        let anthropic_files_client = if provider_resolver.entries().values().any(|entry| {
+            matches!(
+                entry.kind,
+                crate::infra::llm::providers::ProviderKind::AnthropicMessages
+            )
+        }) {
+            Some(Arc::new(
+                crate::infra::llm::providers::anthropic_files_client::AnthropicFilesClient::new(
+                    Arc::clone(&gateway),
+                ),
+            ))
+        } else {
+            None
+        };
+
         // Save params for start() to build + start the outbox pipeline.
         drop(self.outbox_deferred.set(OutboxDeferred {
             db: Arc::clone(&db),
@@ -358,6 +408,7 @@ impl Module for MiniChatModule {
             provider_resolver: Arc::clone(&provider_resolver),
             model_resolver: model_policy_gw.clone() as Arc<dyn crate::domain::repos::ModelResolver>,
             thread_summary_config: cfg.thread_summary_worker.clone(),
+            anthropic_files_client: anthropic_files_client.clone(),
         }));
 
         // ── Services ────────────────────────────────────────────────────────
@@ -381,6 +432,9 @@ impl Module for MiniChatModule {
             cfg.thumbnail,
             metrics,
             cfg.thread_summary_worker,
+            cfg.knowledge_search,
+            knowledge_retriever,
+            anthropic_files_client,
         ));
 
         self.service
@@ -487,6 +541,7 @@ impl RunnableCapability for MiniChatModule {
                         }),
                         max_cleanup_attempts,
                         Arc::clone(&od.metrics),
+                        od.anthropic_files_client.clone(),
                     ),
                 )
                 .queue(&od.outbox_config.chat_cleanup_queue_name, partitions)
@@ -501,6 +556,7 @@ impl RunnableCapability for MiniChatModule {
                         }),
                         max_cleanup_attempts,
                         Arc::clone(&od.metrics),
+                        od.anthropic_files_client.clone(),
                     ),
                 )
                 .queue(&od.outbox_config.thread_summary_queue_name, partitions)
