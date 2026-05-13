@@ -19,8 +19,19 @@ workspace = true
 
 [features]
 default = []
-# FIPS-140-3: compile rustls and its TLS stack with FIPS-approved cipher suites only
-fips = ["rustls/fips", "hyper-rustls/fips"]
+# FIPS-140-3: the `cyberware-rustls-fips-shim` crate pulls `rustls/fips` and
+# `hyper-rustls/fips` ONLY on non-macOS targets (its transitive deps are
+# target-gated). On macOS the corecrypto provider replaces the AWS-LC FIPS
+# backend, so `rustls/fips` is intentionally NOT activated — that is what
+# keeps the aws-lc-fips dylib out of macOS+fips builds.
+fips = [
+    "dep:rustls-fips-shim",
+    "dep:rustls-corecrypto-provider",
+    # Forward to corecrypto-provider's own `fips` feature so its
+    # `default_provider()` becomes TLS-1.3-only. See modkit::Cargo.toml
+    # for the same pattern and rustls-cng-crypto for the upstream reference.
+    "rustls-corecrypto-provider/fips",
+]
 # OpenTelemetry integration for distributed tracing
 otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 
@@ -37,6 +48,7 @@ hyper = { workspace = true, features = ["client", "http1", "http2"] }
 hyper-util = { workspace = true, features = ["client", "client-legacy", "http1", "http2", "tokio"] }
 hyper-rustls = { workspace = true }
 rustls = { workspace = true }
+webpki-roots = "1.0"
 rustls-native-certs = { workspace = true }
 rustls-pki-types = { workspace = true }
 http-body-util = { workspace = true }
@@ -57,6 +69,17 @@ rand = { workspace = true }
 # OpenTelemetry (optional, for distributed tracing)
 opentelemetry = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
+
+# Apple corecrypto-backed rustls CryptoProvider. The crate's `lib.rs` is gated
+# on `cfg(target_os = "macos")` so on Linux/Windows it is an empty lib with no
+# transitive deps — safe to list unconditionally. Activated by the `fips`
+# feature; consumed by `tls.rs::get_crypto_provider` only on macOS.
+rustls-corecrypto-provider = { workspace = true, optional = true }
+
+# Workspace-feature-unification shim that activates `rustls/fips` +
+# `hyper-rustls/fips` on non-macOS only (see crate Cargo.toml for the
+# rationale). Empty lib on every target.
+rustls-fips-shim = { workspace = true, optional = true }
 
 [dev-dependencies]
 httpmock = { workspace = true }

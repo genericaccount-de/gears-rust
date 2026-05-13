@@ -525,34 +525,25 @@ fn build_https_connector(
 ) -> Result<HttpsConnector<HttpConnector>, HttpError> {
     let allow_http = transport == TransportSecurity::AllowInsecureHttp;
 
-    match tls_roots {
-        TlsRootConfig::WebPki => {
-            let provider = tls::get_crypto_provider();
-            let builder = hyper_rustls::HttpsConnectorBuilder::new()
-                .with_provider_and_webpki_roots(provider)
-                // Preserve source error for debugging -
-                // rustls::Error implements Error + Send + Sync
-                .map_err(|e| HttpError::Tls(Box::new(e)))?;
-            let connector = if allow_http {
-                builder.https_or_http().enable_all_versions().build()
-            } else {
-                builder.https_only().enable_all_versions().build()
-            };
-            Ok(connector)
-        }
-        TlsRootConfig::Native => {
-            let client_config = tls::native_roots_client_config()
-                // Native returns String error; convert to boxed error for consistency
-                .map_err(|e| HttpError::Tls(e.into()))?;
-            let builder = hyper_rustls::HttpsConnectorBuilder::new().with_tls_config(client_config);
-            let connector = if allow_http {
-                builder.https_or_http().enable_all_versions().build()
-            } else {
-                builder.https_only().enable_all_versions().build()
-            };
-            Ok(connector)
-        }
+    // Both branches build a `ClientConfig` ourselves (rather than using
+    // `with_provider_and_webpki_roots`) so we can apply `require_ems = true`
+    // under the `fips` feature — see `tls::build_client_config`. The
+    // functions now return `tls::TlsConfigError` (= `Box<dyn Error + Send + Sync>`),
+    // which is exactly what `HttpError::Tls` wraps — no string conversion,
+    // source chain preserved.
+    let client_config = match tls_roots {
+        TlsRootConfig::WebPki => tls::webpki_roots_client_config(),
+        TlsRootConfig::Native => tls::native_roots_client_config(),
     }
+    .map_err(HttpError::Tls)?;
+
+    let builder = hyper_rustls::HttpsConnectorBuilder::new().with_tls_config(client_config);
+    let connector = if allow_http {
+        builder.https_or_http().enable_all_versions().build()
+    } else {
+        builder.https_only().enable_all_versions().build()
+    };
+    Ok(connector)
 }
 
 #[cfg(test)]

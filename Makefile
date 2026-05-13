@@ -292,14 +292,22 @@ safety: clippy kani lint dylint # geiger
 
 # -------- Code security checks --------
 
-.PHONY: deny security
+.PHONY: deny fips-policy security
 
 ## Check licenses and dependencies
 deny:
 	$(call check_tool,cargo-deny)
 	cargo deny check
 
-security: deny
+## FIPS dependency-graph policy (see deny-fips.toml + ADR 0005).
+## Refuses the build if any non-FIPS-validated crypto crate enters the
+## --features fips dep graph. Build-time analogue of Go 1.25 fips140=only.
+## Run on every PR that touches deps.
+fips-policy:
+	$(call check_tool,cargo-deny)
+	cargo deny check bans --config deny-fips.toml
+
+security: deny fips-policy
 
 # -------- API and docs --------
 

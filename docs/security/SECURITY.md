@@ -355,6 +355,10 @@ The architectural lints in the `DE03xx` series enforce **strict layering** (cont
 
 ## 9. Cryptographic Stack & FIPS-140-3
 
+> Source: [FIPS PRD](fips/PRD.md) · [ADRs in `docs/security/fips/adrs/`](fips/adrs/) · [`libs/modkit/src/bootstrap/crypto.rs`](../../libs/modkit/src/bootstrap/crypto.rs) · [`libs/rustls-corecrypto-provider/`](../../libs/rustls-corecrypto-provider/) · [`deny-fips.toml`](../../deny-fips.toml)
+
+### Default (non-FIPS) cryptographic stack
+
 The project uses `aws-lc-rs` (via `rustls`) as its primary TLS cryptographic backend. JWT validation uses `jsonwebtoken` and `aliri`.
 
 | Layer | Library | Backend |
@@ -364,17 +368,122 @@ The project uses `aws-lc-rs` (via `rustls`) as its primary TLS cryptographic bac
 | JWT validation | `jsonwebtoken`, `aliri` | `sha2`, `hmac`, `ring` |
 | Database TLS | `sqlx` (`tls-rustls-aws-lc-rs`) | `aws-lc-rs` |
 
-**FIPS-140-3 support:** the application can be built with FIPS-140-3 approved cryptography by enabling the `fips` feature flag:
+### FIPS-140-3 build (`--features fips`)
+
+Cyber Ware applications can be built with FIPS 140-3 validated cryptography by enabling the `fips` feature flag on `cyberware-modkit`, `cyberware-modkit-http`, and any binary that ships TLS. A single feature flag selects a per-target CMVP-validated backend behind one shared `rustls 0.23` TLS state machine:
+
+| Target | Validated module | How it routes |
+|---|---|---|
+| Linux (x86_64, aarch64) | **AWS-LC FIPS Provider v2** — CMVP cert [#4816](https://csrc.nist.gov/projects/cryptographic-module-validation-program/certificate/4816) | `rustls/fips` + `aws-lc-fips-sys`; activated via target-gated shim `cyberware-rustls-fips-shim` |
+| macOS (any arch) | **Apple corecrypto User-Space Module** — per-macOS-major CMVP cert (search by *"Apple corecrypto Module"* on the [CMVP database](https://csrc.nist.gov/projects/cryptographic-module-validation-program/validated-modules/search)) | In-tree `cyberware-rustls-corecrypto-provider` over `Security.framework` + `CommonCrypto` |
+| Windows (x86_64) | **Microsoft Windows CNG** (`bcrypt.dll`) — per-Windows-build CMVP cert | Community `rustls-cng-crypto` (caret-pinned `0.1.x`); requires OS-level FIPS-mode via `HKLM\System\CurrentControlSet\Control\Lsa\FipsAlgorithmPolicy = 1` |
 
 ```sh
 cargo build -p cyberware-server --features fips
 ```
 
-This switches the underlying cryptographic module from `aws-lc-sys` to `aws-lc-fips-sys` — the FIPS-validated AWS-LC module (NIST Certificate #4816). At startup, the FIPS crypto provider is installed as the process-wide default before any TLS, database, JWT, or other cryptographic operations occur. Runtime assertions verify that TLS configurations are operating in FIPS mode; the application fails fast if FIPS mode is expected but not active.
+`modkit::bootstrap::init_crypto_provider` is invoked automatically as the first step of `init_procedure` (used by `run_server` and `run_migrate`) — no explicit setup in `main()`. The function dispatches per `cfg(target_os, feature = "fips")` and installs the per-OS provider once via `OnceLock`. Subsequent calls return the cached first-call result.
 
-**Build requirements for FIPS:** CMake, Go, C compiler, C++ compiler. These are needed to build the AWS-LC FIPS module with its required integrity checks.
+**Build prerequisites:**
 
-**Important:** enabling the `fips` feature does not automatically make the entire application FIPS-140-3 compliant. Full compliance also depends on the deployment environment, operating system, and adherence to the AWS-LC security policy constraints. The `ring` crate remains in the dependency graph via `pingora-rustls` (certificate hashing only, not TLS crypto) and `aliri` (token lifecycle); these do not participate in TLS cryptographic operations.
+| Target | Toolchain |
+|---|---|
+| Linux + `fips` | C toolchain, `cmake`, `perl`, `go` (required by `aws-lc-fips-sys` build script — module integrity checks) |
+| macOS + `fips` | Xcode Command Line Tools + Rust toolchain. No `cmake` / `perl` / `go`. The per-target shim excludes `aws-lc-fips-sys` from the macOS build graph entirely. |
+| Windows + `fips` (native) | MSVC + Windows SDK. No `cmake` / `perl` / `go`. CNG is loaded at runtime from `bcrypt.dll`. |
+| Windows + `fips` (cross-compile from Linux/macOS) | `cargo install cargo-xwin` plus `ninja`. See `make check-windows-fips`. |
+
+### Algorithm scope on the wire
+
+Under `--features fips`, the `ClientHello` and `ServerHello` offer **only** FIPS-Approved algorithms. No ChaCha20-Poly1305, X25519, X25519MLKEM768 / post-quantum hybrids, Ed25519, MD5, or SHA-1 (outside the SP 800-131A legacy signature-verify allowance).
+
+| Category | Algorithms |
+|---|---|
+| TLS versions | TLS 1.2, TLS 1.3 (no TLS 1.0/1.1). **macOS is TLS 1.3-only** under FIPS — see TLS 1.2 PRF note below. |
+| TLS 1.3 cipher suites | `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384` |
+| TLS 1.2 cipher suites | `ECDHE_{ECDSA,RSA}_WITH_AES_{128,256}_GCM_SHA{256,384}` (×4 — Linux + Windows only) |
+| Key exchange | NIST P-256, P-384 ECDHE |
+| Signature verify | ECDSA P-256/P-384/P-521, RSA-PSS, RSA PKCS#1 v1.5 (SHA-256/384/512) |
+| Signature sign (server-side / mTLS) | Same scope as verify; routed through the validated module (`SecKeyCreateSignature` on macOS, `BCryptSignHash` on Windows, `EVP_PKEY_sign` on Linux) |
+| Hash / HMAC / HKDF | SHA-256, SHA-384 (HKDF is an Approved KDF per NIST SP 800-56C) |
+| TLS 1.2 Extended Master Secret (RFC 7627) | **required** (`require_ems = true`) per NIST SP 800-52 Rev. 2 §3.5 |
+| RSA modulus floor | ≥ 2048 bits (NIST FIPS 186-5 §5.1) — enforced at server-side key load on macOS |
+
+### Build-time dependency-graph policy
+
+A FIPS build must not pull in a non-FIPS-validated crypto crate, even transitively. We enforce this at **dependency-resolution time** via [`cargo-deny`](https://embarkstudios.github.io/cargo-deny/): under `--features fips`, the build fails if any banned crypto crate appears in `cargo tree`. This is the Rust analogue of Go 1.25's `fips140=only` runtime gate — Rust has no language-level hook for "refuse this crypto call", so we cut it off one step earlier, before the offending code ever links. Configured via [`deny-fips.toml`](../../deny-fips.toml); rationale in [ADR 0005](fips/adrs/0005-fips-dependency-policy.md).
+
+```sh
+make fips-policy        # Standalone — runs cargo deny check bans --config deny-fips.toml
+make security           # Runs both `deny` (license/advisory) and `fips-policy`
+```
+
+**Phase A** (shipped) bans crates not currently in the graph — zero-pain regression gate: future PRs adding `md2`/`md4`/`ripemd`, `chacha20poly1305`/`salsa20`, the Curve25519 family (`x25519-dalek`, `ed25519-dalek`, …), alternative TLS frameworks (`openssl`, `boring`, `native-tls`), or alternative rustls CryptoProviders (`rustls-symcrypt`, `rustls-mbedcrypto-provider`, `rustls-openssl`, `rustls-rustcrypto`, `rustls-graviola`, `rustls-wolfcrypto-provider`, `boring-rustls-provider`) all fail the gate.
+
+**Phase B** (pending transitive cleanup) is documented inline in `deny-fips.toml` — `ring`, non-FIPS `aws-lc-rs`, `chacha20`, `md-5`, `sha1`, `blake2`/`blake3`, `aes`, `hmac`, `hkdf`, etc. — currently pulled by upstream deps (`aliri`/`pingora-rustls`/`ureq`, rustls's default features, `rand`). Each moves to Phase A as its upstream pull-through is replaced. **Tracking**: [ADR 0005 §"Phasing"](fips/adrs/0005-fips-dependency-policy.md) and [FIPS PRD §13 TODO-7](fips/PRD.md#13-open-questions) — promotion to Phase A is the unit of work; no per-crate sub-tickets today.
+
+### Runtime Operational Environment validation
+
+A FIPS 140-3 claim is only valid when the running OS version lies inside the **Operational Environment (OE)** listed on the active CMVP certificate. The OE check has different shapes per OS:
+
+| Target | Runtime gate | Behaviour on mismatch |
+|---|---|---|
+| macOS | `cyberware_rustls_corecrypto_provider::oe::validate_oe()` reads `kern.osproductversion` via `sysctlbyname` and matches against [`SUPPORTED_OE_MACOS_MAJOR`](../../libs/rustls-corecrypto-provider/src/oe.rs). Fires as a side-effect of the first `fips_provider()` call. | Under `--features fips`: **panic** (deliberate fail-closed — cannot be silently caught by an intermediate `Result`-handling caller). Override via `CYBERWARE_FIPS_OE_OVERRIDE=1` for CI on pre-release macOS only. |
+| Linux | Not yet implemented at runtime. | OE coverage verified manually per release (CMVP cert search for cert #4816). Tracked as **TODO-8** in [FIPS PRD §13](fips/PRD.md#13-open-questions). |
+| Windows | OS-level FIPS-mode flag check (via `rustls-cng-crypto`'s empty-provider gate). Build-number-vs-CMVP-OE check not yet implemented at runtime. | If `FipsAlgorithmPolicy = 0`: bootstrap refuses to install the provider. Build-number OE check tracked as **TODO-8**. |
+
+### How to verify a build is FIPS-conformant
+
+```sh
+# 1. Wire-level — what the ClientHello actually offers:
+cargo run -p cyberware-fips-probe --features fips -- --url https://www.howsmyssl.com/a/check
+# Expected: given_cipher_suites = AES-GCM only, given_named_groups = secp256r1/secp384r1,
+#           post_quantum_key_agreement: false, [OK] No ChaCha20 in ClientHello.
+
+# 2. Dep-graph regression (cheap, no compile step):
+cargo tree --target aarch64-apple-darwin -p cyberware-example-server --features fips \
+  -e features | grep -E 'corecrypto|aws-lc-fips'
+# Expected on macOS: cyberware-rustls-corecrypto-provider present, aws-lc-fips-sys ABSENT.
+
+cargo tree --target x86_64-unknown-linux-gnu -p cyberware-example-server --features fips \
+  -e features | grep 'aws-lc-fips'
+# Expected on Linux: aws-lc-fips-sys present.
+
+cargo tree --target x86_64-pc-windows-msvc -p cyberware-example-server --features fips \
+  -e features | grep -E 'cng-crypto|aws-lc-fips'
+# Expected on Windows: rustls-cng-crypto present, aws-lc-fips-sys ABSENT.
+
+# 3. Linkage smoke — confirm only OS-supplied crypto framework is loaded:
+otool -L target/release/cyberware-server | grep -E 'aws|crypto|ssl|ring'      # macOS — expect only Security.framework
+dumpbin /imports target\release\cyberware-server.exe | findstr /i "bcrypt aws"  # Windows — expect only bcrypt.dll
+
+# 4. Dep-graph policy regression (rejects non-FIPS crypto crates):
+make fips-policy
+
+# 5. Wire-shape regression for our macOS provider:
+cargo test -p cyberware-rustls-corecrypto-provider --features fips --test fips_provider_invariants
+```
+
+See [`examples/cyberware-fips-probe/README.md`](../../examples/cyberware-fips-probe/README.md) for the full four-layer verification chain (linkage, runtime, wire-level, cert-validation).
+
+### What this does NOT claim
+
+- **Cyber Ware itself is not on the CMVP Validated Modules list.** The validated modules are Apple corecrypto, AWS-LC FIPS Provider, and Microsoft Windows CNG. Cyber Ware is a *consumer* of those modules.
+- **CMVP OE-coverage is the deployment's responsibility.** A FIPS claim is void if the running OS version is not inside the cert's OE. The macOS runtime gate is fail-closed; Linux + Windows OE coverage is verified manually per release.
+- **`CryptoProvider::fips() = true` is design intent, not a runtime witness.** It asserts that every primitive in the provider routes through a CMVP-validated module by construction. It does *not* prove that the running OS version matches an active CMVP cert OE — that proof comes from the §release-checklist CMVP-cert search.
+- **TLS 1.2 PRF on macOS is not CAVS-listed.** Apple corecrypto exposes generic HMAC primitives but not a CAVS-listed dedicated TLS PRF (unlike `aws-lc-fips`'s `tls_prf::Algorithm`). Consequence: `fips_provider()` on macOS is TLS-1.3-only; customers requiring TLS 1.2 on macOS+FIPS must accept that those connections do not carry a FIPS claim.
+- **JWT signature validation does not go through the FIPS path.** `aliri-tokens` + `jsonwebtoken` use `ring` / non-FIPS `aws-lc-rs` for RSA / ECDSA verification on bearer tokens. Treat tokens as authentication context, not as data covered by the cryptographic claim. Out of scope today; tracked as **TODO-7** in [FIPS PRD §13](fips/PRD.md#13-open-questions). Cleanup is gated by `deny-fips.toml` Phase B promotion.
+- **Non-FIPS crypto crates remain in the final binary on macOS+fips.** `ring` is pulled in transitively by `aliri`, `pingora-pool`, and `ureq`; non-FIPS `aws-lc-rs` is pulled in by rustls's default feature set; `chacha20` is pulled in by the `rand` ecosystem. These are **not invoked** on the TLS data plane (the installed `CryptoProvider` routes every TLS primitive through the validated module) but the symbols are linked into the binary. Linkage smoke (above) confirms no non-validated shared libraries appear at runtime.
+- **Server-side TLS keys load from PEM/DER bytes by default.** The bytes transit user-space memory before reaching `SecKeyCreateWithData` / `BCryptImportKeyPair` / `EVP_PKEY_new`. Strict-FIPS auditors operating under "no plaintext CSPs outside the boundary" require a Keychain / NCrypt / HSM flow; tracked as **TODO-1**.
+
+### Deep references
+
+- **[FIPS PRD](fips/PRD.md)** — full strategy: requirements (FRs, NFRs), ecosystem constraints, alternatives we rejected (OpenSSL FIPS Provider 3.1.2, Go 1.25, `native-tls`), per-OS rationale, verification gates, open TODOs.
+- **[ADR 0001 — macOS FIPS via custom corecrypto CryptoProvider](fips/adrs/0001-macos-fips-via-corecrypto-provider.md)** — why we built `cyberware-rustls-corecrypto-provider` over Apple corecrypto rather than `native-tls` or "Linux-only FIPS".
+- **[ADR 0002 — FIPS feature flag via target-conditional shim crate](fips/adrs/0002-fips-feature-target-conditional-shim.md)** — empty `cyberware-rustls-fips-shim` crate that encodes per-target Cargo feature activation.
+- **[ADR 0003 — Windows FIPS via `rustls-cng-crypto`](fips/adrs/0003-windows-fips-via-rustls-cng-crypto.md)** — why `rustls-cng-crypto` over `rustls-symcrypt` today, plus documented migration trigger.
+- **[ADR 0004 — macOS server-side TLS via corecrypto](fips/adrs/0004-macos-server-side-tls-via-corecrypto.md)** — server-side TLS / mTLS signing via `SecKeyCreateSignature`; SEC1-publicKey-only EC key load that preserves the FIPS boundary; honest TLS-1.2-PRF posture.
+- **[ADR 0005 — Workspace-level FIPS dependency policy via cargo-deny](fips/adrs/0005-fips-dependency-policy.md)** — `deny-fips.toml`, `make fips-policy`, Phase A/B/C plan.
 
 ## 10. Continuous Fuzzing
 
@@ -461,7 +570,10 @@ This ensures every new service or module repository starts with the same defense
 
 The following areas have been identified for future hardening:
 
-1. **FIPS-140-3 compliance (remaining work)** — the `fips` feature flag enables FIPS-validated TLS via `aws-lc-fips-sys`. Remaining: replace `ring`-dependent libraries (`aliri` for token lifecycle, `pingora-rustls` for certificate hashing) to eliminate `ring` from the dependency graph; route JWT and hashing operations through `aws-lc-fips-sys`
+1. **FIPS-140-3 — non-TLS crypto cleanup** — the `--features fips` build routes the **TLS data plane** through a CMVP-validated module on Linux, macOS, and Windows (see §9). Open items, tracked in the [FIPS PRD §13](fips/PRD.md#13-open-questions):
+   - **TODO-7** — JWT signature validation (`aliri-tokens` → `jsonwebtoken`) currently uses `ring` / non-FIPS `aws-lc-rs`. Audit the surface and either replace upstream, fork, or restrict JWT to symmetric HMAC. Build-time floor enforced via [`deny-fips.toml`](../../deny-fips.toml) Phase B promotion.
+   - **TODO-8** — Runtime Operational Environment validation on Linux + Windows (macOS already has a sysctl-based fail-closed gate). Today OE coverage on Linux + Windows is verified manually per release via CMVP cert search.
+   - **TODO-1** — Keychain / NCrypt / HSM-stored private keys for server-side TLS (today's PEM/DER load is acceptable for development and most production deployments where filesystem permissions guard the key).
 2. **Secure ORM type-column auto-injection** — the `ScopableEntity` trait supports a `type_col` dimension, but automatic GTS type constraint injection from PDP → `AccessScope` → SQL `WHERE` is under development
 3. **Tenant Resolver access-control plugins** — the `Unauthorized` error variant is reserved in the SDK, but no production plugin enforces caller-vs-target authorization (the static plugin allows any caller to query any configured tenant; the single-tenant plugin uses identity matching only). A policy-backed plugin would enforce fine-grained tenant visibility
 4. **Security guidelines in spec templates** — add explicit security checklist sections to PRD and DESIGN templates (threat modeling, data classification, authentication requirements per feature)

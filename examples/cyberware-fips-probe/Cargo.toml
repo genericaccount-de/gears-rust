@@ -1,0 +1,32 @@
+[package]
+name = "cyberware-fips-probe"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Outbound-HTTPS smoke probe that drives a real TLS handshake through the modkit / modkit-http stack and prints the negotiated cipher suite + the howsmyssl.com self-assessment JSON. Useful for verifying that a `--features fips` build is FIPS-conformant (only AES-GCM suites, P-curves, etc.) on macOS (corecrypto) and on Linux (AWS-LC FIPS)."
+readme = "README.md"
+publish = false
+
+[[bin]]
+name = "cyberware-fips-probe"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Inherit the FIPS chain through modkit / modkit-http: on macOS this installs
+# the corecrypto provider, on non-macOS the AWS-LC FIPS provider.
+fips = ["modkit/fips", "modkit-http/fips"]
+
+[dependencies]
+modkit = { workspace = true, features = ["bootstrap"] }
+modkit-http = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true, features = ["fmt"] }
+clap = { workspace = true, features = ["derive"] }

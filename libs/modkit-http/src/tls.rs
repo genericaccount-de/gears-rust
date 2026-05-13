@@ -57,14 +57,50 @@ pub fn native_root_certs() -> &'static [CertificateDer<'static>] {
 /// This function follows the reqwest pattern:
 /// 1. Check if a default provider is already installed globally
 /// 2. If yes, use that (respects user configuration)
-/// 3. If no, create a new aws-lc-rs provider without installing it globally
+/// 3. If no, create a new aws-lc-rs / corecrypto / AWS-LC FIPS provider
+///    **without** installing it globally
 ///
-/// This avoids global state mutation and is safe to call from multiple threads.
+/// This avoids global state mutation and is safe to call from multiple
+/// threads.
+///
+/// ## Two-providers caveat
+///
+/// The fallback at step (3) does **not** call `install_default()`. If
+/// `modkit::bootstrap::init_crypto_provider` (the canonical install
+/// site) has not yet run, every call into `get_crypto_provider()` will
+/// rebuild a provider — and `CryptoProvider::get_default()` continues
+/// to observe the absence. In practice this is benign because each
+/// build returns an `Arc` over the same module-level statics inside
+/// the underlying provider crate (corecrypto's `default_provider()`
+/// itself caches a process-wide `Arc<CryptoProvider>`, so the
+/// "concurrent providers" are byte-identical handles), but it is **not
+/// the same** as having a global default installed: code paths that
+/// later call `get_default()` (e.g. rustls internals that re-detect)
+/// will still see `None`.
+///
+/// **The canonical entry point is `modkit::bootstrap::init_crypto_provider`**.
+/// Callers outside the bootstrap path (probe binaries, ad-hoc tests)
+/// should invoke it first. The fallback here is a safety net for code
+/// that genuinely cannot run bootstrap, not a substitute for it.
 pub fn get_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     rustls::crypto::CryptoProvider::get_default()
         .cloned()
         .unwrap_or_else(|| {
-            #[cfg(feature = "fips")]
+            // Provider selection mirrors `modkit::bootstrap::init_crypto_provider`:
+            //   - fips + macOS  → Apple corecrypto, TLS 1.3-only (via
+            //                     corecrypto-provider's own `fips` feature
+            //                     that's forwarded by modkit-http's `fips`)
+            //   - fips + other  → AWS-LC FIPS
+            //   - non-fips      → AWS-LC default
+            //
+            // `default_provider()` under `feature = "fips"` is aliased to
+            // `fips_provider()` semantics by the corecrypto crate itself —
+            // same single-entry-point pattern as `rustls-cng-crypto`.
+            #[cfg(all(feature = "fips", target_os = "macos"))]
+            {
+                Arc::new(rustls_corecrypto_provider::default_provider())
+            }
+            #[cfg(all(feature = "fips", not(target_os = "macos")))]
             {
                 Arc::new(rustls::crypto::default_fips_provider())
             }
@@ -73,6 +109,72 @@ pub fn get_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
                 Arc::new(rustls::crypto::aws_lc_rs::default_provider())
             }
         })
+}
+
+/// Type alias for the fallible TLS-config builders in this module. Using a
+/// boxed `dyn Error` (rather than `String`) preserves the source-error chain
+/// from rustls and from `apply_fips_hardening`, so downstream
+/// `HttpError::Tls(_)` carries a proper `.source()`.
+pub type TlsConfigError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// Build a rustls `ClientConfig` from the given root store.
+///
+/// Under the `fips` feature, applies [`apply_fips_hardening`] which:
+///   1. forces `require_ems = true` (NIST SP 800-52 Rev. 2 §3.5), and
+///   2. verifies `config.fips() == true` and returns `Err` otherwise.
+///
+/// Returning `Err` rather than `panic!` matches the witness contract of
+/// `cyberware-rustls-corecrypto-provider`: an OE mismatch surfaces as a
+/// `fips() == false` witness, and that surfaces here as a recoverable
+/// error rather than process termination.
+fn build_client_config(
+    root_store: rustls::RootCertStore,
+) -> Result<rustls::ClientConfig, TlsConfigError> {
+    let provider = get_crypto_provider();
+
+    #[allow(unused_mut)]
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(TlsConfigError::from)?
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    #[cfg(feature = "fips")]
+    {
+        apply_fips_hardening(&mut config)?;
+    }
+
+    Ok(config)
+}
+
+/// Apply FIPS-mode hardening to a freshly-built `ClientConfig`:
+///   * set `require_ems = true` (NIST SP 800-52 Rev. 2 §3.5 — required for
+///     `ClientConfig::fips()` to consider TLS 1.2 sessions FIPS-compliant
+///     when the EMS extension is honoured by the peer).
+///   * verify the full FIPS chain reports `fips() == true`. If not, return
+///     `Err` rather than panic — the failure mode is recoverable from the
+///     caller's perspective (build a non-FIPS client, surface the error,
+///     etc.). Panic was the previous behaviour; replaced because the
+///     witness rework in `cyberware-rustls-corecrypto-provider` makes
+///     `config.fips() == false` a normal runtime state on unsupported
+///     macOS majors, not a programming error.
+#[cfg(feature = "fips")]
+fn apply_fips_hardening(cfg: &mut rustls::ClientConfig) -> Result<(), TlsConfigError> {
+    cfg.require_ems = true;
+    if !cfg.fips() {
+        return Err(
+            "TLS ClientConfig does not advertise FIPS after enabling require_ems. \
+             Either (a) init_crypto_provider() was not called before this TLS config was built, \
+             or (b) the runtime FIPS witness \
+             (cyberware_rustls_corecrypto_provider::oe::fips_witness_ok on macOS) \
+             is reporting false -- typically because the running macOS major is \
+             outside the active corecrypto CMVP cert OE. \
+             Set CYBERWARE_FIPS_OE_OVERRIDE=1 (CI / pre-release only) to force the \
+             witness to true; never set this in production."
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// Build a rustls `ClientConfig` using the cached native root certificates.
@@ -85,13 +187,13 @@ pub fn get_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 ///
 /// This fail-fast behavior ensures TLS configuration errors are caught at client
 /// construction time rather than failing later during TLS handshakes.
-pub fn native_roots_client_config() -> Result<rustls::ClientConfig, String> {
+pub fn native_roots_client_config() -> Result<rustls::ClientConfig, TlsConfigError> {
     let certs = native_root_certs();
 
     let mut root_store = rustls::RootCertStore::empty();
 
     if certs.is_empty() {
-        return Err("no native root CA certificates found in OS certificate store".to_owned());
+        return Err("no native root CA certificates found in OS certificate store".into());
     }
 
     let (added, ignored) = root_store.add_parsable_certificates(certs.iter().cloned());
@@ -109,25 +211,23 @@ pub fn native_roots_client_config() -> Result<rustls::ClientConfig, String> {
             "no valid native root CA certificates parsed (found {}, all {} failed to parse)",
             certs.len(),
             ignored
-        ));
+        )
+        .into());
     }
 
-    let provider = get_crypto_provider();
+    build_client_config(root_store)
+}
 
-    let config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| format!("failed to set TLS protocol versions: {e}"))?
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    #[cfg(feature = "fips")]
-    assert!(
-        config.fips(),
-        "TLS ClientConfig is NOT in FIPS mode - this indicates the FIPS crypto provider \
-         was not installed before TLS configuration was created"
-    );
-
-    Ok(config)
+/// Build a rustls `ClientConfig` using Mozilla's webpki-roots trust anchors.
+///
+/// Under the `fips` feature, `require_ems` is forced on (see
+/// [`build_client_config`]). This is the FIPS-conformant counterpart to the
+/// `hyper_rustls::HttpsConnectorBuilder::with_provider_and_webpki_roots`
+/// one-liner — we must build the config ourselves so we can flip the EMS bit.
+pub fn webpki_roots_client_config() -> Result<rustls::ClientConfig, TlsConfigError> {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    build_client_config(root_store)
 }
 
 #[cfg(test)]
@@ -189,5 +289,60 @@ mod tests {
 
         // We don't assert success because CI containers may not have OS certs.
         // The important thing is it doesn't panic.
+    }
+
+    /// `webpki_roots_client_config()` must always build successfully — the
+    /// trust store comes from a static `webpki-roots::TLS_SERVER_ROOTS` slice
+    /// that is non-empty on every supported platform. Catches a silent
+    /// regression if the `webpki-roots` crate ever renames its constant or
+    /// changes its `extend`-able item type.
+    ///
+    /// Asserts behavioural properties this crate actually controls:
+    ///   1. The config carries the crypto provider returned by
+    ///      `get_crypto_provider()` (non-empty cipher-suite list).
+    ///   2. The provider's cipher-suite set is non-empty — proves we did
+    ///      not accidentally build a config whose negotiation would fail
+    ///      with `NoCipherSuitesInCommon` against every peer.
+    ///   3. The provider's kx-group list is non-empty — same reasoning.
+    ///
+    /// (Asserting `alpn_protocols.len() == 0` was a rustls default we do
+    /// not control; replaced.)
+    #[test]
+    fn test_webpki_roots_client_config_builds() {
+        let cfg = webpki_roots_client_config().expect("webpki roots must always build");
+        let provider = cfg.crypto_provider();
+        assert!(
+            !provider.cipher_suites.is_empty(),
+            "TLS client config must carry a non-empty cipher-suite list"
+        );
+        assert!(
+            !provider.kx_groups.is_empty(),
+            "TLS client config must carry a non-empty kx-group list"
+        );
+    }
+
+    /// When built with `--features fips`, `build_client_config` MUST:
+    ///   1. Set `require_ems = true` (NIST SP 800-52 Rev. 2 §3.5)
+    ///   2. Make `config.fips()` return true (full FIPS chain)
+    ///
+    /// Without this, an Apple-corecrypto-backed FIPS build silently advertises
+    /// `config.fips() == false` because rustls's stock `require_ems` default
+    /// is gated on rustls's *own* `fips` feature — which we deliberately keep
+    /// off on macOS to avoid pulling the AWS-LC FIPS module.
+    ///
+    /// Exercised via the public `webpki_roots_client_config()` (which routes
+    /// through `build_client_config`); calling it avoids a hard dependency on
+    /// the OS keychain that `native_roots_client_config` carries.
+    ///
+    /// Run via `cargo test -p cf-modkit-http --features fips`.
+    #[test]
+    #[cfg(feature = "fips")]
+    fn fips_client_config_requires_ems_and_advertises_fips() {
+        let cfg = webpki_roots_client_config().expect("build under fips");
+        assert!(cfg.require_ems, "fips build must set require_ems = true");
+        assert!(
+            cfg.fips(),
+            "fips build must yield ClientConfig::fips() == true (full provider chain)"
+        );
     }
 }

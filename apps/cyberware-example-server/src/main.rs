@@ -64,12 +64,9 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Install the crypto provider before anything else.
-    // Must run before any TLS config, HTTP client, DB connection, or JWT operation.
-    if let Err(e) = modkit::bootstrap::init_crypto_provider() {
-        eprintln!("fatal: failed to install TLS crypto provider: {e}");
-        return Err(e.into());
-    }
+    // The rustls crypto provider is installed inside
+    // `modkit::bootstrap::init_procedure` (called from `run_server` /
+    // `run_migrate` below) — no explicit setup needed here.
 
     let cli = Cli::parse();
 

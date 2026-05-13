@@ -45,6 +45,8 @@ members = [
     "libs/modkit-node-info",
     "libs/modkit-transport-grpc",
     "libs/modkit-utils",
+    "libs/rustls-corecrypto-provider",
+    "libs/rustls-fips-shim",
     "libs/system-sdks",
     "libs/system-sdks/sdks/directory",
     "modules/credstore/credstore-sdk",
@@ -67,6 +69,7 @@ members = [
     "examples/oop-modules/calculator-gateway/calculator-gateway",
     "examples/oop-modules/calculator/calculator-sdk",
     "examples/oop-modules/calculator/calculator",
+    "examples/cyberware-fips-probe",
     "modules/system/types-registry/types-registry-sdk",
     "modules/system/types-registry/types-registry",
     "modules/simple-user-settings/simple-user-settings-sdk",
@@ -239,6 +242,19 @@ modkit-sdk = { package = "cyberware-modkit-sdk", version = "0.6.5", path = "libs
 modkit-security = { package = "cyberware-modkit-security", version = "0.7.0", path = "libs/modkit-security" }
 modkit-transport-grpc = { package = "cyberware-modkit-transport-grpc", version = "0.6.4", path = "libs/modkit-transport-grpc" }
 modkit-utils = { package = "cyberware-modkit-utils", version = "0.6.3", path = "libs/modkit-utils" }
+rustls-corecrypto-provider = { package = "cyberware-rustls-corecrypto-provider", version = "0.1.0", path = "libs/rustls-corecrypto-provider" }
+rustls-fips-shim = { package = "cyberware-rustls-fips-shim", version = "0.1.0", path = "libs/rustls-fips-shim" }
+
+# PKCS#8 + SEC1 envelope parsing used by the macOS corecrypto provider's
+# server-side signer (cyberware-rustls-corecrypto-provider). These crates do
+# *structural DER parsing only* — no cryptographic primitives, no scalar
+# arithmetic. EC public points are extracted from the embedded `publicKey`
+# field of SEC1 (rather than derived from the scalar in non-FIPS code),
+# preserving the FIPS-validated boundary at corecrypto for every
+# cryptographic operation. See ADR 0004.
+pkcs8 = "0.10"
+sec1 = { version = "0.7", default-features = false, features = ["alloc", "der"] }
+
 
 cyberware-system-sdks = { version = "0.1.35", path = "libs/system-sdks" }
 cyberware-system-sdk-directory = { version = "0.1.35", path = "libs/system-sdks/sdks/directory" }

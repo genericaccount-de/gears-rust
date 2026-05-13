@@ -10,6 +10,11 @@ description = "Standalone server binary for the users-info example module"
 [lints]
 workspace = true
 
+[features]
+default = []
+# FIPS-140-3: enable FIPS-validated crypto provider in transitive TLS deps
+fips = ["modkit/fips"]
+
 [dependencies]
 # ModKit bootstrap (host mode)
 modkit = { workspace = true, features = ["bootstrap"] }

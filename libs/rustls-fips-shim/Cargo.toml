@@ -1,0 +1,29 @@
+[package]
+name = "cyberware-rustls-fips-shim"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Workspace-feature-unification shim: pulls rustls + hyper-rustls with the `fips` feature on every target where the AWS-LC FIPS backend is the intended TLS provider (i.e. everywhere except macOS, where Apple corecrypto is used instead)."
+publish = false
+
+[lib]
+name = "rustls_fips_shim"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+# The shim's purpose: pull rustls + hyper-rustls with the `fips` feature
+# enabled on every target where the AWS-LC FIPS backend is valid. On macOS we
+# want NEITHER feature active (Apple corecrypto replaces the backend), so
+# this target-gated deps section is empty.
+#
+# Mere inclusion of this crate in the dependency graph causes Cargo's feature
+# unification to OR the `fips` feature into the workspace's primary `rustls`
+# and `hyper-rustls` deps. The shim has no public API — its lib is empty.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+rustls = { workspace = true, features = ["fips"] }
+hyper-rustls = { workspace = true, features = ["fips"] }

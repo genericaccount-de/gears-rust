@@ -138,6 +138,24 @@ Cyber Ware applies defense-in-depth security across the entire development lifec
 
 See **[Security Overview](docs/security/SECURITY.md)** for the full breakdown, including: Secure ORM with compile-time tenant scoping, authentication/authorization architecture (NIST SP 800-162 PDP/PEP model), 90+ Clippy deny-level rules, custom dylint architectural lints, cargo-deny advisory checks, ClusterFuzzLite continuous fuzzing, CodeQL/Scorecard/Snyk/Aikido scanners, and AI-powered PR review bots.
 
+## FIPS 140-3 support
+
+Cyber Ware builds with `--features fips` route every TLS data-path cryptographic operation through a **FIPS 140-3 validated cryptographic module**, on a single `rustls 0.23` state machine with one of three pluggable backends:
+
+| Target | Validated module | Backend |
+|---|---|---|
+| Linux (x86_64, aarch64) | AWS-LC FIPS Provider (CMVP cert **#4816**) | `aws-lc-fips-sys` via `rustls/fips` |
+| macOS (any arch) | Apple `corecrypto` User-Space Module (per-OS-version CMVP cert) | `cyberware-rustls-corecrypto-provider` over Security.framework + CommonCrypto |
+| Windows (x86_64) | Microsoft Windows CNG (per-OS-version CMVP cert) | `rustls-cng-crypto` over `bcrypt.dll` |
+
+```sh
+cargo build -p cyberware-example-server --features fips
+```
+
+This is *"uses FIPS-validated cryptography"* — Cyber Ware itself is not on the CMVP Validated Modules list; the validated modules belong to Apple, AWS Labs, and Microsoft.
+
+See **[Security Overview §9](docs/security/SECURITY.md#9-cryptographic-stack--fips-140-3)** for the full per-OS detail (algorithm scope, build prerequisites, verification gates, runtime OE-validation, dep-graph policy, what is and is not covered). Architecture, ecosystem constraints, alternatives we rejected, and per-OS rationale live in the **[FIPS PRD](docs/security/fips/PRD.md)** and the ADRs in [`docs/security/fips/adrs/`](docs/security/fips/adrs/).
+
 ## Configuration
 
 ### YAML Configuration Structure

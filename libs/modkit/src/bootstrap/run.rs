@@ -44,10 +44,9 @@ fn spawn_signal_handler(cancel: CancellationToken, context: &str) {
 /// - Problems with the database or third-party services
 /// - An issue during runtime or shutdown
 ///
-/// # Preconditions
-///
-/// The TLS crypto provider must be installed before calling this function
-/// (see [`super::init_crypto_provider`]).
+/// The TLS crypto provider is installed automatically as the first step of
+/// [`init_procedure`] (idempotent), so callers do not need to invoke
+/// [`super::init_crypto_provider`] explicitly.
 pub async fn run_server(config: AppConfig) -> Result<()> {
     init_procedure(&config).map_err(|e| {
         tracing::error!(error = %e, "Initialization failed");
@@ -119,10 +118,9 @@ pub async fn run_server(config: AppConfig) -> Result<()> {
 /// - Pre-init phase fails
 /// - Migration phase fails
 ///
-/// # Preconditions
-///
-/// The TLS crypto provider must be installed before calling this function
-/// (see [`super::init_crypto_provider`]).
+/// The TLS crypto provider is installed automatically as the first step of
+/// [`init_procedure`] (idempotent), so callers do not need to invoke
+/// [`super::init_crypto_provider`] explicitly.
 pub async fn run_migrate(config: AppConfig) -> Result<()> {
     init_procedure(&config).map_err(|e| {
         tracing::error!(error = %e, "Initialization failed");
@@ -277,14 +275,24 @@ fn try_build_oop_module_config(
 /// - registers the panic hook used to route panics through tracing
 /// - emits a small startup span and version metadata for diagnostics
 ///
-/// **Note:** the crypto provider must already be installed before calling this
-/// function (see [`super::init_crypto_provider`]).
+/// The rustls crypto provider is installed inside this function (idempotent
+/// `OnceLock`), so callers do not need to invoke
+/// [`super::init_crypto_provider`] separately. Direct callers of
+/// [`super::init_crypto_provider`] outside the bootstrap path (e.g. ad-hoc
+/// probe binaries that do not call `run_server` / `run_migrate`) are still
+/// supported.
 ///
 /// # Errors
 ///
-/// Returns an error if OpenTelemetry tracing initialization fails while tracing is enabled.
+/// Returns an error if OpenTelemetry tracing initialization fails while
+/// tracing is enabled, or if the crypto provider installation fails.
 #[cfg_attr(not(feature = "otel"), allow(clippy::unnecessary_wraps))]
 pub fn init_procedure(config: &AppConfig) -> Result<()> {
+    // Install the rustls crypto provider FIRST — before anything that may
+    // touch TLS (OTLP exporter over HTTPS, DB connections, etc.). The call
+    // is process-wide and idempotent; calling it twice is safe.
+    super::init_crypto_provider()?;
+
     // Build OpenTelemetry layer before logging
     #[cfg(feature = "otel")]
     let otel_layer = if config.opentelemetry.tracing.enabled {
