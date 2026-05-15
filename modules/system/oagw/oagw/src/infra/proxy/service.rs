@@ -1850,7 +1850,7 @@ mod tests {
             Duration::from_secs(10),
             Duration::from_secs(30),
             Duration::from_secs(3600),
-            false,
+            Arc::new(crate::domain::ssrf::SsrfGuard::disabled()),
         );
         let proxy = Arc::new(crate::infra::proxy::pingora_proxy::new_http_proxy(
             &server_conf,

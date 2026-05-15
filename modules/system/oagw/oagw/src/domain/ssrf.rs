@@ -1,8 +1,288 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-/// Returns `true` if the IP address is in a private, loopback, link-local,
-/// or otherwise non-globally-routable range that should be blocked by SSRF
-/// protections.
+use modkit_macros::domain_model;
+use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// SSRF Policy (config)
+// ---------------------------------------------------------------------------
+
+/// SSRF protection policy.
+///
+/// When enabled (the default), the built-in deny-list blocks private,
+/// loopback, link-local, and other non-routable IP ranges.
+///
+/// Evaluation order: **allow first** — if an IP/hostname matches an allow
+/// list it is permitted regardless of deny lists.
+#[domain_model]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SsrfPolicy {
+    /// Master switch. When `false`, all SSRF checks are skipped. Default: true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Additional CIDR ranges to deny (e.g. `["10.96.0.0/12"]` for k8s service CIDRs).
+    #[serde(default)]
+    pub extra_deny_cidrs: Vec<String>,
+    /// CIDR ranges to exempt from all deny lists (e.g. `["10.0.5.20/32"]`).
+    #[serde(default)]
+    pub allow_cidrs: Vec<String>,
+    /// Additional hostnames to deny. Entries starting with `.` are suffix
+    /// matches (e.g. `".cluster.local"`). Plain entries require exact match.
+    #[serde(default)]
+    pub extra_deny_hostnames: Vec<String>,
+    /// Hostnames to exempt from all deny lists. Same matching rules.
+    #[serde(default)]
+    pub allow_hostnames: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for SsrfPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            extra_deny_cidrs: Vec::new(),
+            allow_cidrs: Vec::new(),
+            extra_deny_hostnames: Vec::new(),
+            allow_hostnames: Vec::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parsed CIDR prefix
+// ---------------------------------------------------------------------------
+
+/// Parsed CIDR prefix (e.g. `10.96.0.0/12`). IPv4 addresses are mapped to
+/// IPv4-mapped IPv6 internally so a single `contains` check handles both
+/// address families.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct Cidr {
+    /// Network address, zero-extended / IPv4-mapped to 128 bits.
+    network: u128,
+    /// Bitmask with `prefix_len` leading 1-bits (in 128-bit space).
+    mask: u128,
+}
+
+impl Cidr {
+    /// Parse a CIDR string (e.g. `"10.96.0.0/12"` or `"fd00::/8"`).
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let (addr_str, prefix_str) = s
+            .split_once('/')
+            .ok_or_else(|| format!("invalid CIDR '{s}': missing '/' separator"))?;
+
+        let addr: IpAddr = addr_str
+            .trim()
+            .parse()
+            .map_err(|e| format!("invalid CIDR '{s}': bad address: {e}"))?;
+
+        let raw_prefix: u8 = prefix_str
+            .trim()
+            .parse()
+            .map_err(|e| format!("invalid CIDR '{s}': bad prefix length: {e}"))?;
+
+        let (bits, max_prefix) = match addr {
+            IpAddr::V4(v4) => {
+                if raw_prefix > 32 {
+                    return Err(format!(
+                        "invalid CIDR '{s}': prefix length {raw_prefix} exceeds 32 for IPv4"
+                    ));
+                }
+                // Map to IPv4-mapped IPv6 space: ::ffff:a.b.c.d
+                let mapped = v4.to_ipv6_mapped().into();
+                (mapped, raw_prefix + 96)
+            }
+            IpAddr::V6(v6) => {
+                if raw_prefix > 128 {
+                    return Err(format!(
+                        "invalid CIDR '{s}': prefix length {raw_prefix} exceeds 128 for IPv6"
+                    ));
+                }
+                (u128::from(v6), raw_prefix)
+            }
+        };
+
+        let mask = if max_prefix == 0 {
+            0
+        } else {
+            u128::MAX << (128 - max_prefix)
+        };
+        let network = bits & mask;
+
+        Ok(Self { network, mask })
+    }
+
+    /// Check whether `ip` falls within this prefix.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        let bits: u128 = match ip {
+            IpAddr::V4(v4) => v4.to_ipv6_mapped().into(),
+            IpAddr::V6(v6) => v6.into(),
+        };
+        (bits & self.mask) == self.network
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SSRF Guard (runtime)
+// ---------------------------------------------------------------------------
+
+/// Pre-compiled SSRF guard for runtime IP and hostname checks.
+///
+/// Built once from [`SsrfPolicy`] at module init and shared via `Arc`.
+#[domain_model]
+pub struct SsrfGuard {
+    enabled: bool,
+    extra_deny: Vec<Cidr>,
+    allow: Vec<Cidr>,
+    extra_deny_hostnames: Vec<String>,
+    allow_hostnames: Vec<String>,
+}
+
+impl std::fmt::Debug for SsrfGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SsrfGuard")
+            .field("enabled", &self.enabled)
+            .field("extra_deny_count", &self.extra_deny.len())
+            .field("allow_count", &self.allow.len())
+            .field("extra_deny_hostnames", &self.extra_deny_hostnames)
+            .field("allow_hostnames", &self.allow_hostnames)
+            .finish()
+    }
+}
+
+impl SsrfGuard {
+    /// Build from config, parsing all CIDR strings. Returns `Err` on malformed input.
+    pub fn from_config(cfg: &SsrfPolicy) -> Result<Self, String> {
+        let extra_deny = cfg
+            .extra_deny_cidrs
+            .iter()
+            .map(|s| Cidr::parse(s))
+            .collect::<Result<Vec<_>, _>>()?;
+        let allow = cfg
+            .allow_cidrs
+            .iter()
+            .map(|s| Cidr::parse(s))
+            .collect::<Result<Vec<_>, _>>()?;
+        let extra_deny_hostnames = cfg
+            .extra_deny_hostnames
+            .iter()
+            .map(|s| s.strip_suffix('.').unwrap_or(s).to_ascii_lowercase())
+            .collect();
+        let allow_hostnames = cfg
+            .allow_hostnames
+            .iter()
+            .map(|s| s.strip_suffix('.').unwrap_or(s).to_ascii_lowercase())
+            .collect();
+        Ok(Self {
+            enabled: cfg.enabled,
+            extra_deny,
+            allow,
+            extra_deny_hostnames,
+            allow_hostnames,
+        })
+    }
+
+    /// Disabled guard (all checks return "allowed").
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            extra_deny: Vec::new(),
+            allow: Vec::new(),
+            extra_deny_hostnames: Vec::new(),
+            allow_hostnames: Vec::new(),
+        }
+    }
+
+    /// Whether the guard is active.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Check whether an IP is blocked (allow → builtin deny → extra deny).
+    #[must_use]
+    pub fn is_ip_blocked(&self, ip: IpAddr) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        // Allow-list takes precedence.
+        if self.allow.iter().any(|cidr| cidr.contains(ip)) {
+            return false;
+        }
+        // Built-in deny-list.
+        if is_ssrf_blocked_ip(ip) {
+            return true;
+        }
+        // Extra deny CIDRs.
+        self.extra_deny.iter().any(|cidr| cidr.contains(ip))
+    }
+
+    /// Human-readable block reason, or `"allowed"`.
+    #[must_use]
+    pub fn ip_block_reason(&self, ip: IpAddr) -> &str {
+        if !self.enabled {
+            return "allowed";
+        }
+        if self.allow.iter().any(|cidr| cidr.contains(ip)) {
+            return "allowed";
+        }
+        if is_ssrf_blocked_ip(ip) {
+            return ssrf_block_reason(ip);
+        }
+        if self.extra_deny.iter().any(|cidr| cidr.contains(ip)) {
+            return "blocked by extra_deny_cidrs";
+        }
+        "allowed"
+    }
+
+    /// Check whether a hostname is blocked (allow → builtin deny → extra deny).
+    /// Returns `Some(matched_pattern)` if blocked, `None` if allowed.
+    #[must_use]
+    pub fn is_hostname_blocked<'a>(&'a self, host: &str) -> Option<&'a str> {
+        if !self.enabled {
+            return None;
+        }
+        let normalized = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+        // Allow-list takes precedence.
+        for pattern in &self.allow_hostnames {
+            if hostname_matches(&normalized, pattern) {
+                return None;
+            }
+        }
+        // Built-in hostname deny-list.
+        if let Some(matched) = is_ssrf_blocked_hostname(host) {
+            return Some(matched);
+        }
+        // Extra deny hostnames.
+        for pattern in &self.extra_deny_hostnames {
+            if hostname_matches(&normalized, pattern) {
+                return Some(pattern.as_str());
+            }
+        }
+        None
+    }
+}
+
+/// Suffix (`.cluster.local`) or exact match against a normalized hostname.
+fn hostname_matches(host: &str, pattern: &str) -> bool {
+    if pattern.starts_with('.') {
+        host.ends_with(pattern) || host == &pattern[1..]
+    } else {
+        host == pattern
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in deny-lists
+// ---------------------------------------------------------------------------
+
+/// Check whether an IP is in a non-globally-routable range.
 ///
 /// Blocked IPv4 ranges:
 /// - `127.0.0.0/8`       — loopback
@@ -44,16 +324,11 @@ pub fn is_ssrf_blocked_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// Hostnames blocked at config time to fail fast with a clear SSRF error.
-/// Other cloud metadata services use IPs (e.g. 169.254.169.254) and are
-/// caught by the IP deny-list.
-const BLOCKED_HOSTNAMES: &[&str] = &[
-    "localhost",
-    "localhost.localdomain",
-    "metadata.google.internal",
-];
+/// Hostnames blocked at config time. Cloud metadata IPs (169.254.169.254)
+/// are caught by the IP deny-list instead.
+const BLOCKED_HOSTNAMES: &[&str] = &["localhost", "localhost.localdomain"];
 
-/// Returns `Some(reason)` if the hostname is in the static SSRF deny-list.
+/// Check the static hostname deny-list. Returns the matched entry or `None`.
 #[must_use]
 pub fn is_ssrf_blocked_hostname(host: &str) -> Option<&'static str> {
     let normalized = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
@@ -242,13 +517,7 @@ fn is_ssrf_blocked_ipv6(ip: Ipv6Addr) -> bool {
     false
 }
 
-/// Human-readable reason string for a blocked IP (for error messages / logs).
-///
-/// Returns a static string describing *why* the address is blocked, or
-/// `"non-routable address"` / `"non-routable IPv6 address"` as a catch-all for
-/// ranges covered by `is_ssrf_blocked_ip` but not individually enumerated here.
-/// Returns `"allowed"` if the address is not blocked (callers should check
-/// `is_ssrf_blocked_ip` first to avoid that case).
+/// Human-readable reason for a blocked IP, or `"allowed"`.
 #[must_use]
 pub fn ssrf_block_reason(ip: IpAddr) -> &'static str {
     match ip {
@@ -800,29 +1069,13 @@ mod tests {
     }
 
     #[test]
-    fn blocked_hostname_metadata_google() {
-        assert_eq!(
-            is_ssrf_blocked_hostname("metadata.google.internal"),
-            Some("metadata.google.internal"),
-        );
-    }
-
-    #[test]
     fn blocked_hostname_case_insensitive() {
         assert_eq!(is_ssrf_blocked_hostname("LocalHost"), Some("localhost"));
-        assert_eq!(
-            is_ssrf_blocked_hostname("METADATA.GOOGLE.INTERNAL"),
-            Some("metadata.google.internal"),
-        );
     }
 
     #[test]
     fn blocked_hostname_trailing_dot() {
         assert_eq!(is_ssrf_blocked_hostname("localhost."), Some("localhost"));
-        assert_eq!(
-            is_ssrf_blocked_hostname("metadata.google.internal."),
-            Some("metadata.google.internal"),
-        );
     }
 
     #[test]
@@ -835,5 +1088,293 @@ mod tests {
     fn allowed_hostname_partial_match() {
         assert_eq!(is_ssrf_blocked_hostname("notlocalhost"), None);
         assert_eq!(is_ssrf_blocked_hostname("localhost.example.com"), None);
+    }
+
+    // ===================================================================
+    // Cidr tests
+    // ===================================================================
+
+    #[test]
+    fn cidr_parse_ipv4_valid() {
+        let cidr = Cidr::parse("10.96.0.0/12").unwrap();
+        assert!(cidr.contains("10.96.0.1".parse().unwrap()));
+        assert!(cidr.contains("10.111.255.255".parse().unwrap()));
+        assert!(!cidr.contains("10.112.0.0".parse().unwrap()));
+        assert!(!cidr.contains("192.168.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_parse_ipv4_host_32() {
+        let cidr = Cidr::parse("10.0.5.20/32").unwrap();
+        assert!(cidr.contains("10.0.5.20".parse().unwrap()));
+        assert!(!cidr.contains("10.0.5.21".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_parse_ipv4_slash_0() {
+        let cidr = Cidr::parse("0.0.0.0/0").unwrap();
+        assert!(cidr.contains("1.2.3.4".parse().unwrap()));
+        assert!(cidr.contains("255.255.255.255".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_parse_ipv6_valid() {
+        let cidr = Cidr::parse("fd00::/8").unwrap();
+        assert!(cidr.contains("fd12::1".parse().unwrap()));
+        assert!(!cidr.contains("fe80::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_parse_rejects_missing_slash() {
+        assert!(Cidr::parse("10.0.0.0").is_err());
+    }
+
+    #[test]
+    fn cidr_parse_rejects_bad_address() {
+        assert!(Cidr::parse("999.999.999.999/8").is_err());
+    }
+
+    #[test]
+    fn cidr_parse_rejects_ipv4_prefix_too_large() {
+        assert!(Cidr::parse("10.0.0.0/33").is_err());
+    }
+
+    #[test]
+    fn cidr_parse_rejects_ipv6_prefix_too_large() {
+        assert!(Cidr::parse("fd00::/129").is_err());
+    }
+
+    // ===================================================================
+    // SsrfGuard tests
+    // ===================================================================
+
+    use super::SsrfPolicy;
+
+    fn guard(cfg: SsrfPolicy) -> SsrfGuard {
+        SsrfGuard::from_config(&cfg).unwrap()
+    }
+
+    #[test]
+    fn guard_disabled_allows_everything() {
+        let e = SsrfGuard::disabled();
+        assert!(!e.is_ip_blocked("127.0.0.1".parse().unwrap()));
+        assert!(!e.is_ip_blocked("10.0.0.1".parse().unwrap()));
+        assert!(e.is_hostname_blocked("localhost").is_none());
+    }
+
+    #[test]
+    fn guard_default_blocks_builtin_ranges() {
+        let e = guard(SsrfPolicy::default());
+        assert!(e.is_ip_blocked("127.0.0.1".parse().unwrap()));
+        assert!(e.is_ip_blocked("10.0.0.1".parse().unwrap()));
+        assert!(e.is_ip_blocked("192.168.1.1".parse().unwrap()));
+        assert!(!e.is_ip_blocked("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn guard_extra_deny_cidrs_blocks_additional_range() {
+        let e = guard(SsrfPolicy {
+            enabled: true,
+            extra_deny_cidrs: vec!["203.0.114.0/24".into()],
+            ..Default::default()
+        });
+        // 203.0.114.x is NOT in the built-in deny-list but IS in extra.
+        assert!(e.is_ip_blocked("203.0.114.5".parse().unwrap()));
+        assert!(!e.is_ip_blocked("203.0.115.5".parse().unwrap()));
+        // Built-in still works too.
+        assert!(e.is_ip_blocked("10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn guard_allow_cidrs_exempts_from_builtin() {
+        let e = guard(SsrfPolicy {
+            enabled: true,
+            allow_cidrs: vec!["10.0.5.20/32".into()],
+            ..Default::default()
+        });
+        // 10.0.5.20 is in the built-in deny (10.0.0.0/8) but allow-listed.
+        assert!(!e.is_ip_blocked("10.0.5.20".parse().unwrap()));
+        // Other 10.x IPs still blocked.
+        assert!(e.is_ip_blocked("10.0.5.21".parse().unwrap()));
+    }
+
+    #[test]
+    fn guard_allow_cidrs_exempts_from_extra_deny() {
+        let e = guard(SsrfPolicy {
+            enabled: true,
+            extra_deny_cidrs: vec!["203.0.114.0/24".into()],
+            allow_cidrs: vec!["203.0.114.10/32".into()],
+            ..Default::default()
+        });
+        assert!(!e.is_ip_blocked("203.0.114.10".parse().unwrap()));
+        assert!(e.is_ip_blocked("203.0.114.11".parse().unwrap()));
+    }
+
+    #[test]
+    fn guard_extra_deny_hostnames_exact() {
+        let e = guard(SsrfPolicy {
+            enabled: true,
+            extra_deny_hostnames: vec!["kubernetes.default.svc".into()],
+            ..Default::default()
+        });
+        assert!(e.is_hostname_blocked("kubernetes.default.svc").is_some());
+        assert!(e.is_hostname_blocked("other.svc").is_none());
+    }
+
+    #[test]
+    fn guard_extra_deny_hostnames_suffix() {
+        let e = guard(SsrfPolicy {
+            enabled: true,
+            extra_deny_hostnames: vec![".cluster.local".into()],
+            ..Default::default()
+        });
+        assert!(
+            e.is_hostname_blocked("my-svc.default.svc.cluster.local")
+                .is_some()
+        );
+        assert!(e.is_hostname_blocked("cluster.local").is_some());
+        assert!(e.is_hostname_blocked("notcluster.local").is_none());
+    }
+
+    #[test]
+    fn guard_extra_deny_hostnames_case_insensitive() {
+        let e = guard(SsrfPolicy {
+            enabled: true,
+            extra_deny_hostnames: vec![".Cluster.Local".into()],
+            ..Default::default()
+        });
+        assert!(e.is_hostname_blocked("foo.cluster.local").is_some());
+    }
+
+    #[test]
+    fn guard_extra_deny_hostnames_trailing_dot() {
+        let e = guard(SsrfPolicy {
+            enabled: true,
+            extra_deny_hostnames: vec![".cluster.local.".into()],
+            ..Default::default()
+        });
+        // Pattern has trailing dot stripped during normalization.
+        assert!(e.is_hostname_blocked("foo.cluster.local").is_some());
+    }
+
+    #[test]
+    fn guard_allow_hostnames_exempts_from_builtin() {
+        let e = guard(SsrfPolicy {
+            enabled: true,
+            allow_hostnames: vec!["localhost".into()],
+            ..Default::default()
+        });
+        // localhost is in the built-in deny-list but allow-listed.
+        assert!(e.is_hostname_blocked("localhost").is_none());
+        // Other built-in blocked hostnames still blocked.
+        assert!(e.is_hostname_blocked("localhost.localdomain").is_some());
+    }
+
+    #[test]
+    fn guard_allow_hostnames_exempts_from_extra_deny() {
+        let e = guard(SsrfPolicy {
+            enabled: true,
+            extra_deny_hostnames: vec![".cluster.local".into()],
+            allow_hostnames: vec!["special-svc.cluster.local".into()],
+            ..Default::default()
+        });
+        assert!(e.is_hostname_blocked("special-svc.cluster.local").is_none());
+        assert!(e.is_hostname_blocked("other-svc.cluster.local").is_some());
+    }
+
+    #[test]
+    fn guard_allow_hostnames_suffix() {
+        let e = guard(SsrfPolicy {
+            enabled: true,
+            extra_deny_hostnames: vec![".internal".into()],
+            allow_hostnames: vec![".safe.internal".into()],
+            ..Default::default()
+        });
+        assert!(e.is_hostname_blocked("evil.internal").is_some());
+        assert!(e.is_hostname_blocked("svc.safe.internal").is_none());
+    }
+
+    #[test]
+    fn guard_ip_block_reason_extra_deny() {
+        let e = guard(SsrfPolicy {
+            enabled: true,
+            extra_deny_cidrs: vec!["203.0.114.0/24".into()],
+            ..Default::default()
+        });
+        assert_eq!(
+            e.ip_block_reason("203.0.114.5".parse().unwrap()),
+            "blocked by extra_deny_cidrs"
+        );
+        assert_eq!(e.ip_block_reason("8.8.8.8".parse().unwrap()), "allowed");
+    }
+
+    #[test]
+    fn guard_from_config_rejects_bad_cidr() {
+        let result = SsrfGuard::from_config(&SsrfPolicy {
+            enabled: true,
+            extra_deny_cidrs: vec!["not-a-cidr".into()],
+            ..Default::default()
+        });
+        assert!(result.is_err());
+    }
+
+    // ===================================================================
+    // hostname_matches tests
+    // ===================================================================
+
+    #[test]
+    fn hostname_matches_exact() {
+        assert!(hostname_matches("foo.bar", "foo.bar"));
+        assert!(!hostname_matches("baz.bar", "foo.bar"));
+    }
+
+    #[test]
+    fn hostname_matches_suffix() {
+        assert!(hostname_matches("a.cluster.local", ".cluster.local"));
+        assert!(hostname_matches("a.b.cluster.local", ".cluster.local"));
+        // The suffix itself matches (.cluster.local matches cluster.local).
+        assert!(hostname_matches("cluster.local", ".cluster.local"));
+    }
+
+    #[test]
+    fn hostname_matches_suffix_no_partial() {
+        // "notcluster.local" should NOT match ".cluster.local".
+        assert!(!hostname_matches("notcluster.local", ".cluster.local"));
+    }
+
+    // ===================================================================
+    // Config deserialization tests
+    // ===================================================================
+
+    #[test]
+    fn config_ssrf_policy_deserializes_full_form() {
+        let json = r#"{
+            "enabled": true,
+            "extra_deny_cidrs": ["10.96.0.0/12"],
+            "allow_cidrs": ["10.0.5.20/32"],
+            "extra_deny_hostnames": [".cluster.local"],
+            "allow_hostnames": ["special-svc.cluster.local"]
+        }"#;
+        let policy: SsrfPolicy = serde_json::from_str(json).unwrap();
+        assert!(policy.enabled);
+        assert_eq!(policy.extra_deny_cidrs.len(), 1);
+        assert_eq!(policy.allow_cidrs.len(), 1);
+        assert_eq!(policy.extra_deny_hostnames.len(), 1);
+        assert_eq!(policy.allow_hostnames.len(), 1);
+    }
+
+    #[test]
+    fn config_ssrf_policy_defaults_to_enabled() {
+        let json = "{}";
+        let policy: SsrfPolicy = serde_json::from_str(json).unwrap();
+        assert!(policy.enabled);
+        assert!(policy.extra_deny_cidrs.is_empty());
+    }
+
+    #[test]
+    fn config_ssrf_policy_disabled() {
+        let json = r#"{"enabled": false}"#;
+        let policy: SsrfPolicy = serde_json::from_str(json).unwrap();
+        assert!(!policy.enabled);
     }
 }

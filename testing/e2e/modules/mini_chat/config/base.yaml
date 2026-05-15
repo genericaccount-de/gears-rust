@@ -112,7 +112,8 @@ modules:
     config:
       proxy_timeout_secs: 30
       allow_http_upstream: false
-      ssrf_protection: false # Disabled for e2e tests (mock upstreams use 127.0.0.1)
+      ssrf_policy:
+        enabled: false # Disabled for e2e tests (mock upstreams use 127.0.0.1)
 
   file-parser:
     config:

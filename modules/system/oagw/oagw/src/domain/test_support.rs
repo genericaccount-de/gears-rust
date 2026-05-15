@@ -9,6 +9,7 @@ use crate::domain::services::{
     ControlPlaneService, ControlPlaneServiceImpl, DataPlaneService, EndpointSelector,
     ServiceGatewayClientV1Facade,
 };
+use crate::domain::ssrf::SsrfGuard;
 use crate::infra::proxy::DataPlaneServiceImpl;
 use crate::infra::storage::{InMemoryRouteRepo, InMemoryUpstreamRepo};
 use async_trait::async_trait;
@@ -525,7 +526,7 @@ impl TestCpBuilder {
             tenant_resolver,
             allow_all_enforcer(),
             credstore,
-            false,
+            Arc::new(SsrfGuard::disabled()),
         ));
 
         cp
@@ -666,7 +667,7 @@ impl TestDpBuilder {
             Duration::from_secs(10),
             Duration::from_secs(30),
             Duration::from_secs(3600),
-            false,
+            Arc::new(SsrfGuard::disabled()),
         )
         .with_skip_upstream_tls_verify(self.skip_upstream_tls_verify);
         let proxy = Arc::new(crate::infra::proxy::pingora_proxy::new_http_proxy(
@@ -676,7 +677,11 @@ impl TestDpBuilder {
 
         let backend_selector: Arc<dyn EndpointSelector> =
             self.backend_selector.unwrap_or_else(|| {
-                Arc::new(crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new(false))
+                Arc::new(
+                    crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new(Arc::new(
+                        SsrfGuard::disabled(),
+                    )),
+                )
             });
 
         let mut svc = DataPlaneServiceImpl::new(
@@ -732,8 +737,11 @@ pub fn build_test_app_state(
     cp_builder: TestCpBuilder,
     dp_builder: TestDpBuilder,
 ) -> TestAppState {
-    let backend_selector: Arc<dyn EndpointSelector> =
-        Arc::new(crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new(false));
+    let backend_selector: Arc<dyn EndpointSelector> = Arc::new(
+        crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new(Arc::new(
+            SsrfGuard::disabled(),
+        )),
+    );
     let cp = cp_builder.build_and_register(hub);
     let dp = dp_builder
         .with_backend_selector(backend_selector.clone())

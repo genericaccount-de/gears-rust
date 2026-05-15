@@ -2,6 +2,8 @@ use std::{fmt, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::ssrf::SsrfPolicy;
+
 /// Configuration for the OAGW module.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,12 +56,11 @@ pub struct OagwConfig {
     /// (create / update / delete) are omitted. Default: `true`.
     #[serde(default = "default_true")]
     pub management_api_enabled: bool,
-    /// Enable SSRF protection: block DNS-resolved and statically-configured
-    /// IP addresses in private/loopback/link-local ranges. Disable for
-    /// deployments that legitimately proxy to internal services.
-    /// Default: `true`.
-    #[serde(default = "default_true")]
-    pub ssrf_protection: bool,
+    /// SSRF protection policy. Controls which upstream IPs and hostnames are
+    /// blocked. See [`SsrfPolicy`] for available fields.
+    /// Default: enabled with built-in deny-list, no extra rules.
+    #[serde(default)]
+    pub ssrf_policy: SsrfPolicy,
 }
 
 impl Default for OagwConfig {
@@ -76,7 +77,7 @@ impl Default for OagwConfig {
             streaming_idle_timeout_secs: default_streaming_idle_timeout_secs(),
             protocol_cache_ttl_secs: default_protocol_cache_ttl_secs(),
             management_api_enabled: true,
-            ssrf_protection: true,
+            ssrf_policy: SsrfPolicy::default(),
         }
     }
 }
@@ -211,7 +212,7 @@ impl fmt::Debug for OagwConfig {
             )
             .field("protocol_cache_ttl_secs", &self.protocol_cache_ttl_secs)
             .field("management_api_enabled", &self.management_api_enabled)
-            .field("ssrf_protection", &self.ssrf_protection)
+            .field("ssrf_policy", &self.ssrf_policy)
             .finish()
     }
 }

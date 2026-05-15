@@ -1,7 +1,7 @@
 use crate::domain::error::DomainError;
 use crate::domain::model::{Endpoint, ListQuery, MatchRules, Route};
 use crate::domain::repo::RouteRepository;
-use crate::domain::ssrf;
+use crate::domain::ssrf::SsrfGuard;
 use uuid::Uuid;
 
 /// Ensure exactly one of `http` or `grpc` is present in the match rules.
@@ -88,28 +88,33 @@ pub(in crate::domain::services) fn validate_endpoints(
     Ok(())
 }
 
-/// Validate endpoints against SSRF deny-lists.
+/// Validate endpoints against the SSRF guard.
 ///
-/// Rejects endpoints whose host is a known SSRF hostname (e.g. `localhost`,
-/// cloud metadata services) or parses as a blocked IP address.
+/// Rejects endpoints whose host is a blocked hostname or whose IP address
+/// is denied by the built-in or extra deny-lists (unless allow-listed).
+/// When the guard is disabled, this is a no-op.
 pub(in crate::domain::services) fn validate_endpoints_ssrf(
+    guard: &SsrfGuard,
     endpoints: &[Endpoint],
 ) -> Result<(), DomainError> {
+    if !guard.is_enabled() {
+        return Ok(());
+    }
     for (i, ep) in endpoints.iter().enumerate() {
         let host = ep.normalized_host();
-        if let Some(blocked) = ssrf::is_ssrf_blocked_hostname(&host) {
+        if let Some(blocked) = guard.is_hostname_blocked(&host) {
             return Err(DomainError::validation(format!(
                 "endpoint[{i}] hostname '{}' is blocked by SSRF protection (matches '{blocked}')",
                 ep.host,
             )));
         }
         if let Ok(ip) = host.parse::<std::net::IpAddr>()
-            && ssrf::is_ssrf_blocked_ip(ip)
+            && guard.is_ip_blocked(ip)
         {
             return Err(DomainError::validation(format!(
                 "endpoint[{i}] IP address '{}' is blocked by SSRF protection: {}",
                 ep.host,
-                ssrf::ssrf_block_reason(ip),
+                guard.ip_block_reason(ip),
             )));
         }
     }

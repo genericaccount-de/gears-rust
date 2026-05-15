@@ -8,6 +8,7 @@ mod validation;
 use std::sync::Arc;
 
 use super::ControlPlaneService;
+use crate::domain::ssrf::SsrfGuard;
 
 use crate::domain::error::DomainError;
 use crate::domain::model::{
@@ -16,10 +17,9 @@ use crate::domain::model::{
 };
 use crate::domain::repo::{RouteRepository, UpstreamRepository};
 
-use alias::{
-    compute_derived_alias, enforce_alias_create, enforce_alias_update, normalize_alias,
-    validate_alias,
-};
+#[cfg(test)]
+use alias::compute_derived_alias;
+use alias::{enforce_alias_create, enforce_alias_update, normalize_alias};
 use bind::{BindOverrides, validate_ancestor_bind};
 use budget::validate_budget_config;
 #[cfg(test)]
@@ -46,7 +46,7 @@ pub(crate) struct ControlPlaneServiceImpl {
     tenant_resolver: Arc<dyn TenantResolverClient>,
     policy_enforcer: PolicyEnforcer,
     credstore: Arc<dyn CredStoreClientV1>,
-    ssrf_protection: bool,
+    ssrf_guard: Arc<SsrfGuard>,
 }
 
 impl ControlPlaneServiceImpl {
@@ -57,7 +57,7 @@ impl ControlPlaneServiceImpl {
         tenant_resolver: Arc<dyn TenantResolverClient>,
         policy_enforcer: PolicyEnforcer,
         credstore: Arc<dyn CredStoreClientV1>,
-        ssrf_protection: bool,
+        ssrf_guard: Arc<SsrfGuard>,
     ) -> Self {
         Self {
             upstreams,
@@ -65,7 +65,7 @@ impl ControlPlaneServiceImpl {
             tenant_resolver,
             policy_enforcer,
             credstore,
-            ssrf_protection,
+            ssrf_guard,
         }
     }
 }
@@ -84,9 +84,7 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
         req: CreateUpstreamRequest,
     ) -> Result<Upstream, DomainError> {
         validate_endpoints(&req.server.endpoints)?;
-        if self.ssrf_protection {
-            validate_endpoints_ssrf(&req.server.endpoints)?;
-        }
+        validate_endpoints_ssrf(&self.ssrf_guard, &req.server.endpoints)?;
         if let Some(ref cors) = req.cors {
             crate::domain::cors::validate_cors_config(cors)?;
         }
@@ -183,9 +181,7 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
 
         // Full replacement: validate and apply server.
         validate_endpoints(&req.server.endpoints)?;
-        if self.ssrf_protection {
-            validate_endpoints_ssrf(&req.server.endpoints)?;
-        }
+        validate_endpoints_ssrf(&self.ssrf_guard, &req.server.endpoints)?;
         existing.server = req.server;
         existing.protocol = req.protocol;
 

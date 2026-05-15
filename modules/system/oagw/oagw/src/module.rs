@@ -2,6 +2,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::config::{OagwConfig, TokenCacheConfig};
+use crate::domain::ssrf::SsrfGuard;
 use crate::domain::type_catalog::oagw_gts_entities;
 use crate::domain::type_provisioning::TypeProvisioningService;
 use crate::infra::type_provisioning::TypeProvisioningServiceImpl;
@@ -64,6 +65,13 @@ impl Module for OutboundApiGatewayModule {
             .map_err(|e| anyhow::anyhow!("invalid OAGW config: {e}"))?;
         info!("OAGW config: proxy_timeout_secs={}", cfg.proxy_timeout_secs);
 
+        // -- SSRF guard (shared across CP, DP, selectors) --
+        let ssrf_guard = Arc::new(
+            SsrfGuard::from_config(&cfg.ssrf_policy)
+                .map_err(|e| anyhow::anyhow!("invalid SSRF policy config: {e}"))?,
+        );
+        info!(ssrf_policy = ?ssrf_guard, "SSRF guard initialized");
+
         // -- Control Plane init --
         let upstream_repo = Arc::new(InMemoryUpstreamRepo::new());
         let route_repo = Arc::new(InMemoryRouteRepo::new());
@@ -81,7 +89,7 @@ impl Module for OutboundApiGatewayModule {
             tenant_resolver,
             policy_enforcer.clone(),
             credstore.clone(),
-            cfg.ssrf_protection,
+            ssrf_guard.clone(),
         ));
 
         // -- Data Plane init (Pingora proxy engine) --
@@ -96,14 +104,14 @@ impl Module for OutboundApiGatewayModule {
             connect_timeout,
             read_timeout,
             protocol_cache_ttl,
-            cfg.ssrf_protection,
+            ssrf_guard.clone(),
         );
         let proxy = Arc::new(crate::infra::proxy::pingora_proxy::new_http_proxy(
             &server_conf,
             pingora_proxy,
         ));
         let backend_selector: Arc<dyn EndpointSelector> = Arc::new(
-            crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new(cfg.ssrf_protection),
+            crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new(ssrf_guard.clone()),
         );
 
         let token_http_config = if cfg.allow_http_upstream {

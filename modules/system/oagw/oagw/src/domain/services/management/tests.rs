@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::domain::model::{
     Endpoint, HttpMatch, HttpMethod, MatchRules, PathSuffixMode, Scheme, Server,
 };
+use crate::domain::ssrf::SsrfGuard;
 
 use super::*;
 use crate::domain::test_support::{
@@ -18,7 +19,7 @@ fn make_service() -> ControlPlaneServiceImpl {
         Arc::new(MockTenantResolverClient::single_tenant()),
         allow_all_enforcer(),
         Arc::new(MockCredStoreClient::empty()),
-        false,
+        Arc::new(SsrfGuard::disabled()),
     )
 }
 
@@ -29,7 +30,7 @@ fn make_service_with_resolver(resolver: MockTenantResolverClient) -> ControlPlan
         Arc::new(resolver),
         allow_all_enforcer(),
         Arc::new(MockCredStoreClient::empty()),
-        false,
+        Arc::new(SsrfGuard::disabled()),
     )
 }
 
@@ -43,7 +44,7 @@ fn make_service_with_resolver_and_creds(
         Arc::new(resolver),
         allow_all_enforcer(),
         Arc::new(MockCredStoreClient::with_secrets(creds)),
-        false,
+        Arc::new(SsrfGuard::disabled()),
     )
 }
 
@@ -4529,6 +4530,10 @@ fn merge_rate_limit_allocated_does_not_set_pool_owner_id() {
 
 // -- validate_endpoints_ssrf tests --
 
+fn default_guard() -> SsrfGuard {
+    SsrfGuard::from_config(&Default::default()).unwrap()
+}
+
 #[test]
 fn ssrf_rejects_loopback_ip() {
     let endpoints = vec![Endpoint {
@@ -4536,7 +4541,7 @@ fn ssrf_rejects_loopback_ip() {
         host: "127.0.0.1".into(),
         port: 443,
     }];
-    let err = validate_endpoints_ssrf(&endpoints).unwrap_err();
+    let err = validate_endpoints_ssrf(&default_guard(), &endpoints).unwrap_err();
     match err {
         DomainError::Validation { detail, .. } => {
             assert!(
@@ -4555,7 +4560,7 @@ fn ssrf_rejects_private_10_x() {
         host: "10.0.0.1".into(),
         port: 443,
     }];
-    let err = validate_endpoints_ssrf(&endpoints).unwrap_err();
+    let err = validate_endpoints_ssrf(&default_guard(), &endpoints).unwrap_err();
     assert!(matches!(err, DomainError::Validation { .. }));
 }
 
@@ -4566,7 +4571,7 @@ fn ssrf_rejects_private_172_16() {
         host: "172.16.0.1".into(),
         port: 443,
     }];
-    let err = validate_endpoints_ssrf(&endpoints).unwrap_err();
+    let err = validate_endpoints_ssrf(&default_guard(), &endpoints).unwrap_err();
     assert!(matches!(err, DomainError::Validation { .. }));
 }
 
@@ -4577,7 +4582,7 @@ fn ssrf_rejects_private_192_168() {
         host: "192.168.1.1".into(),
         port: 443,
     }];
-    let err = validate_endpoints_ssrf(&endpoints).unwrap_err();
+    let err = validate_endpoints_ssrf(&default_guard(), &endpoints).unwrap_err();
     assert!(matches!(err, DomainError::Validation { .. }));
 }
 
@@ -4588,7 +4593,7 @@ fn ssrf_rejects_link_local_metadata() {
         host: "169.254.169.254".into(),
         port: 80,
     }];
-    let err = validate_endpoints_ssrf(&endpoints).unwrap_err();
+    let err = validate_endpoints_ssrf(&default_guard(), &endpoints).unwrap_err();
     match err {
         DomainError::Validation { detail, .. } => {
             assert!(
@@ -4607,7 +4612,7 @@ fn ssrf_allows_public_ip() {
         host: "8.8.8.8".into(),
         port: 443,
     }];
-    assert!(validate_endpoints_ssrf(&endpoints).is_ok());
+    assert!(validate_endpoints_ssrf(&default_guard(), &endpoints).is_ok());
 }
 
 #[test]
@@ -4617,7 +4622,7 @@ fn ssrf_allows_hostname_endpoints() {
         host: "api.openai.com".into(),
         port: 443,
     }];
-    assert!(validate_endpoints_ssrf(&endpoints).is_ok());
+    assert!(validate_endpoints_ssrf(&default_guard(), &endpoints).is_ok());
 }
 
 #[test]
@@ -4627,7 +4632,7 @@ fn ssrf_rejects_localhost() {
         host: "localhost".into(),
         port: 443,
     }];
-    let err = validate_endpoints_ssrf(&endpoints).unwrap_err();
+    let err = validate_endpoints_ssrf(&default_guard(), &endpoints).unwrap_err();
     match err {
         DomainError::Validation { detail, .. } => {
             assert!(detail.contains("SSRF protection"), "got: {detail}");
@@ -4645,22 +4650,29 @@ fn ssrf_rejects_localhost_localdomain() {
         port: 443,
     }];
     assert!(matches!(
-        validate_endpoints_ssrf(&endpoints),
+        validate_endpoints_ssrf(&default_guard(), &endpoints),
         Err(DomainError::Validation { .. })
     ));
 }
 
 #[test]
-fn ssrf_rejects_metadata_google_internal() {
+fn ssrf_extra_deny_hostnames_blocks_suffix() {
+    use crate::domain::ssrf::SsrfPolicy;
+    let guard = SsrfGuard::from_config(&SsrfPolicy {
+        enabled: true,
+        extra_deny_hostnames: vec![".cluster.local".into()],
+        ..Default::default()
+    })
+    .unwrap();
     let endpoints = vec![Endpoint {
         scheme: Scheme::Http,
-        host: "metadata.google.internal".into(),
+        host: "my-svc.default.svc.cluster.local".into(),
         port: 80,
     }];
-    let err = validate_endpoints_ssrf(&endpoints).unwrap_err();
+    let err = validate_endpoints_ssrf(&guard, &endpoints).unwrap_err();
     match err {
         DomainError::Validation { detail, .. } => {
-            assert!(detail.contains("metadata.google.internal"), "got: {detail}");
+            assert!(detail.contains("cluster.local"), "got: {detail}");
         }
         _ => panic!("expected Validation, got: {err:?}"),
     }
@@ -4674,7 +4686,7 @@ fn ssrf_rejects_localhost_case_insensitive() {
         port: 443,
     }];
     assert!(matches!(
-        validate_endpoints_ssrf(&endpoints),
+        validate_endpoints_ssrf(&default_guard(), &endpoints),
         Err(DomainError::Validation { .. })
     ));
 }
@@ -4687,7 +4699,7 @@ fn ssrf_rejects_localhost_trailing_dot() {
         port: 443,
     }];
     assert!(matches!(
-        validate_endpoints_ssrf(&endpoints),
+        validate_endpoints_ssrf(&default_guard(), &endpoints),
         Err(DomainError::Validation { .. })
     ));
 }
@@ -4706,7 +4718,7 @@ fn ssrf_rejects_second_endpoint_in_list() {
             port: 443,
         },
     ];
-    let err = validate_endpoints_ssrf(&endpoints).unwrap_err();
+    let err = validate_endpoints_ssrf(&default_guard(), &endpoints).unwrap_err();
     match err {
         DomainError::Validation { detail, .. } => {
             assert!(
@@ -4727,7 +4739,7 @@ fn make_service_ssrf_enabled() -> ControlPlaneServiceImpl {
         Arc::new(MockTenantResolverClient::single_tenant()),
         allow_all_enforcer(),
         Arc::new(MockCredStoreClient::empty()),
-        true,
+        Arc::new(SsrfGuard::from_config(&Default::default()).unwrap()),
     )
 }
 
