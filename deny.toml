@@ -80,6 +80,10 @@ exceptions = [
   #      reviewed for license changes.
   # Reviewer sign-off required before removing or modifying this exception.
   { name = "kreuzberg", version = "=4.9.4", allow = ["Elastic-2.0"] },
+  # aws-lc-fips-sys vendors AWS-LC-FIPS sources carrying an OpenSSL license term
+  # as part of the upstream license expression. We do not allow OpenSSL globally,
+  # so keep this exception pinned to the reviewed crate release only.
+  { name = "aws-lc-fips-sys", version = "=0.13.14", allow = ["OpenSSL"] },
 ]
 
 # Private workspace crates handling
