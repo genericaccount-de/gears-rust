@@ -213,6 +213,11 @@ fn orphan_input_from_turn(turn: &TurnModel) -> OrphanFinalizationInput {
                 warn!(turn_id = %turn.id, value = turn.code_interpreter_completed_count, "negative code_interpreter_completed_count in DB, defaulting to 0");
                 0
             }),
+        file_search_completed_count: u32::try_from(turn.file_search_completed_count)
+            .unwrap_or_else(|_| {
+                warn!(turn_id = %turn.id, value = turn.file_search_completed_count, "negative file_search_completed_count in DB, defaulting to 0");
+                0
+            }),
     }
 }
 
@@ -354,6 +359,7 @@ mod tests {
     fn stub_turn(
         web_search_completed_count: i32,
         code_interpreter_completed_count: i32,
+        file_search_completed_count: i32,
     ) -> TurnModel {
         use crate::infra::db::entity::chat_turn::TurnState;
         TurnModel {
@@ -378,6 +384,7 @@ mod tests {
             web_search_enabled: false,
             web_search_completed_count,
             code_interpreter_completed_count,
+            file_search_completed_count,
             deleted_at: None,
             replaced_by_request_id: None,
             started_at: time::OffsetDateTime::now_utc(),
@@ -389,23 +396,31 @@ mod tests {
 
     #[test]
     fn orphan_input_maps_tool_counts() {
-        let turn = stub_turn(3, 5);
+        let turn = stub_turn(3, 5, 7);
         let input = orphan_input_from_turn(&turn);
         assert_eq!(input.web_search_completed_count, 3);
         assert_eq!(input.code_interpreter_completed_count, 5);
+        assert_eq!(input.file_search_completed_count, 7);
     }
 
     #[test]
     fn orphan_input_clamps_negative_web_search_count() {
-        let turn = stub_turn(-1, 0);
+        let turn = stub_turn(-1, 0, 0);
         let input = orphan_input_from_turn(&turn);
         assert_eq!(input.web_search_completed_count, 0);
     }
 
     #[test]
     fn orphan_input_clamps_negative_code_interpreter_count() {
-        let turn = stub_turn(0, -2);
+        let turn = stub_turn(0, -2, 0);
         let input = orphan_input_from_turn(&turn);
         assert_eq!(input.code_interpreter_completed_count, 0);
+    }
+
+    #[test]
+    fn orphan_input_clamps_negative_file_search_count() {
+        let turn = stub_turn(0, 0, -3);
+        let input = orphan_input_from_turn(&turn);
+        assert_eq!(input.file_search_completed_count, 0);
     }
 }

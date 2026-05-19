@@ -709,6 +709,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                         policy_version_applied: input.policy_version_applied.unwrap_or(0),
                         web_search_calls: input.web_search_completed_count,
                         code_interpreter_calls: input.code_interpreter_completed_count,
+                        file_search_calls: input.file_search_completed_count,
                         timestamp: now,
                         requester_type: "user".to_owned(),
                         dedupe_key: None,
@@ -880,6 +881,7 @@ fn build_usage_event(
         policy_version_applied: input.policy_version_applied,
         web_search_calls: input.web_search_calls,
         code_interpreter_calls: input.code_interpreter_calls,
+        file_search_calls: input.file_search_calls,
         timestamp: time::OffsetDateTime::now_utc(),
         requester_type: "user".to_owned(),
         dedupe_key: None,
@@ -1195,6 +1197,7 @@ mod tests {
             ],
             web_search_calls: 3,
             code_interpreter_calls: 0,
+            file_search_calls: 0,
             context_window: 128_000,
             assembled_context_tokens: 0,
             messages_truncated: false,
@@ -1955,6 +1958,7 @@ mod tests {
             started_at: time::OffsetDateTime::now_utc(),
             web_search_completed_count: 0,
             code_interpreter_completed_count: 0,
+            file_search_completed_count: 0,
         };
 
         let result = svc.finalize_orphan_turn(input, 60).await.unwrap();
@@ -2033,6 +2037,7 @@ mod tests {
             started_at: time::OffsetDateTime::now_utc(),
             web_search_completed_count: 3,
             code_interpreter_completed_count: 2,
+            file_search_completed_count: 4,
         };
 
         let result = svc.finalize_orphan_turn(input, 60).await.unwrap();
@@ -2047,6 +2052,10 @@ mod tests {
         assert_eq!(
             usage_events[0].code_interpreter_calls, 2,
             "code_interpreter_calls must reflect persisted count"
+        );
+        assert_eq!(
+            usage_events[0].file_search_calls, 4,
+            "file_search_calls must reflect persisted count"
         );
     }
 
@@ -2101,6 +2110,7 @@ mod tests {
             started_at: time::OffsetDateTime::now_utc(),
             web_search_completed_count: 0,
             code_interpreter_completed_count: 0,
+            file_search_completed_count: 0,
         };
 
         let result = svc.finalize_orphan_turn(input, 60).await.unwrap();
@@ -2152,6 +2162,7 @@ mod tests {
             started_at: time::OffsetDateTime::now_utc(),
             web_search_completed_count: 0,
             code_interpreter_completed_count: 0,
+            file_search_completed_count: 0,
         };
 
         let result = svc.finalize_orphan_turn(input, 60).await.unwrap();

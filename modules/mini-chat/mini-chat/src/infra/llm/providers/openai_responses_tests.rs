@@ -493,41 +493,58 @@ fn builder_user_field_format() {
 }
 
 #[test]
-fn builder_function_tool_dropped() {
+fn builder_function_tool_included() {
     let request = llm_request("gpt-4o")
         .tool(LlmTool::Function {
-            name: "get_weather".into(),
-            description: "Get weather".into(),
-            parameters: serde_json::json!({}),
+            name: "search_knowledge".into(),
+            description: "Search the knowledge base".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
         })
         .build_streaming();
 
     let body = build_request_body(&request, true);
 
-    // Function tools are dropped for Responses API
-    assert!(body.get("tools").is_none());
+    // Function tools are forwarded to the Responses API for agentic tool use
+    let tools = body.get("tools").expect("tools should be present");
+    assert_eq!(tools[0]["type"], "function");
+    assert_eq!(tools[0]["name"], "search_knowledge");
+}
+
+/// Test helper: build a `ModelApiParams` with sensible defaults that
+/// individual tests override field-by-field.
+fn test_api_params() -> mini_chat_sdk::ModelApiParams {
+    mini_chat_sdk::ModelApiParams {
+        temperature: 0.7,
+        top_p: 1.0,
+        frequency_penalty: 0.0,
+        presence_penalty: 0.0,
+        stop: vec![],
+        extra_body: None,
+        reasoning_effort: None,
+    }
 }
 
 #[test]
 fn builder_reasoning_effort_nested_under_reasoning() {
     let request = llm_request("o3")
         .message(LlmMessage::user("Think hard"))
-        .additional_params(serde_json::json!({
-            "temperature": 1.0,
-            "reasoning_effort": "high"
-        }))
+        .api_params(mini_chat_sdk::ModelApiParams {
+            temperature: 1.0,
+            reasoning_effort: Some("high".into()),
+            ..test_api_params()
+        })
         .build_streaming();
 
     let body = build_request_body(&request, true);
 
-    // Top-level key must be removed
+    // Top-level Chat-Completions-style key is never written
     assert!(
         body.get("reasoning_effort").is_none(),
         "reasoning_effort should not appear at top level"
     );
-    // Must be nested as `reasoning.effort`
+    // Responses API expects `reasoning: { effort }`
     assert_eq!(body["reasoning"]["effort"], "high");
-    // Other additional_params are still top-level
+    // Other typed params land at top level
     assert_eq!(body["temperature"], 1.0);
 }
 
@@ -535,9 +552,7 @@ fn builder_reasoning_effort_nested_under_reasoning() {
 fn builder_no_reasoning_key_when_effort_absent() {
     let request = llm_request("gpt-4o")
         .message(LlmMessage::user("Hello"))
-        .additional_params(serde_json::json!({
-            "temperature": 0.7
-        }))
+        .api_params(test_api_params())
         .build_streaming();
 
     let body = build_request_body(&request, true);
@@ -688,12 +703,12 @@ fn parse_code_interpreter_completed_event_ignores_file_outputs() {
     let event = ServerEvent {
         event: Some("response.code_interpreter_call.completed".to_string()),
         data: r#"{
-                "outputs": [
-                    {"type":"files","file_id":"file-abc"},
-                    {"type":"logs","logs":"only this"},
-                    {"type":"files","file_id":"file-def"}
-                ]
-            }"#
+            "outputs": [
+                {"type":"files","file_id":"file-abc"},
+                {"type":"logs","logs":"only this"},
+                {"type":"files","file_id":"file-def"}
+            ]
+        }"#
         .to_string(),
         id: None,
         retry: None,
@@ -710,11 +725,11 @@ fn parse_code_interpreter_completed_event_ignores_file_outputs() {
 #[test]
 fn parse_response_completed_event() {
     let event = ServerEvent {
-            event: Some("response.completed".to_string()),
-            data: r#"{"response":{"id":"resp-abc","output":[{"type":"message","content":[{"type":"output_text","text":"Hello","annotations":[]}]}],"usage":{"input_tokens":100,"output_tokens":50}}}"#.to_string(),
-            id: None,
-            retry: None,
-        };
+        event: Some("response.completed".to_string()),
+        data: r#"{"response":{"id":"resp-abc","output":[{"type":"message","content":[{"type":"output_text","text":"Hello","annotations":[]}]}],"usage":{"input_tokens":100,"output_tokens":50}}}"#.to_string(),
+        id: None,
+        retry: None,
+    };
     let result = ProviderEvent::from_server_event(event).unwrap();
     match result {
         ProviderEvent::ResponseCompleted { response } => {
@@ -729,11 +744,11 @@ fn parse_response_completed_event() {
 #[test]
 fn parse_response_completed_with_token_details() {
     let event = ServerEvent {
-            event: Some("response.completed".to_string()),
-            data: r#"{"response":{"id":"resp-abc","output":[],"usage":{"input_tokens":800,"output_tokens":200,"input_tokens_details":{"cached_tokens":300},"output_tokens_details":{"reasoning_tokens":60}}}}"#.to_string(),
-            id: None,
-            retry: None,
-        };
+        event: Some("response.completed".to_string()),
+        data: r#"{"response":{"id":"resp-abc","output":[],"usage":{"input_tokens":800,"output_tokens":200,"input_tokens_details":{"cached_tokens":300},"output_tokens_details":{"reasoning_tokens":60}}}}"#.to_string(),
+        id: None,
+        retry: None,
+    };
     let result = ProviderEvent::from_server_event(event).unwrap();
     match result {
         ProviderEvent::ResponseCompleted { response } => {
@@ -781,11 +796,11 @@ fn parse_response_failed_event() {
 #[test]
 fn parse_response_incomplete_event() {
     let event = ServerEvent {
-            event: Some("response.incomplete".to_string()),
-            data: r#"{"response":{"id":"resp-inc","output":[],"usage":{"input_tokens":200,"output_tokens":4096},"incomplete_details":{"reason":"max_output_tokens"}}}"#.to_string(),
-            id: None,
-            retry: None,
-        };
+        event: Some("response.incomplete".to_string()),
+        data: r#"{"response":{"id":"resp-inc","output":[],"usage":{"input_tokens":200,"output_tokens":4096},"incomplete_details":{"reason":"max_output_tokens"}}}"#.to_string(),
+        id: None,
+        retry: None,
+    };
     let result = ProviderEvent::from_server_event(event).unwrap();
     match result {
         ProviderEvent::ResponseIncomplete { response } => {
@@ -1100,6 +1115,7 @@ fn extract_citations_file_citation() {
                     text: Some("snippet".into()),
                 }],
             }],
+            ..Default::default()
         }],
         usage: RawUsage {
             input_tokens: 0,
@@ -1137,6 +1153,7 @@ fn extract_citations_url_citation() {
                     text: None,
                 }],
             }],
+            ..Default::default()
         }],
         usage: RawUsage {
             input_tokens: 0,
@@ -1164,6 +1181,7 @@ fn extract_citations_empty_annotations() {
                 text: "Hello".into(),
                 annotations: vec![],
             }],
+            ..Default::default()
         }],
         usage: RawUsage {
             input_tokens: 0,
@@ -1197,6 +1215,7 @@ fn extract_citations_url_citation_snippet_from_text_range() {
                     text: None,
                 }],
             }],
+            ..Default::default()
         }],
         usage: RawUsage {
             input_tokens: 0,
@@ -1230,6 +1249,7 @@ fn extract_citations_url_citation_snippet_from_annotation_text() {
                     text: Some("explicit snippet".into()),
                 }],
             }],
+            ..Default::default()
         }],
         usage: RawUsage {
             input_tokens: 0,
@@ -1263,6 +1283,7 @@ fn extract_citations_url_citation_no_text_no_indices() {
                     text: None,
                 }],
             }],
+            ..Default::default()
         }],
         usage: RawUsage {
             input_tokens: 0,

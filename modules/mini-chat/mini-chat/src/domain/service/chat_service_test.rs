@@ -10,8 +10,8 @@ use crate::infra::db::repo::chat_repo::ChatRepository as OrmChatRepository;
 use super::ChatService;
 use crate::domain::service::test_helpers::{
     MockThreadSummaryRepo, NoopOutboxEnqueuer, inmem_db, mock_db_provider, mock_enforcer,
-    mock_model_resolver, mock_tenant_only_enforcer, mock_thread_summary_repo, test_security_ctx,
-    test_security_ctx_with_id,
+    mock_model_resolver, mock_provider_resolver, mock_tenant_only_enforcer,
+    mock_thread_summary_repo, test_security_ctx, test_security_ctx_with_id,
 };
 use crate::infra::db::repo::attachment_repo::AttachmentRepository as OrmAttachmentRepository;
 
@@ -35,6 +35,7 @@ fn build_service_with_enforcer(
         Arc::new(NoopOutboxEnqueuer),
         enforcer,
         mock_model_resolver(),
+        mock_provider_resolver(),
     )
 }
 
@@ -594,6 +595,7 @@ async fn get_chat_message_count_reflects_inserted_messages() {
         Arc::new(NoopOutboxEnqueuer),
         mock_enforcer(),
         mock_model_resolver(),
+        mock_provider_resolver(),
     );
 
     let tenant_id = Uuid::new_v4();

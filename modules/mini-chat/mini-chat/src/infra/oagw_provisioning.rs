@@ -124,6 +124,10 @@ async fn create_upstream(
         });
     }
 
+    if let Some(headers) = crate::infra::llm::providers::upstream_headers_for_kind(entry.kind) {
+        builder = builder.headers(headers);
+    }
+
     match gateway.create_upstream(ctx.clone(), builder.build()).await {
         Ok(u) => {
             info!(
@@ -194,6 +198,10 @@ async fn create_tenant_upstream(
             sharing: oagw_sdk::SharingMode::Inherit,
             config: Some(config.clone()),
         });
+    }
+
+    if let Some(headers) = crate::infra::llm::providers::upstream_headers_for_kind(entry.kind) {
+        builder = builder.headers(headers);
     }
 
     match gateway.create_upstream(ctx.clone(), builder.build()).await {

@@ -208,6 +208,11 @@ impl<
         thumbnail_config: ThumbnailConfig,
         metrics: Arc<dyn MiniChatMetricsPort>,
         summary_config: crate::config::background::ThreadSummaryWorkerConfig,
+        knowledge_search_config: crate::config::KnowledgeSearchConfig,
+        knowledge_retriever: Option<Arc<dyn crate::domain::ports::KnowledgeRetriever>>,
+        anthropic_files_client: Option<
+            Arc<crate::infra::llm::providers::anthropic_files_client::AnthropicFilesClient>,
+        >,
     ) -> Self {
         let enforcer = PolicyEnforcer::new(authz);
 
@@ -254,6 +259,7 @@ impl<
                 Arc::clone(outbox_enqueuer),
                 enforcer.clone(),
                 Arc::clone(model_resolver),
+                Arc::clone(provider_resolver),
             ),
             messages: MessageService::new(
                 Arc::clone(&db),
@@ -279,6 +285,8 @@ impl<
                 context_config,
                 rag_config.clone(),
                 Arc::clone(&metrics),
+                knowledge_search_config,
+                knowledge_retriever,
             ),
             turns,
             reactions: ReactionService::new(
@@ -302,6 +310,7 @@ impl<
                 rag_config,
                 thumbnail_config,
                 Arc::clone(&metrics),
+                anthropic_files_client,
             ),
             models: ModelService::new(
                 Arc::clone(&db),

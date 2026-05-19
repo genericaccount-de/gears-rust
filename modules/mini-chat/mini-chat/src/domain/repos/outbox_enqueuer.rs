@@ -8,6 +8,19 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::model::audit_envelope::AuditEnvelope;
 
+/// Coordinates needed to issue a provider-specific `DELETE` against a
+/// secondary upload.
+#[domain_model]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecondaryCleanupRef {
+    /// Provider-side file id stored in `attachments.secondary_file_id`.
+    pub file_id: String,
+    /// Which provider's id is in `file_id` (e.g. `"anthropic"`).
+    pub provider_kind: String,
+    /// OAGW upstream alias for the secondary provider.
+    pub upstream_alias: String,
+}
+
 /// Payload for attachment cleanup outbox events.
 ///
 /// Enqueued within the delete transaction so cleanup workers can
@@ -24,6 +37,11 @@ pub struct AttachmentCleanupEvent {
     pub storage_backend: String,
     pub attachment_kind: String,
     pub deleted_at: OffsetDateTime,
+    /// `Some` when the chat performed a secondary upload that succeeded
+    /// (`secondary_status = uploaded`). The cleanup worker uses this to
+    /// issue a provider-specific `DELETE` after the primary delete succeeds.
+    #[serde(default)]
+    pub secondary_ref: Option<SecondaryCleanupRef>,
 }
 
 /// Why provider cleanup was triggered.
@@ -63,6 +81,13 @@ pub struct ChatCleanupEvent {
     pub system_request_id: Uuid,
     #[serde(with = "time::serde::rfc3339")]
     pub chat_deleted_at: OffsetDateTime,
+    /// OAGW upstream alias for the chat's secondary-upload provider, when
+    /// the chat is backed by one (e.g. Anthropic) and at least one
+    /// attachment may have a secondary file id to clean up. `None` for
+    /// chats without a secondary provider. Resolved at chat-delete time so
+    /// the handler doesn't need a `ProviderResolver` dependency.
+    #[serde(default)]
+    pub secondary_upstream_alias: Option<String>,
 }
 
 /// Durable outbox payload for thread summary generation.

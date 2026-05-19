@@ -21,6 +21,7 @@ pub mod key {
     pub const RESOURCE_TYPE: &str = "resource_type";
     #[allow(dead_code)] // declared ahead of call site (metrics infra uses string literals)
     pub const STATE: &str = "state";
+    pub const PROVIDER_KIND: &str = "provider_kind";
 }
 
 // ── Label values ─────────────────────────────────────────────────────────

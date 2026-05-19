@@ -1,3 +1,5 @@
+#![allow(clippy::non_ascii_literal)]
+
 use std::collections::HashMap;
 
 use secrecy::{ExposeSecret, SecretString};
@@ -52,6 +54,9 @@ pub struct MiniChatConfig {
     /// Image thumbnail generation settings.
     #[serde(default)]
     pub thumbnail: ThumbnailConfig,
+    /// Knowledge search (RAG) feature configuration.
+    #[serde(default)]
+    pub knowledge_search: KnowledgeSearchConfig,
 }
 
 /// Which file/vector-store implementation to use for RAG operations.
@@ -154,6 +159,18 @@ pub struct ProviderEntry {
     /// Required for Azure (`?api-version=…`). Ignored for `OpenAI`.
     #[serde(default)]
     pub api_version: Option<String>,
+    /// Provider ID to use for RAG storage operations (file upload, vector store, search).
+    ///
+    /// Required for providers that have no file storage of their own (e.g. Anthropic).
+    /// When set, `DispatchingFileStorage`, `DispatchingVectorStore`, and the
+    /// knowledge-search upstream alias are all resolved from this provider instead
+    /// of the LLM provider's entry.
+    ///
+    /// Example: set `rag_provider = "azure_openai"` on the `anthropic` provider entry
+    /// so that file upload and vector search continue to target Azure even when the
+    /// chat is served by Claude.
+    #[serde(default)]
+    pub rag_provider: Option<String>,
     /// Per-tenant overrides. Key = tenant ID (UUID string).
     /// Overrides host and/or auth for specific tenants while sharing
     /// the same adapter kind and API path.
@@ -256,6 +273,24 @@ impl ProviderEntry {
     }
 }
 
+impl MiniChatConfig {
+    /// Validate that every `rag_provider` reference resolves to a known entry.
+    ///
+    /// Catches config typos at boot rather than at first request.
+    pub fn validate_provider_refs(&self) -> Result<(), String> {
+        for (id, entry) in &self.providers {
+            if let Some(ref rag_id) = entry.rag_provider
+                && !self.providers.contains_key(rag_id)
+            {
+                return Err(format!(
+                    "provider '{id}' has rag_provider = '{rag_id}' which is not a known provider"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -289,6 +324,7 @@ fn default_providers() -> HashMap<String, ProviderEntry> {
             supports_file_search_filters: true,
             storage_kind: StorageKind::OpenAi,
             api_version: None,
+            rag_provider: None,
             tenant_overrides: HashMap::new(),
         },
     );
@@ -404,6 +440,7 @@ impl Default for MiniChatConfig {
             thread_summary_worker: ThreadSummaryWorkerConfig::default(),
             cleanup_worker: CleanupWorkerConfig::default(),
             thumbnail: ThumbnailConfig::default(),
+            knowledge_search: KnowledgeSearchConfig::default(),
         }
     }
 }
@@ -905,6 +942,108 @@ impl ThumbnailConfig {
     }
 }
 
+// ── Knowledge search config ──────────────────────────────────────────────
+
+fn default_knowledge_search_max_calls() -> u32 {
+    3
+}
+
+fn default_knowledge_search_top_k() -> usize {
+    5
+}
+
+fn default_knowledge_search_max_chunk_chars() -> usize {
+    2000
+}
+
+fn default_knowledge_search_guard() -> String {
+    "You have access to a tool called search_knowledge that searches the organization \
+     knowledge base. Use it when the question relates to internal documents or when \
+     retrieved context would improve your answer. Do NOT answer from memory when the \
+     question is about internal topics — always prefer search_knowledge. \
+     Use retrieved content only and cite sources inline as [SOURCE_1], [SOURCE_2], etc."
+        .to_owned()
+}
+
+/// Configuration for the pluggable `search_knowledge` RAG tool (issue #1251).
+///
+/// When `enabled` is `true` and `vector_store_id` is set, the model can call
+/// `search_knowledge` as a function tool. The agentic loop in the provider task
+/// intercepts the function call, queries the Azure vector store, injects the
+/// results as a `function_call_output` message, and continues streaming.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeSearchConfig {
+    /// Enable the `search_knowledge` function tool. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Azure `OpenAI` vector store ID to search.
+    /// Required when `enabled = true`; ignored otherwise.
+    #[serde(default)]
+    pub vector_store_id: Option<String>,
+
+    /// Provider ID (key in `providers` map) that holds the vector store.
+    /// Must match a provider entry with `storage_kind = "azure"`.
+    #[serde(default)]
+    pub provider_id: Option<String>,
+
+    /// Maximum `search_knowledge` calls per message in the agentic loop.
+    /// Default: 3.
+    #[serde(default = "default_knowledge_search_max_calls")]
+    pub max_calls_per_message: u32,
+
+    /// Number of chunks to retrieve per call (top-k). Default: 5.
+    #[serde(default = "default_knowledge_search_top_k")]
+    pub top_k: usize,
+
+    /// Maximum number of characters kept per retrieved chunk after post-processing.
+    /// Bounds the per-call context token cost. Default: 2000 (~500 tokens).
+    #[serde(default = "default_knowledge_search_max_chunk_chars")]
+    pub max_chunk_chars: usize,
+
+    /// Guard instruction appended to system prompt when enabled.
+    #[serde(default = "default_knowledge_search_guard")]
+    pub guard: String,
+}
+
+impl Default for KnowledgeSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            vector_store_id: None,
+            provider_id: None,
+            max_calls_per_message: default_knowledge_search_max_calls(),
+            top_k: default_knowledge_search_top_k(),
+            max_chunk_chars: default_knowledge_search_max_chunk_chars(),
+            guard: default_knowledge_search_guard(),
+        }
+    }
+}
+
+impl KnowledgeSearchConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.enabled {
+            if self.vector_store_id.as_deref().is_none_or(str::is_empty) {
+                return Err("knowledge_search.vector_store_id must be set when enabled".to_owned());
+            }
+            if self.provider_id.as_deref().is_none_or(str::is_empty) {
+                return Err("knowledge_search.provider_id must be set when enabled".to_owned());
+            }
+        }
+        if self.max_calls_per_message == 0 {
+            return Err("knowledge_search.max_calls_per_message must be > 0".to_owned());
+        }
+        if self.top_k == 0 {
+            return Err("knowledge_search.top_k must be > 0".to_owned());
+        }
+        if self.max_chunk_chars == 0 {
+            return Err("knowledge_search.max_chunk_chars must be > 0".to_owned());
+        }
+        Ok(())
+    }
+}
+
 fn default_url_prefix() -> String {
     DEFAULT_URL_PREFIX.to_owned()
 }
@@ -1220,6 +1359,7 @@ mod tests {
             supports_file_search_filters: true,
             storage_kind: StorageKind::Azure,
             api_version: Some("2024-10-21".to_owned()),
+            rag_provider: None,
             tenant_overrides: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -1285,6 +1425,7 @@ mod tests {
             supports_file_search_filters: true,
             storage_kind: StorageKind::Azure,
             api_version: Some("2024-10-21".to_owned()),
+            rag_provider: None,
             tenant_overrides: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -1342,6 +1483,7 @@ mod tests {
             supports_file_search_filters: true,
             storage_kind: StorageKind::Azure,
             api_version: Some("2024-10-21".to_owned()),
+            rag_provider: None,
             tenant_overrides: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -1376,6 +1518,7 @@ mod tests {
             supports_file_search_filters: true,
             storage_kind: StorageKind::Azure,
             api_version: Some("2024-10-21".to_owned()),
+            rag_provider: None,
             tenant_overrides: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -1414,6 +1557,7 @@ mod tests {
             supports_file_search_filters: true,
             storage_kind: StorageKind::Azure,
             api_version: Some("2024-10-21".to_owned()),
+            rag_provider: None,
             tenant_overrides: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -1448,6 +1592,7 @@ mod tests {
             supports_file_search_filters: true,
             storage_kind: StorageKind::Azure,
             api_version: Some("2024-10-21".to_owned()),
+            rag_provider: None,
             tenant_overrides: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -1480,6 +1625,7 @@ mod tests {
             supports_file_search_filters: true,
             storage_kind: StorageKind::Azure,
             api_version: Some("2024-10-21".to_owned()),
+            rag_provider: None,
             tenant_overrides: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -1560,6 +1706,68 @@ mod tests {
             .validate()
             .is_ok()
         );
+    }
+
+    fn provider_entry_with_rag(rag_provider: Option<&str>) -> ProviderEntry {
+        ProviderEntry {
+            kind: crate::infra::llm::ProviderKind::OpenAiResponses,
+            upstream_alias: None,
+            host: "host.example.com".to_owned(),
+            port: None,
+            use_http: false,
+            api_path: "/v1/responses".to_owned(),
+            auth_plugin_type: None,
+            auth_config: None,
+            storage_backend: None,
+            supports_file_search_filters: true,
+            storage_kind: StorageKind::OpenAi,
+            api_version: None,
+            rag_provider: rag_provider.map(str::to_owned),
+            tenant_overrides: HashMap::new(),
+        }
+    }
+
+    fn config_with_providers(providers: HashMap<String, ProviderEntry>) -> MiniChatConfig {
+        MiniChatConfig {
+            providers,
+            ..MiniChatConfig::default()
+        }
+    }
+
+    #[test]
+    fn validate_provider_refs_accepts_resolved_reference() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "anthropic".to_owned(),
+            provider_entry_with_rag(Some("azure")),
+        );
+        providers.insert("azure".to_owned(), provider_entry_with_rag(None));
+        config_with_providers(providers)
+            .validate_provider_refs()
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_provider_refs_accepts_no_reference() {
+        let mut providers = HashMap::new();
+        providers.insert("openai".to_owned(), provider_entry_with_rag(None));
+        config_with_providers(providers)
+            .validate_provider_refs()
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_provider_refs_rejects_unknown_reference() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "anthropic".to_owned(),
+            provider_entry_with_rag(Some("does_not_exist")),
+        );
+        let err = config_with_providers(providers)
+            .validate_provider_refs()
+            .unwrap_err();
+        assert!(err.contains("anthropic"));
+        assert!(err.contains("does_not_exist"));
     }
 
     #[test]

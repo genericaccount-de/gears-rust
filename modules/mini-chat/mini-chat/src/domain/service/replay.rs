@@ -332,6 +332,7 @@ mod tests {
             web_search_enabled: false,
             web_search_completed_count: 0,
             code_interpreter_completed_count: 0,
+            file_search_completed_count: 0,
             deleted_at: None,
             replaced_by_request_id: None,
             started_at: OffsetDateTime::now_utc(),

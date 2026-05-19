@@ -244,6 +244,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
         provider_response_id: Option<String>,
         web_search_calls: u32,
         code_interpreter_calls: u32,
+        file_search_calls: u32,
         ttft_ms: Option<u64>,
         total_ms: Option<u64>,
     ) -> crate::domain::model::finalization::FinalizationInput {
@@ -275,6 +276,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
             period_starts: self.period_starts.clone(),
             web_search_calls,
             code_interpreter_calls,
+            file_search_calls,
             context_window: self.context_window,
             assembled_context_tokens: self.assembled_context_tokens,
             messages_truncated: self.messages_truncated,
@@ -331,17 +333,30 @@ pub(super) fn requester_type_from_str(s: Option<&str>) -> RequesterType {
 
 /// Normalize an [`LlmProviderError`] to a `(code, message)` pair for the SSE
 /// error event. Messages are already sanitized by the infra layer.
+///
+/// The `code` is a stable token the UI maps to a category (see
+/// `error-messages.ts` `CODE_MAP`). The `message` is shown verbatim as the
+/// detail text and is intentionally crafted to be informative — the upstream
+/// provider's classification, when available, is preserved here so operators
+/// debugging from the UI alone can identify whether a failure is a
+/// `rate_limit_error`, `invalid_request_error`, etc.
 pub(super) fn normalize_error(err: &LlmProviderError) -> (String, String) {
     match err {
-        LlmProviderError::RateLimited { .. } => (
-            "rate_limited".to_owned(),
-            "Rate limited by provider".to_owned(),
-        ),
+        LlmProviderError::RateLimited { retry_after_secs } => {
+            let message = match retry_after_secs {
+                Some(secs) => format!("Rate limited by provider; retry in {secs}s"),
+                None => "Rate limited by provider".to_owned(),
+            };
+            ("rate_limited".to_owned(), message)
+        }
         LlmProviderError::Timeout => (
             "provider_timeout".to_owned(),
             "Provider request timed out".to_owned(),
         ),
         LlmProviderError::ProviderError { message, .. } => {
+            // `message` already carries the upstream code and HTTP status —
+            // see `parse_anthropic_error` and friends. Pass it through so the
+            // UI shows the full story.
             ("provider_error".to_owned(), message.clone())
         }
         LlmProviderError::InvalidResponse { detail } => (

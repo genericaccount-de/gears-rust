@@ -49,6 +49,7 @@ fn test_provider_resolver(
             supports_file_search_filters: true,
             storage_kind: StorageKind::OpenAi,
             api_version: None,
+            rag_provider: None,
             tenant_overrides: HashMap::new(),
         },
     );
@@ -99,6 +100,7 @@ fn build_service(
         rag_config,
         crate::config::ThumbnailConfig::default(),
         Arc::new(crate::domain::ports::metrics::NoopMetrics),
+        None, // anthropic_files_client — not exercised in this test fixture
     )
 }
 
@@ -147,6 +149,7 @@ fn build_service_with_metrics(
         rag_config,
         crate::config::ThumbnailConfig::default(),
         metrics,
+        None, // anthropic_files_client — not exercised in this test fixture
     )
 }
 
@@ -2043,6 +2046,7 @@ fn dual_provider_resolver(
             supports_file_search_filters: true,
             storage_kind: StorageKind::OpenAi,
             api_version: None,
+            rag_provider: None,
             tenant_overrides: HashMap::new(),
         },
     );
@@ -2061,6 +2065,7 @@ fn dual_provider_resolver(
             supports_file_search_filters: false,
             storage_kind: StorageKind::Azure,
             api_version: Some("2024-10-21".to_owned()),
+            rag_provider: None,
             tenant_overrides: HashMap::new(),
         },
     );
@@ -2155,6 +2160,7 @@ fn build_service_azure(
         rag_config,
         crate::config::ThumbnailConfig::default(),
         Arc::new(crate::domain::ports::metrics::NoopMetrics),
+        None, // anthropic_files_client — not exercised in this test fixture
     )
 }
 
@@ -2635,6 +2641,7 @@ async fn test_openai_file_storage_uses_tenant_specific_alias() {
             supports_file_search_filters: true,
             storage_kind: StorageKind::OpenAi,
             api_version: None,
+            rag_provider: None,
             tenant_overrides,
         },
     );
@@ -2754,6 +2761,7 @@ async fn test_upload_limits_ccm_tighter_than_configmap() {
             rag_config,
             crate::config::ThumbnailConfig::default(),
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
+            None, // anthropic_files_client — not exercised in this test fixture
         );
 
     let upload_ctx = svc.get_upload_context(&ctx, chat_id).await.unwrap();

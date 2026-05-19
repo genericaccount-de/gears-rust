@@ -151,6 +151,37 @@ impl ProviderResolver {
             .or(entry.upstream_alias.as_deref())
     }
 
+    /// Resolve the RAG storage provider ID for a given LLM provider.
+    ///
+    /// Returns `rag_provider` if configured on the entry, otherwise the
+    /// `provider_id` itself (backward-compatible — existing all-in-one providers
+    /// like `azure_openai` need no change).
+    ///
+    /// Use this whenever routing file upload, vector store, or search operations
+    /// to ensure Anthropic-backed chats still reach Azure storage.
+    #[must_use]
+    pub fn resolve_rag_provider<'a>(&'a self, provider_id: &'a str) -> &'a str {
+        self.registry
+            .get(provider_id)
+            .and_then(|entry| entry.rag_provider.as_deref())
+            .unwrap_or(provider_id)
+    }
+
+    /// Whether the configured provider uses the Anthropic Messages adapter.
+    ///
+    /// Used by `AttachmentService` to decide whether to perform a parallel
+    /// upload to Anthropic's Files API in addition to the primary Azure/OpenAI
+    /// upload (see `anthropic-provider-support.md` §8.0).
+    #[must_use]
+    pub fn is_anthropic_messages(&self, provider_id: &str) -> bool {
+        self.registry.get(provider_id).is_some_and(|entry| {
+            matches!(
+                entry.kind,
+                crate::infra::llm::providers::ProviderKind::AnthropicMessages
+            )
+        })
+    }
+
     /// Whether the provider supports `file_search` filters (metadata filtering).
     ///
     /// Azure `OpenAI` does NOT support filters — `FilteredByAttachmentIds` must
@@ -192,6 +223,7 @@ impl ProviderResolver {
                 supports_file_search_filters: true,
                 storage_kind: StorageKind::OpenAi,
                 api_version: None,
+                rag_provider: None,
                 tenant_overrides: HashMap::new(),
             },
         );
@@ -321,6 +353,7 @@ mod tests {
                 supports_file_search_filters: true,
                 storage_kind: StorageKind::OpenAi,
                 api_version: None,
+                rag_provider: None,
                 tenant_overrides: HashMap::new(),
             },
         );
@@ -339,6 +372,7 @@ mod tests {
                 supports_file_search_filters: false,
                 storage_kind: StorageKind::Azure,
                 api_version: Some("2024-10-21".to_owned()),
+                rag_provider: None,
                 tenant_overrides: HashMap::new(),
             },
         );
@@ -394,6 +428,7 @@ mod tests {
                 supports_file_search_filters: true,
                 storage_kind: StorageKind::Azure,
                 api_version: Some("2024-10-21".to_owned()),
+                rag_provider: None,
                 tenant_overrides: {
                     let mut t = HashMap::new();
                     t.insert(
@@ -519,6 +554,7 @@ mod tests {
                 supports_file_search_filters: true,
                 storage_kind: StorageKind::Azure,
                 api_version: Some("2024-10-21".to_owned()),
+                rag_provider: None,
                 tenant_overrides: HashMap::new(),
             },
         );
@@ -572,5 +608,45 @@ mod tests {
             err.contains("storage_kind"),
             "error should mention storage_kind: {err}"
         );
+    }
+
+    // ── resolve_rag_provider ──
+
+    #[test]
+    fn resolve_rag_provider_with_rag_provider_set_returns_rag_provider() {
+        let mut m = HashMap::new();
+        m.insert(
+            "anthropic".to_owned(),
+            ProviderEntry {
+                kind: ProviderKind::AnthropicMessages,
+                upstream_alias: Some("anthropic.alias".to_owned()),
+                host: "api.anthropic.com".to_owned(),
+                port: None,
+                use_http: false,
+                api_path: "/v1/messages".to_owned(),
+                auth_plugin_type: None,
+                auth_config: None,
+                storage_backend: None,
+                supports_file_search_filters: false,
+                storage_kind: StorageKind::OpenAi,
+                api_version: None,
+                rag_provider: Some("azure_openai".to_owned()),
+                tenant_overrides: HashMap::new(),
+            },
+        );
+        let resolver = ProviderResolver::new(&null_gw(), m);
+        assert_eq!(resolver.resolve_rag_provider("anthropic"), "azure_openai");
+    }
+
+    #[test]
+    fn resolve_rag_provider_without_rag_provider_falls_back_to_provider_id() {
+        let resolver = ProviderResolver::new(&null_gw(), mock_providers());
+        assert_eq!(resolver.resolve_rag_provider("openai"), "openai");
+    }
+
+    #[test]
+    fn resolve_rag_provider_unknown_provider_falls_back_to_provider_id() {
+        let resolver = ProviderResolver::new(&null_gw(), mock_providers());
+        assert_eq!(resolver.resolve_rag_provider("nonexistent"), "nonexistent");
     }
 }

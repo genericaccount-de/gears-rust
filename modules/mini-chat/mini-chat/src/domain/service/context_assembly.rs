@@ -3,6 +3,8 @@
 //! Assembles system instructions, conversation messages, and tool definitions
 //! from domain inputs. No I/O, no async — all data is gathered beforehand.
 
+#![allow(clippy::inconsistent_struct_constructor)]
+
 use modkit_macros::domain_model;
 
 use crate::config::EstimationBudgets;
@@ -49,6 +51,8 @@ pub struct ContextInput<'a> {
     pub web_search_guard: &'a str,
     /// Guard instruction appended when `file_search` is enabled.
     pub file_search_guard: &'a str,
+    /// Guard instruction appended when `search_knowledge` is enabled.
+    pub knowledge_search_guard: &'a str,
     /// Thread summary content (if exists).
     pub thread_summary: Option<&'a str>,
     /// Recent messages from DB, already in chronological order.
@@ -59,6 +63,8 @@ pub struct ContextInput<'a> {
     pub web_search_enabled: bool,
     /// Whether `file_search` tool is enabled for this request.
     pub file_search_enabled: bool,
+    /// Whether the `search_knowledge` function tool is enabled for this request.
+    pub knowledge_search_enabled: bool,
     /// Vector store IDs for `file_search` (empty = no `file_search` tool).
     pub vector_store_ids: &'a [String],
     /// Optional metadata filter for file search (e.g. filter by `attachment_ids`).
@@ -211,6 +217,8 @@ pub fn assemble_context(
         input.web_search_guard,
         input.file_search_enabled,
         input.file_search_guard,
+        input.knowledge_search_enabled,
+        input.knowledge_search_guard,
     );
 
     // ── Tools ──
@@ -230,6 +238,31 @@ pub fn assemble_context(
     if !input.code_interpreter_file_ids.is_empty() {
         tools.push(LlmTool::CodeInterpreter {
             file_ids: input.code_interpreter_file_ids.clone(),
+        });
+    }
+    if input.knowledge_search_enabled {
+        tools.push(LlmTool::Function {
+            name: "search_knowledge".to_owned(),
+            description: "Search the organization knowledge base for relevant information. \
+                          Use this tool when the user asks about topics that may be covered \
+                          in internal documents or when context from the knowledge base \
+                          would improve your answer."
+                .to_owned(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "A focused search query describing the information needed."
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return. Omit to use the default.",
+                        "minimum": 1
+                    }
+                },
+                "required": ["query"]
+            }),
         });
     }
 
@@ -353,6 +386,8 @@ fn build_system_instructions(
     web_search_guard: &str,
     file_search_enabled: bool,
     file_search_guard: &str,
+    knowledge_search_enabled: bool,
+    knowledge_search_guard: &str,
 ) -> Option<String> {
     let mut parts: Vec<&str> = Vec::new();
 
@@ -364,6 +399,9 @@ fn build_system_instructions(
     }
     if file_search_enabled && !file_search_guard.is_empty() {
         parts.push(file_search_guard);
+    }
+    if knowledge_search_enabled && !knowledge_search_guard.is_empty() {
+        parts.push(knowledge_search_guard);
     }
 
     if parts.is_empty() {
@@ -402,6 +440,8 @@ mod tests {
             file_search_max_num_results: 5,
             code_interpreter_file_ids: vec![],
             token_budget: None,
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &[],
         })
         .unwrap();
@@ -428,6 +468,8 @@ mod tests {
             file_search_max_num_results: 5,
             code_interpreter_file_ids: vec![],
             token_budget: None,
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &[],
         })
         .unwrap();
@@ -454,6 +496,8 @@ mod tests {
             file_search_max_num_results: 5,
             code_interpreter_file_ids: vec![],
             token_budget: None,
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &[],
         })
         .unwrap();
@@ -480,6 +524,8 @@ mod tests {
             file_search_max_num_results: 5,
             code_interpreter_file_ids: vec![],
             token_budget: None,
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &[],
         })
         .unwrap();
@@ -487,6 +533,80 @@ mod tests {
         assert!(instructions.contains("Base prompt."));
         assert!(instructions.contains("web guard"));
         assert!(instructions.contains("file guard"));
+    }
+
+    // 5.9b: knowledge_search enabled → search_knowledge function tool added + guard appended
+    #[test]
+    fn knowledge_search_adds_function_tool_and_appends_guard() {
+        let result = assemble_context(&ContextInput {
+            system_prompt: "Base prompt.",
+            web_search_guard: "",
+            file_search_guard: "",
+            thread_summary: None,
+            recent_messages: &[],
+            user_message: "hello",
+            web_search_enabled: false,
+            file_search_enabled: false,
+            vector_store_ids: &[],
+            file_search_filters: None,
+            web_search_context_size: crate::domain::llm::WebSearchContextSize::Low,
+            file_search_max_num_results: 5,
+            code_interpreter_file_ids: vec![],
+            token_budget: None,
+            knowledge_search_enabled: true,
+            knowledge_search_guard: "Use search_knowledge for internal docs.",
+            image_file_ids: &[],
+        })
+        .unwrap();
+        let instructions = result.system_instructions.unwrap();
+        assert!(instructions.contains("Base prompt."));
+        assert!(instructions.contains("Use search_knowledge for internal docs."));
+
+        let has_search_knowledge = result.tools.iter().any(|t| {
+            matches!(
+                t,
+                crate::domain::llm::LlmTool::Function { name, .. } if name == "search_knowledge"
+            )
+        });
+        assert!(
+            has_search_knowledge,
+            "search_knowledge function tool must be present"
+        );
+    }
+
+    // 5.9c: knowledge_search disabled → no function tool and no guard
+    #[test]
+    fn knowledge_search_disabled_omits_tool_and_guard() {
+        let result = assemble_context(&ContextInput {
+            system_prompt: "Base prompt.",
+            web_search_guard: "",
+            file_search_guard: "",
+            thread_summary: None,
+            recent_messages: &[],
+            user_message: "hello",
+            web_search_enabled: false,
+            file_search_enabled: false,
+            vector_store_ids: &[],
+            file_search_filters: None,
+            web_search_context_size: crate::domain::llm::WebSearchContextSize::Low,
+            file_search_max_num_results: 5,
+            code_interpreter_file_ids: vec![],
+            token_budget: None,
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "Use search_knowledge for internal docs.",
+            image_file_ids: &[],
+        })
+        .unwrap();
+        let instructions = result.system_instructions.unwrap();
+        assert!(!instructions.contains("search_knowledge"));
+
+        let has_search_knowledge = result.tools.iter().any(|t| {
+            matches!(
+                t,
+                crate::domain::llm::LlmTool::Function { name, .. } if name == "search_knowledge"
+            )
+        });
+        assert!(!has_search_knowledge);
     }
 
     // 5.10: thread summary present → included as first message with prefix
@@ -508,6 +628,8 @@ mod tests {
             file_search_max_num_results: 5,
             code_interpreter_file_ids: vec![],
             token_budget: None,
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &[],
         })
         .unwrap();
@@ -547,6 +669,8 @@ mod tests {
             file_search_max_num_results: 5,
             code_interpreter_file_ids: vec![],
             token_budget: None,
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &[],
         })
         .unwrap();
@@ -576,6 +700,8 @@ mod tests {
             file_search_max_num_results: 5,
             code_interpreter_file_ids: vec![],
             token_budget: None,
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &[],
         })
         .unwrap();
@@ -602,6 +728,8 @@ mod tests {
             file_search_max_num_results: 5,
             code_interpreter_file_ids: vec![],
             token_budget: None,
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &[],
         })
         .unwrap();
@@ -635,6 +763,8 @@ mod tests {
             file_search_max_num_results: 7,
             code_interpreter_file_ids: vec![],
             token_budget: None,
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &[],
         })
         .unwrap();
@@ -669,6 +799,8 @@ mod tests {
             file_search_max_num_results: 5,
             code_interpreter_file_ids: vec![],
             token_budget: None,
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &[],
         })
         .unwrap();
@@ -690,6 +822,8 @@ mod tests {
             file_search_max_num_results: 5,
             code_interpreter_file_ids: vec![],
             token_budget: None,
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &[],
         })
         .unwrap();
@@ -806,6 +940,8 @@ mod tests {
             file_search_max_num_results: 5,
             code_interpreter_file_ids: vec![],
             token_budget: Some(test_budget(context_window, 4096)),
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &[],
         })
         .unwrap();
@@ -846,6 +982,8 @@ mod tests {
             file_search_max_num_results: 5,
             code_interpreter_file_ids: vec![],
             token_budget: Some(test_budget(context_window, 4096)),
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &[],
         })
         .unwrap();
@@ -896,6 +1034,8 @@ mod tests {
             file_search_max_num_results: 5,
             code_interpreter_file_ids: vec![],
             token_budget: Some(test_budget(context_window, 4096)),
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &[],
         })
         .unwrap();
@@ -923,6 +1063,8 @@ mod tests {
             file_search_max_num_results: 5,
             code_interpreter_file_ids: vec![],
             token_budget: Some(test_budget(5000, 4096)),
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &[],
         });
 
@@ -955,6 +1097,8 @@ mod tests {
             file_search_max_num_results: 5,
             code_interpreter_file_ids: vec![],
             token_budget: None,
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &[],
         })
         .unwrap();
@@ -995,6 +1139,8 @@ mod tests {
             file_search_max_num_results: 5,
             code_interpreter_file_ids: vec!["file-abc123".to_owned()],
             token_budget: None,
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &[],
         })
         .unwrap();
@@ -1023,6 +1169,8 @@ mod tests {
             file_search_max_num_results: 5,
             code_interpreter_file_ids: vec![],
             token_budget: None,
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &[],
         })
         .unwrap();
@@ -1065,6 +1213,8 @@ mod tests {
             file_search_max_num_results: 5,
             code_interpreter_file_ids: vec![],
             token_budget: None,
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &images,
         })
         .unwrap();
@@ -1093,6 +1243,8 @@ mod tests {
             file_search_max_num_results: 5,
             code_interpreter_file_ids: vec![],
             token_budget: None,
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &images,
         })
         .unwrap();
@@ -1119,6 +1271,8 @@ mod tests {
             file_search_max_num_results: 5,
             code_interpreter_file_ids: vec![],
             token_budget: None,
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &[],
         })
         .unwrap();
@@ -1145,6 +1299,8 @@ mod tests {
             file_search_max_num_results: 5,
             code_interpreter_file_ids: vec![],
             token_budget: Some(test_budget(10_000, 4096)),
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &images,
         });
         assert!(result.is_ok());
@@ -1168,6 +1324,8 @@ mod tests {
             file_search_max_num_results: 5,
             code_interpreter_file_ids: vec![],
             token_budget: Some(test_budget(5100, 4096)),
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
             image_file_ids: &images,
         });
         assert!(matches!(

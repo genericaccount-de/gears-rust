@@ -120,6 +120,11 @@ async fn insert_attachment(
         cleanup_attempts: Set(0),
         last_cleanup_error: Set(None),
         cleanup_updated_at: Set(None),
+        secondary_file_id: Set(None),
+        secondary_status: Set(
+            crate::infra::db::entity::attachment::SecondaryUploadStatus::NotAttempted,
+        ),
+        secondary_provider_kind: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
         deleted_at: Set(None),
@@ -160,6 +165,11 @@ async fn insert_deleted_attachment(db: &Db, tenant_id: Uuid, chat_id: Uuid) -> U
         cleanup_attempts: Set(0),
         last_cleanup_error: Set(None),
         cleanup_updated_at: Set(None),
+        secondary_file_id: Set(None),
+        secondary_status: Set(
+            crate::infra::db::entity::attachment::SecondaryUploadStatus::NotAttempted,
+        ),
+        secondary_provider_kind: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
         deleted_at: Set(Some(now)),

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use authz_resolver_sdk::PolicyEnforcer;
+use bytes::Bytes;
 use modkit_macros::domain_model;
 use modkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
@@ -16,12 +17,20 @@ use crate::domain::ports::{
 };
 use crate::domain::repos::{
     AttachmentRepository, ChatRepository, InsertVectorStoreParams, ModelResolver, OutboxEnqueuer,
-    VectorStoreRepository,
+    SetSecondaryUploadParams, VectorStoreRepository,
 };
-use crate::infra::db::entity::attachment::Model as AttachmentModel;
+use crate::infra::db::entity::attachment::{
+    Model as AttachmentModel, SecondaryUploadStatus, secondary_provider_kind,
+};
 use crate::infra::llm::provider_resolver::ProviderResolver;
 
 use super::DbProvider;
+
+/// Hard ceiling on the parallel Anthropic Files API upload during the primary
+/// readiness path. A wedged upstream must not delay the user-visible
+/// transition to `ready` — on timeout the secondary upload is recorded as
+/// `Failed` and the primary path proceeds normally.
+const ANTHROPIC_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 // ── RAII guard for attachments_pending gauge ─────────────────────────────
 
@@ -80,6 +89,18 @@ pub enum CodeInterpreterStatus {
     Unknown,
 }
 
+/// Information needed to perform the parallel "secondary" upload to
+/// Anthropic's Files API alongside the primary Azure/OpenAI upload.
+///
+/// Populated only when the chat's LLM provider uses the Anthropic Messages
+/// adapter (see `anthropic-provider-support.md` §8.0). `upstream_alias` is the
+/// OAGW alias under which Anthropic's API was registered at module init.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct AnthropicUploadInfo {
+    pub upstream_alias: String,
+}
+
 /// Pre-resolved context returned by `get_upload_context` so that
 /// `upload_file` can skip the duplicate authz + model resolution.
 #[domain_model]
@@ -94,6 +115,10 @@ pub struct UploadContext {
     /// switch is not active. Pre-resolved to avoid duplicate model lookups.
     /// `Unknown` when model resolution failed transiently.
     pub code_interpreter_status: CodeInterpreterStatus,
+    /// `Some` when the chat's LLM provider is Anthropic — the upload code
+    /// will perform a secondary parallel upload to Anthropic's Files API
+    /// after the primary Azure/OpenAI upload succeeds. `None` otherwise.
+    pub anthropic_upload: Option<AnthropicUploadInfo>,
 }
 
 // ── Error helpers for transaction boundary crossing ─────────────────────
@@ -156,6 +181,11 @@ pub struct AttachmentService<
     rag_config: RagConfig,
     thumbnail_config: ThumbnailConfig,
     metrics: Arc<dyn MiniChatMetricsPort>,
+    /// Anthropic Files API client used for the parallel upload when the chat's
+    /// LLM provider is Anthropic. `None` when no Anthropic provider is
+    /// configured — the parallel upload is skipped silently in that case.
+    anthropic_files_client:
+        Option<Arc<crate::infra::llm::providers::anthropic_files_client::AnthropicFilesClient>>,
 }
 
 impl<
@@ -179,6 +209,9 @@ impl<
         rag_config: RagConfig,
         thumbnail_config: ThumbnailConfig,
         metrics: Arc<dyn MiniChatMetricsPort>,
+        anthropic_files_client: Option<
+            Arc<crate::infra::llm::providers::anthropic_files_client::AnthropicFilesClient>,
+        >,
     ) -> Self {
         Self {
             db,
@@ -194,6 +227,7 @@ impl<
             rag_config,
             thumbnail_config,
             metrics,
+            anthropic_files_client,
         }
     }
 
@@ -233,7 +267,7 @@ impl<
         let config_image_bytes = u64::from(self.rag_config.uploaded_image_max_size_kb) * 1024;
 
         // CCM per-model limit (best-effort — fall back to ConfigMap on failure).
-        let (provider_id, storage_backend, ccm_bytes, model_supports_ci) =
+        let (provider_id, storage_backend, ccm_bytes, model_supports_ci, anthropic_upload) =
             self.resolve_model_limits(ctx, chat_id, chat.model).await;
 
         let code_interpreter_status = self
@@ -253,6 +287,7 @@ impl<
             limits,
             allow_csv_upload: self.rag_config.allow_csv_upload,
             code_interpreter_status,
+            anthropic_upload,
         })
     }
 
@@ -263,19 +298,61 @@ impl<
         ctx: &SecurityContext,
         chat_id: Uuid,
         model: String,
-    ) -> (String, String, Option<u64>, Option<bool>) {
+    ) -> (
+        String,
+        String,
+        Option<u64>,
+        Option<bool>,
+        Option<AnthropicUploadInfo>,
+    ) {
         match self
             .model_resolver
             .resolve_model(ctx.subject_id(), Some(model))
             .await
         {
             Ok(resolved) => {
+                // Storage operations (file upload, vector store, cleanup) must
+                // route to the LLM provider's `rag_provider` when set — see
+                // `anthropic-provider-support.md` §7.5. The LLM provider may
+                // have no file/vector-store API of its own (Anthropic), so we
+                // resolve to a storage-capable provider here once and pass the
+                // resolved id downstream as the canonical provider_id for the
+                // attachment row.
+                let storage_provider_id = self
+                    .provider_resolver
+                    .resolve_rag_provider(&resolved.provider_id)
+                    .to_owned();
                 let backend = self
                     .provider_resolver
-                    .resolve_storage_backend(&resolved.provider_id);
+                    .resolve_storage_backend(&storage_provider_id);
                 let ccm = u64::from(resolved.max_file_size_mb) * 1_048_576;
                 let ci = Some(resolved.tool_support.code_interpreter);
-                (resolved.provider_id, backend, Some(ccm), ci)
+
+                // §8.0: when the chat's LLM provider is Anthropic, the upload
+                // path performs a second parallel upload to Anthropic's Files
+                // API. Capture the LLM provider's upstream alias here so the
+                // upload code doesn't have to redo the resolution.
+                let anthropic_upload = if self
+                    .provider_resolver
+                    .is_anthropic_messages(&resolved.provider_id)
+                {
+                    let tenant_str = ctx.subject_tenant_id().to_string();
+                    self.provider_resolver
+                        .upstream_alias_for(&resolved.provider_id, Some(&tenant_str))
+                        .map(|alias| AnthropicUploadInfo {
+                            upstream_alias: alias.to_owned(),
+                        })
+                } else {
+                    None
+                };
+
+                (
+                    storage_provider_id,
+                    backend,
+                    Some(ccm),
+                    ci,
+                    anthropic_upload,
+                )
             }
             Err(e) => {
                 tracing::warn!(
@@ -287,7 +364,7 @@ impl<
                 let backend = self
                     .provider_resolver
                     .resolve_storage_backend(&fallback_provider);
-                (fallback_provider, backend, None, None)
+                (fallback_provider, backend, None, None, None)
             }
         }
     }
@@ -372,6 +449,75 @@ impl<
         Ok(row)
     }
 
+    /// Resolve the coordinates needed to issue a secondary-provider delete
+    /// (currently: Anthropic Files API) for a soft-deleted attachment.
+    ///
+    /// Returns `None` whenever any precondition is missing — the parallel
+    /// upload never succeeded, the chat's LLM provider is not Anthropic, or
+    /// the OAGW upstream alias can't be resolved. The caller treats `None`
+    /// as "no secondary cleanup needed"; the primary cleanup still proceeds.
+    ///
+    /// DB lookup errors propagate (`?`); model-resolver errors are logged
+    /// and swallowed since they shouldn't block the user-visible delete.
+    async fn resolve_secondary_cleanup_ref(
+        &self,
+        ctx: &SecurityContext,
+        chat_scope: &AccessScope,
+        chat_id: Uuid,
+        row: &AttachmentModel,
+        conn: &modkit_db::DbConn<'_>,
+    ) -> Result<Option<crate::domain::repos::SecondaryCleanupRef>, DomainError> {
+        if !matches!(row.secondary_status, SecondaryUploadStatus::Uploaded) {
+            return Ok(None);
+        }
+        let (Some(file_id), Some(provider_kind)) = (
+            row.secondary_file_id.as_ref(),
+            row.secondary_provider_kind.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+
+        let chat_row = self
+            .chat_repo
+            .get(conn, chat_scope, chat_id)
+            .await?
+            .ok_or_else(|| DomainError::not_found("Chat", chat_id))?;
+
+        let resolved = match self
+            .model_resolver
+            .resolve_model(ctx.subject_id(), Some(chat_row.model.clone()))
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    chat_id = %chat_id,
+                    model = %chat_row.model,
+                    "delete_attachment: could not resolve model for secondary cleanup alias"
+                );
+                return Ok(None);
+            }
+        };
+
+        if !self
+            .provider_resolver
+            .is_anthropic_messages(&resolved.provider_id)
+        {
+            return Ok(None);
+        }
+
+        let tenant = ctx.subject_tenant_id().to_string();
+        Ok(self
+            .provider_resolver
+            .upstream_alias_for(&resolved.provider_id, Some(&tenant))
+            .map(|alias| crate::domain::repos::SecondaryCleanupRef {
+                file_id: file_id.clone(),
+                provider_kind: provider_kind.clone(),
+                upstream_alias: alias.to_owned(),
+            }))
+    }
+
     /// Soft-delete an attachment.
     ///
     /// Ordering: load → 404 → ownership check → 403 → idempotent (204 if already deleted)
@@ -424,6 +570,14 @@ impl<
             return Ok(());
         }
 
+        // Resolve secondary-upload delete coordinates at enqueue time so the
+        // cleanup worker stays free of ProviderResolver. `None` on any
+        // non-Anthropic chat, missing attachment fields, or alias-resolution
+        // failure — the primary cleanup proceeds regardless.
+        let secondary_ref = self
+            .resolve_secondary_cleanup_ref(ctx, &chat_scope, chat_id, &row, &conn)
+            .await?;
+
         // TX(soft-delete + outbox enqueue) — atomic per DESIGN.md Phase 1.
         let event = crate::domain::repos::AttachmentCleanupEvent {
             event_type: "attachment_deleted".to_owned(),
@@ -435,6 +589,7 @@ impl<
             storage_backend: row.storage_backend.clone(),
             attachment_kind: row.attachment_kind.to_string(),
             deleted_at: time::OffsetDateTime::now_utc(),
+            secondary_ref,
         };
 
         let attachment_repo = Arc::clone(&self.attachment_repo);
@@ -990,6 +1145,182 @@ impl<
             }
         }
 
+        // Take the buffered image bytes ONCE and convert via `Bytes::from(Vec<u8>)`,
+        // which re-uses the existing allocation (zero-copy move). Subsequent
+        // consumers — the parallel Anthropic upload below and the thumbnail
+        // generator at step 5b — share the same buffer via `Bytes::clone()`,
+        // a cheap `Arc::clone`. Per `anthropic-provider-support.md` §8.0.1
+        // this keeps peak memory at ~1x file size.
+        //
+        // `None` for documents (buffer was never allocated) and for images
+        // that exceeded `thumbnail.max_decode_bytes` (buffer cleared mid-stream).
+        let buffered_image_bytes: Option<Bytes> = image_buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .map(Bytes::from);
+
+        // Captured for CAS race-loss cleanup at step 6 — set inside the
+        // `'anthropic_upload` block when the secondary upload succeeds, so
+        // the cleanup branch at step 6 can issue a best-effort Anthropic
+        // delete and avoid leaking the upstream file.
+        let mut secondary_cleanup: Option<(String, String)> = None;
+
+        // 4c. Parallel "secondary" upload to Anthropic Files API.
+        //
+        // Per `anthropic-provider-support.md` §8.0: when the chat's LLM
+        // provider is Anthropic, files are also uploaded to Anthropic's
+        // Files API so the `load_files` tool and image content blocks can
+        // reference them via `secondary_file_id` with
+        // `secondary_provider_kind = "anthropic"`. Failure here is non-fatal:
+        // Azure remains the primary store and the attachment still
+        // transitions to `ready` — but `secondary_status = failed` and the
+        // adapter will skip blocks that reference this attachment.
+        //
+        // Currently only images are supported because we have raw bytes
+        // already buffered (for thumbnail generation). Document support
+        // would require a re-download from Azure — see follow-up.
+        'anthropic_upload: {
+            let (Some(info), Some(client)) =
+                (&upload_ctx.anthropic_upload, &self.anthropic_files_client)
+            else {
+                break 'anthropic_upload;
+            };
+            if is_document {
+                break 'anthropic_upload;
+            }
+            let Some(bytes) = buffered_image_bytes.as_ref() else {
+                // Image bytes weren't buffered (size > thumbnail.max_decode_bytes).
+                // Anthropic upload would require re-download from Azure — skip for now.
+                tracing::warn!(
+                    attachment_id = %attachment_id,
+                    "image bytes not retained (file too large for thumbnail buffer); \
+                     skipping parallel Anthropic upload"
+                );
+                break 'anthropic_upload;
+            };
+
+            // The whole parallel-upload block is best-effort: failures here
+            // must NOT abort the primary upload. Acquire connections inside a
+            // tight scope so a transient pool failure (or a slow Anthropic
+            // upload) doesn't block other paths from a DB conn.
+            match self.db.conn() {
+                Ok(conn) => {
+                    if let Err(e) = self
+                        .attachment_repo
+                        .set_secondary_upload(
+                            &conn,
+                            &scope,
+                            SetSecondaryUploadParams {
+                                id: attachment_id,
+                                secondary_file_id: None,
+                                secondary_status: SecondaryUploadStatus::Pending,
+                                secondary_provider_kind: Some(
+                                    secondary_provider_kind::ANTHROPIC.to_owned(),
+                                ),
+                            },
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            attachment_id = %attachment_id,
+                            error = %e,
+                            "failed to persist secondary pending status; \
+                             watchdog will have no in-flight signal"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        attachment_id = %attachment_id,
+                        error = %e,
+                        "could not acquire DB connection for pending-status write; continuing"
+                    );
+                }
+            }
+
+            // Hard timeout on the parallel upload — see `ANTHROPIC_UPLOAD_TIMEOUT`.
+            // A timeout is treated the same as a failed upload
+            // (`secondary_status = Failed`, logged), so the user-visible
+            // attachment still reaches `ready` via the surrounding logic.
+            let upload_fut = client.upload_file(
+                ctx.clone(),
+                &info.upstream_alias,
+                &filename,
+                validated_mime,
+                bytes.clone(),
+            );
+            let (secondary_file_id, secondary_status) =
+                match tokio::time::timeout(ANTHROPIC_UPLOAD_TIMEOUT, upload_fut).await {
+                    Ok(Ok(file_ref)) => {
+                        tracing::debug!(
+                            attachment_id = %attachment_id,
+                            anthropic_file_id = %file_ref.file_id,
+                            "parallel Anthropic Files API upload succeeded"
+                        );
+                        // Capture cleanup coordinates so a CAS race-loss at
+                        // step 6 can issue a best-effort Anthropic delete.
+                        secondary_cleanup =
+                            Some((info.upstream_alias.clone(), file_ref.file_id.clone()));
+                        (Some(file_ref.file_id), SecondaryUploadStatus::Uploaded)
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            attachment_id = %attachment_id,
+                            error = %e,
+                            "parallel Anthropic Files API upload failed; \
+                             load_files / image blocks will skip this attachment"
+                        );
+                        (None, SecondaryUploadStatus::Failed)
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            attachment_id = %attachment_id,
+                            timeout_secs = ANTHROPIC_UPLOAD_TIMEOUT.as_secs(),
+                            "parallel Anthropic Files API upload timed out; \
+                             load_files / image blocks will skip this attachment"
+                        );
+                        (None, SecondaryUploadStatus::Failed)
+                    }
+                };
+
+            match self.db.conn() {
+                Ok(conn) => {
+                    if let Err(e) = self
+                        .attachment_repo
+                        .set_secondary_upload(
+                            &conn,
+                            &scope,
+                            SetSecondaryUploadParams {
+                                id: attachment_id,
+                                secondary_file_id,
+                                secondary_status,
+                                secondary_provider_kind: Some(
+                                    secondary_provider_kind::ANTHROPIC.to_owned(),
+                                ),
+                            },
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            attachment_id = %attachment_id,
+                            error = %e,
+                            "failed to persist Anthropic upload outcome; \
+                             row stays in pending (best-effort)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        attachment_id = %attachment_id,
+                        error = %e,
+                        "could not acquire DB connection to record Anthropic upload outcome; \
+                         row stays in pending/not_attempted (best-effort)"
+                    );
+                }
+            }
+        }
+
         // 5. Execute purpose-specific paths (each fires independently).
         // - FileSearch + document → vector store indexing
         // - CodeInterpreter → (no extra step during upload; file is used at stream time)
@@ -1044,30 +1375,27 @@ impl<
         // 5b. Image thumbnail generation (best-effort, offloaded to blocking thread).
         // Thumbnail failure never blocks the upload — the attachment transitions
         // to `ready` with `img_thumbnail = null`.
-        let thumbnail = if is_document {
-            None
-        } else {
-            let raw_bytes = image_buffer
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            match raw_bytes {
-                Some(raw) => {
-                    let cfg = self.thumbnail_config.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        super::thumbnail::generate(&cfg, &raw)
-                    })
-                    .await
-                    {
-                        Ok(thumb) => thumb,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "thumbnail spawn_blocking failed");
-                            None
-                        }
+        //
+        // Reuses the same `Bytes` buffer extracted before step 4c. If the
+        // Anthropic upload took a clone, dropping that clone here decrements
+        // the `Bytes` ref-count to one — the underlying allocation is unique
+        // to the thumbnail task by the time `spawn_blocking` runs.
+        let thumbnail = match buffered_image_bytes {
+            Some(bytes) => {
+                let cfg = self.thumbnail_config.clone();
+                match tokio::task::spawn_blocking(move || {
+                    super::thumbnail::generate(&cfg, bytes.as_ref())
+                })
+                .await
+                {
+                    Ok(thumb) => thumb,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "thumbnail spawn_blocking failed");
+                        None
                     }
                 }
-                None => None,
             }
+            None => None,
         };
 
         // 6. CAS: uploaded → ready (with thumbnail if available)
@@ -1096,9 +1424,14 @@ impl<
                 )
                 .await?;
             if affected == 0 {
-                // P1-14: Concurrent soft-delete — best-effort cleanup
+                // P1-14: Concurrent soft-delete — best-effort cleanup of both
+                // the primary file and (if uploaded) the Anthropic secondary,
+                // so the upstream Files API doesn't accumulate orphans.
                 tracing::warn!(attachment_id = %attachment_id, "CAS set_ready returned 0 (concurrent delete?)");
                 self.spawn_delete_file(ctx.clone(), &provider_id, &provider_file_id);
+                if let Some((alias, file_id)) = secondary_cleanup.take() {
+                    self.spawn_delete_secondary_file(ctx.clone(), alias, file_id);
+                }
                 return Err(DomainError::not_found("Attachment", attachment_id));
             }
         }
@@ -1157,6 +1490,30 @@ impl<
         tokio::spawn(async move {
             if let Err(e) = storage.delete_file(ctx, &pid, &fid).await {
                 tracing::warn!(provider_file_id = %fid, error = %e, "fire-and-forget file delete failed");
+            }
+        });
+    }
+
+    /// Fire-and-forget delete of a secondary-provider file (today: Anthropic
+    /// Files API). Used when a CAS race-loss leaves the secondary upload
+    /// orphaned at the upstream — the row is gone (or about to be), so the
+    /// usual cleanup-worker path won't run.
+    fn spawn_delete_secondary_file(
+        &self,
+        ctx: SecurityContext,
+        upstream_alias: String,
+        file_id: String,
+    ) {
+        let Some(client) = self.anthropic_files_client.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            if let Err(e) = client.delete_file(ctx, &upstream_alias, &file_id).await {
+                tracing::warn!(
+                    secondary_file_id = %file_id,
+                    error = %e,
+                    "fire-and-forget secondary file delete failed (orphaned)"
+                );
             }
         });
     }

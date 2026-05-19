@@ -399,6 +399,13 @@ pub fn mock_db_provider(db: Db) -> Arc<DBProvider<modkit_db::DbError>> {
     Arc::new(DBProvider::new(db))
 }
 
+/// Build an empty `ProviderResolver` for tests that don't exercise provider
+/// routing. With no providers registered, `is_anthropic_messages` returns
+/// `false` and the Anthropic cleanup path is a no-op.
+pub fn mock_provider_resolver() -> Arc<crate::infra::llm::provider_resolver::ProviderResolver> {
+    Arc::new(crate::infra::llm::provider_resolver::ProviderResolver::empty())
+}
+
 // ── Stream helpers ──
 
 /// Convert `Bytes` into a `FileStream` for test use.
@@ -654,6 +661,11 @@ pub async fn insert_test_attachment(db: &TestDb, params: InsertTestAttachmentPar
         cleanup_attempts: Set(0),
         last_cleanup_error: Set(None),
         cleanup_updated_at: Set(None),
+        secondary_file_id: Set(None),
+        secondary_status: Set(
+            crate::infra::db::entity::attachment::SecondaryUploadStatus::NotAttempted,
+        ),
+        secondary_provider_kind: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
         deleted_at: Set(params.deleted_at),
@@ -1295,6 +1307,7 @@ impl crate::domain::ports::MiniChatMetricsPort for TestMetrics {
     fn record_cleanup_retry(&self, _: &str, _: &str) {}
     fn record_cleanup_backlog(&self, _: &str, _: &str, _: i64) {}
     fn record_cleanup_vs_with_failed_attachments(&self) {}
+    fn record_secondary_cleanup_skipped(&self, _: &str) {}
     fn record_orphan_detected(&self, _: &str) {}
     fn record_orphan_finalized(&self, _: &str) {}
     fn record_orphan_scan_duration_seconds(&self, _: f64) {}
@@ -1302,6 +1315,9 @@ impl crate::domain::ports::MiniChatMetricsPort for TestMetrics {
     fn record_thread_summary_execution(&self, _: &str) {}
     fn record_thread_summary_cas_conflict(&self) {}
     fn record_summary_fallback(&self) {}
+    fn record_knowledge_search(&self, _: &str) {}
+    fn record_knowledge_search_latency_ms(&self, _: f64) {}
+    fn record_knowledge_search_chunks(&self, _: f64) {}
 }
 
 // ── Mock User Limits Provider ──
