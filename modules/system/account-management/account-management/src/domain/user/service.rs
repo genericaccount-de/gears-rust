@@ -133,10 +133,10 @@ pub(super) mod pep {
     ///   `tenants` entity's `resource_col = "id"` declaration so the
     ///   compiled subtree clamp on `tenants` resolves through this
     ///   property.
-    pub const USER: ResourceType = ResourceType {
-        name: "gts.cf.core.am.user.v1~",
-        supported_properties: &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
-    };
+    pub const USER: ResourceType = ResourceType::from_static(
+        "gts.cf.core.am.user.v1~",
+        &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+    );
 
     /// Action vocabulary. `get_user` is internally a single-row
     /// `list_users` projection so it shares the `LIST` policy bucket;

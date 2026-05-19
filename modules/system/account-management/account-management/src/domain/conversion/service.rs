@@ -554,10 +554,10 @@ pub(super) mod pep {
     ///   `tenants` entity's `resource_col = "id"` declaration so the
     ///   compiled subtree clamp on `tenants` resolves through this
     ///   property).
-    pub const CONVERSION: ResourceType = ResourceType {
-        name: "gts.cf.core.am.conversion_request.v1~",
-        supported_properties: &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
-    };
+    pub const CONVERSION: ResourceType = ResourceType::from_static(
+        "gts.cf.core.am.conversion_request.v1~",
+        &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+    );
 
     /// Action vocabulary. Each public conversion-service method
     /// PEP-gates on exactly one action; system-driven sweeps

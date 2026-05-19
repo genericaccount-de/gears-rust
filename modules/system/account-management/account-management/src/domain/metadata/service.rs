@@ -98,14 +98,14 @@ pub(super) mod pep {
     ///   the listing operation itself, then re-authorises per row
     ///   with the row's resolved `schema_id` to drop entries the
     ///   caller cannot read — the PRD line 1848 contract.
-    pub const METADATA: ResourceType = ResourceType {
-        name: "gts.cf.core.am.tenant_metadata.v1~",
-        supported_properties: &[
+    pub const METADATA: ResourceType = ResourceType::from_static(
+        "gts.cf.core.am.tenant_metadata.v1~",
+        &[
             pep_properties::OWNER_TENANT_ID,
             pep_properties::RESOURCE_ID,
             SCHEMA_ID,
         ],
-    };
+    );
 
     /// AM-local PEP attribute name for the chained metadata schema id.
     /// Carries the wire-shaped `gts.…~vendor.…~` chain (the validated
