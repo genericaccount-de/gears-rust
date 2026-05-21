@@ -3233,6 +3233,21 @@ on behalf of a tenant administrator)
   deactivate their auto-created Subscription to silence noisy default events or add custom thresholds — without
   modifying the underlying Quota. Concrete FRs and the corresponding schema additions land in the P2 PRD revision. —
   owner: Platform Engineering — target resolution: P2 PRD revision.
+- **Hierarchical quota lookup as an additive extension**: P1 builds the applicable-Quota set per-
+  `(subject_type, subject_id)` independently — no traversal of any subject hierarchy, no consumption against an
+  ancestor's Quota. A future extension is expected to introduce hierarchy-aware lookup as a strictly additive change:
+  an individual Quota opts in via a marker on the Quota itself, and evaluations targeting a descendant of that Quota's
+  subject pick it up as part of the applicable set (potentially also propagating the debit up the chain). Open design
+  points: (1) the marker's shape — a typed enum on the Quota record vs a reserved `metadata` key vs a
+  Subject-Type-Registry capability that opts a whole subject type in; (2) where the hierarchy itself lives and how the
+  applicable-set builder discovers ancestors at evaluation time without inflating latency; (3) how ancestor walk
+  composes with the Engine contract without altering `Decision` arms or Debit Plan invariants; (4) atomic multi-Quota
+  acquisition (`cpt-cf-quota-enforcement-fr-lease-acquire`) across N ancestor counters under deadlock-free ordering; (5)
+  period attribution when ancestor and descendant Quotas carry different period specs; (6) idempotency / rollback
+  fan-out across the ancestor chain; (7) PDP scope for "descendant consuming against an ancestor's Quota". Decision
+  criterion: concrete product demand for organization-tree consumption accounting plus a credible additive-shape
+  proposal that preserves P1 behavior for non-opted-in Quotas. — owner: Platform Engineering — target resolution:
+  deferred — production feedback.
 - **Composable Policy patterns (P2)**: introduce a Pattern Registry parallel to Subject Type Registry — operators select
   a parameterized pattern (`cascade`, `attribute_gated`, `most_restrictive_wins`, `cel` escape hatch) instead of
   authoring raw CEL for every Policy. Reduces operator-authored CEL footprint to the genuine long-tail. Patterns have
