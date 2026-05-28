@@ -31,6 +31,11 @@ pub enum TokenError {
     /// The token watcher is not ready or has been shut down.
     #[error("token unavailable: {0}")]
     Unavailable(String),
+
+    /// The token endpoint returned a token with an invalid lifetime or
+    /// freshness ratio.
+    #[error("invalid token lifetime: {0}")]
+    InvalidTokenLifetime(String),
 }
 
 #[cfg(test)]
@@ -69,5 +74,14 @@ mod tests {
     fn unavailable_renders() {
         let e = TokenError::Unavailable("watcher shut down".into());
         assert_eq!(e.to_string(), "token unavailable: watcher shut down");
+    }
+
+    #[test]
+    fn invalid_token_lifetime_renders() {
+        let e = TokenError::InvalidTokenLifetime("lifetime_secs must be > 0".into());
+        assert_eq!(
+            e.to_string(),
+            "invalid token lifetime: lifetime_secs must be > 0"
+        );
     }
 }

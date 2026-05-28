@@ -29,7 +29,7 @@ This folder contains the ModKit developer documentation, split by topic for focu
 | E2E testing (philosophy, patterns, infrastructure) | `13_e2e_testing.md` | |
 | HTTP client (TLS, retries, timeouts, concurrency, OTel tracing, auth hook) | | `docs/adrs/modkit/0001-modkit-hyper-tower-http-client.md` |
 | AuthN/AuthZ, PolicyEnforcer, PEP enforcement | `06_authn_authz_secure_orm.md` | `docs/arch/authorization/DESIGN.md` |
-| Authentication (inbound JWT/OIDC policies, outbound OAuth2 client-credentials) | | `docs/adrs/modkit/0002-modkit-auth-client-with-aliri.md` |
+| Authentication (inbound JWT/OIDC policies, outbound OAuth2 client-credentials) | | `docs/adrs/modkit/0002-modkit-auth-oauth2-client.md` |
 
 ## Core invariants (apply everywhere)
 
@@ -64,4 +64,4 @@ This folder contains the ModKit developer documentation, split by topic for focu
 ### Related ADRs
 
 - `docs/adrs/modkit/0001-modkit-hyper-tower-http-client.md` – **modkit-http**: Hyper+Tower HTTP client with TLS, retries, timeouts, concurrency limiting, decompression, OTel tracing, and extensible auth layer hook.
-- `docs/adrs/modkit/0002-modkit-auth-client-with-aliri.md` – **modkit-auth**: Inbound JWT/OIDC route-level policies and outbound OAuth2 client-credentials flow with automatic token refresh and `Authorization: Bearer` injection.
+- `docs/adrs/modkit/0002-modkit-auth-oauth2-client.md` – **modkit-auth**: Inbound JWT/OIDC route-level policies and outbound OAuth2 client-credentials flow with automatic token refresh and `Authorization: Bearer` injection.

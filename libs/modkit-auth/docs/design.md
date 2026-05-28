@@ -2,11 +2,10 @@
 
 ### Dependency policy
 
-`modkit-auth` depends on `aliri_tokens` without default features and without `oauth2`:
-
-```toml
-aliri_tokens = { version = "0.3", default-features = false, features = ["rand"] }
-```
+`modkit-auth` uses an in-house token watcher (`src/oauth2/token_watcher.rs`) for
+background refresh with jitter and exponential backoff. This replaces the former
+`aliri_tokens` dependency, eliminating the transitive `aliri_tokens` → `aliri` →
+`ring 0.17` chain that blocked FIPS Phase A promotion.
 
 `modkit-auth` depends on `modkit-http` for token endpoint HTTP calls. This is acceptable because `modkit-http` is hyper-based and does not pull `reqwest`.
 
@@ -53,7 +52,9 @@ Rules:
 
 ### Token source (modkit-http based)
 
-Implement a custom `AsyncTokenSource` for `aliri_tokens`.
+The token source (`OAuthTokenSource`) performs the OAuth2 client credentials
+exchange using `modkit-http::HttpClient` and returns a `FetchedToken` consumed
+by the in-house token watcher.
 
 The token source holds an `HttpClient` instance built with `HttpClientConfig::token_endpoint()`. This client provides:
 
@@ -90,27 +91,23 @@ The token source holds an `HttpClient` instance built with `HttpClientConfig::to
 
 ### Token watcher
 
-Use `aliri_tokens` watcher created from the token source.
+In-house implementation (`src/oauth2/token_watcher.rs`) with:
 
-Watcher responsibilities:
-
-- in-memory caching
-- refresh scheduling
-- jitter application
-- error backoff
-- concurrency control (avoid duplicate refresh under load)
-- optionally serve current token while refresh is in progress
+- `ArcSwap`-backed lock-free reads (`CachedToken`)
+- `tokio::spawn` background refresh loop
+- Random early jitter (via `rand`, non-crypto)
+- Exponential backoff on consecutive errors
+- Graceful shutdown via `oneshot` channel (dropped with watcher)
+- Three-state token lifecycle: `Fresh` → `Stale` → `Expired`
 
 ### Invalidate semantics
 
-`aliri_tokens` watcher has no explicit "drop cached token now" API.
-
 Implementation:
 
-- store the active watcher behind `ArcSwap` (preferred) or `RwLock<Arc<_>>`
+- store the active watcher behind `ArcSwap`
 - `Token::invalidate()` creates a new watcher (same config) and swaps it in
-- old watcher is dropped when no longer referenced
-- next `get()` triggers a new fetch via the token source
+- old watcher is dropped when no longer referenced (shutdown signal cancels loop)
+- next `get()` reads from the freshly-spawned watcher
 
 ### Outbound auth layer (tower)
 

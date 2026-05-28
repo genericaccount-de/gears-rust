@@ -1,9 +1,5 @@
 use std::time::Duration;
 
-use aliri_clock::DurationSecs;
-use aliri_tokens::sources::AsyncTokenSource;
-use aliri_tokens::{AccessToken, IdToken, TokenLifetimeConfig, TokenWithLifetime};
-use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use http::header::AUTHORIZATION;
 use url::Url;
@@ -11,14 +7,15 @@ use zeroize::Zeroizing;
 
 use super::config::OAuthClientConfig;
 use super::error::TokenError;
+use super::token_watcher::FetchedToken;
 use super::types::ClientAuthMethod;
 use modkit_utils::SecretString;
 
 /// Token source that exchanges client credentials for an access token using
 /// `modkit-http::HttpClient`.
 ///
-/// It implements [`aliri_tokens::AsyncTokenSource`] so that
-/// `aliri_tokens` can drive refresh scheduling, jitter, and backoff.
+/// Called by [`super::token_watcher::TokenWatcher`] for both the initial fetch
+/// and background refreshes.
 pub struct OAuthTokenSource {
     client: modkit_http::HttpClient,
     token_endpoint: Url,
@@ -81,11 +78,10 @@ impl OAuthTokenSource {
     }
 }
 
-#[async_trait]
-impl AsyncTokenSource for OAuthTokenSource {
-    type Error = TokenError;
-
-    async fn request_token(&mut self) -> Result<TokenWithLifetime, Self::Error> {
+impl OAuthTokenSource {
+    /// Perform a single token exchange and return a [`FetchedToken`] suitable
+    /// for caching by the [`super::token_watcher::TokenWatcher`].
+    pub(crate) async fn request_token(&mut self) -> Result<FetchedToken, TokenError> {
         // -- build form fields ---------------------------------------------------
         let mut fields: Vec<(&str, &str)> = vec![("grant_type", "client_credentials")];
 
@@ -158,35 +154,33 @@ impl AsyncTokenSource for OAuthTokenSource {
 
         // Compute per-token refresh parameters so that the stale time
         // never exceeds the expiry time, even for short-lived tokens.
-        let (freshness, min_stale) = refresh_params(
+        let (freshness_ratio, _min_stale_secs) = refresh_params(
             lifetime_secs,
             &self.refresh_offset,
             &self.min_refresh_period,
         );
-        let lifetime_config = TokenLifetimeConfig::new(freshness, min_stale);
 
-        let access_token = AccessToken::new(token_resp.access_token);
-        let token = lifetime_config.create_token(
-            &access_token,
-            None::<&IdToken>,
-            DurationSecs(lifetime_secs),
-        );
-
-        Ok(token)
+        Ok(FetchedToken {
+            access_token: token_resp.access_token,
+            lifetime_secs,
+            freshness_ratio,
+        })
     }
 }
 
-/// Compute refresh parameters for [`TokenLifetimeConfig`].
+/// Compute refresh parameters for [`CachedToken`](super::token_watcher::CachedToken).
 ///
-/// Returns `(freshness_period, min_staleness_period)` such that
-/// `max(lifetime × freshness_period, min_staleness_period) <= lifetime`,
-/// guaranteeing the stale time never exceeds the expiry time.
+/// Returns `(freshness_ratio, min_stale_secs)` where:
+/// - `freshness_ratio` (0.0–1.0): fraction of the token's lifetime during
+///   which it is considered **fresh**. After this fraction elapses the token
+///   transitions to **stale** and the background watcher attempts a refresh.
+/// - `min_stale_secs`: lower bound on the staleness window (the time
+///   between the fresh→stale transition and expiry).
 ///
-/// `min_refresh_period` is used as a **lower bound on the staleness
-/// window** (the minimum time the token spends in the "stale" state
-/// before expiry), not as a refresh deadline. It is capped to
-/// `desired_delay` so it can never push the stale time past expiry.
-/// In `aliri_tokens` terms it maps to `min_staleness_period`.
+/// `min_refresh_period` sets a **lower bound on the staleness window**
+/// (the minimum time the token spends in the "stale" state before expiry),
+/// not a refresh deadline. It is capped to `desired_delay` so it can never
+/// push the stale boundary past expiry.
 ///
 /// - Normal case (`offset < lifetime`): stale `offset` seconds before
 ///   expiry.
@@ -197,9 +191,9 @@ fn refresh_params(
     lifetime_secs: u64,
     refresh_offset: &Duration,
     min_refresh_period: &Duration,
-) -> (f64, DurationSecs) {
+) -> (f64, u64) {
     if lifetime_secs == 0 {
-        return (0.0, DurationSecs(0));
+        return (0.0, 0);
     }
 
     let offset = refresh_offset.as_secs();
@@ -215,7 +209,7 @@ fn refresh_params(
     let freshness = (desired_delay as f64) / (lifetime_secs as f64);
     let min_stale = min_refresh_period.as_secs().min(desired_delay);
 
-    (freshness, DurationSecs(min_stale))
+    (freshness, min_stale)
 }
 
 #[cfg(test)]
@@ -254,8 +248,8 @@ mod tests {
         let mut source = OAuthTokenSource::new(&test_config(&server)).unwrap();
         let token = source.request_token().await.unwrap();
 
-        assert_eq!(token.access_token().as_str(), "tok-123");
-        assert_eq!(token.lifetime(), DurationSecs(3600));
+        assert_eq!(token.access_token, "tok-123");
+        assert_eq!(token.lifetime_secs, 3600);
         mock.assert();
     }
 
@@ -274,7 +268,7 @@ mod tests {
         let token = source.request_token().await.unwrap();
 
         // default_ttl from OAuthClientConfig::default() is 5 min = 300s
-        assert_eq!(token.lifetime(), DurationSecs(300));
+        assert_eq!(token.lifetime_secs, 300);
         mock.assert();
     }
 
@@ -292,8 +286,8 @@ mod tests {
         let mut source = OAuthTokenSource::new(&test_config(&server)).unwrap();
         let token = source.request_token().await.unwrap();
 
-        // Server-provided expires_in is honoured as-is; aliri handles refresh scheduling.
-        assert_eq!(token.lifetime(), DurationSecs(0));
+        // Server-provided expires_in is honoured as-is; token watcher handles refresh scheduling.
+        assert_eq!(token.lifetime_secs, 0);
         mock.assert();
     }
 
@@ -510,19 +504,19 @@ mod tests {
         let mut source = OAuthTokenSource::new(&test_config(&server)).unwrap();
         let token = source.request_token().await.unwrap();
 
-        assert_eq!(token.access_token().as_str(), "tok");
+        assert_eq!(token.access_token, "tok");
         mock.assert();
     }
 
     // -- refresh_params -------------------------------------------------------
 
-    /// Helper: verify that the aliri formula
+    /// Helper: verify that the refresh formula
     /// `max(lifetime * freshness, min_stale) <= lifetime`
     /// holds for the given params.
     #[allow(clippy::cast_precision_loss)]
-    fn assert_stale_before_expiry(lifetime: u64, freshness: f64, min_stale: DurationSecs) {
+    fn assert_stale_before_expiry(lifetime: u64, freshness: f64, min_stale: u64) {
         let delay_a = (lifetime as f64) * freshness;
-        let delay_b = min_stale.0 as f64;
+        let delay_b = min_stale as f64;
         let delay = delay_a.max(delay_b);
         assert!(
             delay <= lifetime as f64,
@@ -535,7 +529,7 @@ mod tests {
         // 1-hour token, 30-min offset → stale at 50%
         let (r, ms) = refresh_params(3600, &Duration::from_mins(30), &Duration::from_secs(10));
         assert!((r - 0.5).abs() < f64::EPSILON);
-        assert_eq!(ms, DurationSecs(10));
+        assert_eq!(ms, 10);
         assert_stale_before_expiry(3600, r, ms);
     }
 
@@ -544,7 +538,7 @@ mod tests {
         // 20-min token, 30-min offset → fallback 0.5
         let (r, ms) = refresh_params(1200, &Duration::from_mins(30), &Duration::from_secs(10));
         assert!((r - 0.5).abs() < f64::EPSILON);
-        assert_eq!(ms, DurationSecs(10));
+        assert_eq!(ms, 10);
         assert_stale_before_expiry(1200, r, ms);
     }
 
@@ -561,7 +555,7 @@ mod tests {
         // Both values must be zero so stale == expiry.
         let (r, ms) = refresh_params(0, &Duration::from_mins(30), &Duration::from_secs(10));
         assert!((r - 0.0).abs() < f64::EPSILON);
-        assert_eq!(ms, DurationSecs(0));
+        assert_eq!(ms, 0);
     }
 
     #[test]
@@ -569,7 +563,7 @@ mod tests {
         // 5-min token, 1-min offset → stale at 80%
         let (r, ms) = refresh_params(300, &Duration::from_mins(1), &Duration::from_secs(10));
         assert!((r - 0.8).abs() < f64::EPSILON);
-        assert_eq!(ms, DurationSecs(10));
+        assert_eq!(ms, 10);
         assert_stale_before_expiry(300, r, ms);
     }
 
@@ -578,7 +572,7 @@ mod tests {
         // No offset → stale at 100% (only stale when expired)
         let (r, ms) = refresh_params(3600, &Duration::from_secs(0), &Duration::from_secs(10));
         assert!((r - 1.0).abs() < f64::EPSILON);
-        assert_eq!(ms, DurationSecs(10));
+        assert_eq!(ms, 10);
         assert_stale_before_expiry(3600, r, ms);
     }
 
@@ -589,7 +583,7 @@ mod tests {
         // desired_delay = 300 - 60 = 240
         assert!((r - 0.8).abs() < f64::EPSILON);
         // min_stale capped to desired_delay, not 600
-        assert_eq!(ms, DurationSecs(240));
+        assert_eq!(ms, 240);
         assert_stale_before_expiry(300, r, ms);
     }
 
@@ -598,6 +592,6 @@ mod tests {
         // expires_in=0 with min_refresh_period=10 — both must be zero
         let (r, ms) = refresh_params(0, &Duration::from_mins(30), &Duration::from_secs(10));
         assert!((r - 0.0).abs() < f64::EPSILON);
-        assert_eq!(ms, DurationSecs(0));
+        assert_eq!(ms, 0);
     }
 }

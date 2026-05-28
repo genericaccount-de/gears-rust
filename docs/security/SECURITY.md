@@ -359,13 +359,13 @@ The architectural lints in the `DE03xx` series enforce **strict layering** (cont
 
 ### Default (non-FIPS) cryptographic stack
 
-The project uses `aws-lc-rs` (via `rustls`) as its primary TLS cryptographic backend. JWT validation uses `jsonwebtoken` and `aliri`.
+The project uses `aws-lc-rs` (via `rustls`) as its primary TLS cryptographic backend. JWT validation uses `jsonwebtoken`.
 
 | Layer | Library | Backend |
 |---|---|---|
 | TLS | `rustls` + `hyper-rustls` | `aws-lc-rs` |
 | Certificate verification | `rustls-webpki` | `aws-lc-rs`, `ring` |
-| JWT validation | `jsonwebtoken`, `aliri` | `sha2`, `hmac`, `ring` |
+| JWT validation | `jsonwebtoken` | `sha2`, `hmac`, `ring` |
 | Database TLS | `sqlx` (`tls-rustls-aws-lc-rs`) | `aws-lc-rs` |
 
 ### FIPS-140-3 build (`--features fips`)
@@ -420,7 +420,7 @@ make security           # Runs both `deny` (license/advisory) and `fips-policy`
 
 **Phase A** (shipped) bans crates not currently in the graph — zero-pain regression gate: future PRs adding `md2`/`md4`/`ripemd`, `chacha20poly1305`/`salsa20`, the Curve25519 family (`x25519-dalek`, `ed25519-dalek`, …), alternative TLS frameworks (`openssl`, `boring`, `native-tls`), or alternative rustls CryptoProviders (`rustls-symcrypt`, `rustls-mbedcrypto-provider`, `rustls-openssl`, `rustls-rustcrypto`, `rustls-graviola`, `rustls-wolfcrypto-provider`, `boring-rustls-provider`) all fail the gate.
 
-**Phase B** (pending transitive cleanup) is documented inline in `deny-fips.toml` — `ring`, non-FIPS `aws-lc-rs`, `chacha20`, `md-5`, `sha1`, `blake2`/`blake3`, `aes`, `hmac`, `hkdf`, etc. — currently pulled by upstream deps (`aliri`/`pingora-rustls`/`ureq`, rustls's default features, `rand`). Each moves to Phase A as its upstream pull-through is replaced. **Tracking**: [ADR 0005 §"Phasing"](fips/adrs/0005-fips-dependency-policy.md) and [FIPS PRD §13 TODO-7](fips/PRD.md#13-open-questions) — promotion to Phase A is the unit of work; no per-crate sub-tickets today.
+**Phase B** (pending transitive cleanup) is documented inline in `deny-fips.toml` — `ring`, non-FIPS `aws-lc-rs`, `chacha20`, `md-5`, `sha1`, `blake2`/`blake3`, `aes`, `hmac`, `hkdf`, etc. — currently pulled by upstream deps (`pingora-rustls`/`ureq`, rustls's default features, `rand`). Each moves to Phase A as its upstream pull-through is replaced. **Tracking**: [ADR 0005 §"Phasing"](fips/adrs/0005-fips-dependency-policy.md) and [FIPS PRD §13 TODO-7](fips/PRD.md#13-open-questions) — promotion to Phase A is the unit of work; no per-crate sub-tickets today.
 
 ### Runtime Operational Environment validation
 
@@ -472,8 +472,8 @@ See [`examples/cyberware-fips-probe/README.md`](../../examples/cyberware-fips-pr
 - **CMVP OE-coverage is the deployment's responsibility.** A FIPS claim is void if the running OS version is not inside the cert's OE. The macOS runtime gate is fail-closed; Linux + Windows OE coverage is verified manually per release.
 - **`CryptoProvider::fips() = true` is design intent, not a runtime witness.** It asserts that every primitive in the provider routes through a CMVP-validated module by construction. It does *not* prove that the running OS version matches an active CMVP cert OE — that proof comes from the §release-checklist CMVP-cert search.
 - **TLS 1.2 PRF on macOS is not CAVS-listed.** Apple corecrypto exposes generic HMAC primitives but not a CAVS-listed dedicated TLS PRF (unlike `aws-lc-fips`'s `tls_prf::Algorithm`). Consequence: `fips_provider()` on macOS is TLS-1.3-only; customers requiring TLS 1.2 on macOS+FIPS must accept that those connections do not carry a FIPS claim.
-- **JWT signature validation does not go through the FIPS path.** `aliri-tokens` + `jsonwebtoken` use `ring` / non-FIPS `aws-lc-rs` for RSA / ECDSA verification on bearer tokens. Treat tokens as authentication context, not as data covered by the cryptographic claim. Out of scope today; tracked as **TODO-7** in [FIPS PRD §13](fips/PRD.md#13-open-questions). Cleanup is gated by `deny-fips.toml` Phase B promotion.
-- **Non-FIPS crypto crates remain in the final binary on macOS+fips.** `ring` is pulled in transitively by `aliri`, `pingora-pool`, and `ureq`; non-FIPS `aws-lc-rs` is pulled in by rustls's default feature set; `chacha20` is pulled in by the `rand` ecosystem. These are **not invoked** on the TLS data plane (the installed `CryptoProvider` routes every TLS primitive through the validated module) but the symbols are linked into the binary. Linkage smoke (above) confirms no non-validated shared libraries appear at runtime.
+- **JWT signature validation does not go through the FIPS path.** `jsonwebtoken` uses `ring` / non-FIPS `aws-lc-rs` for RSA / ECDSA verification on bearer tokens. Treat tokens as authentication context, not as data covered by the cryptographic claim. Out of scope today; tracked as **TODO-7** in [FIPS PRD §13](fips/PRD.md#13-open-questions). Cleanup is gated by `deny-fips.toml` Phase B promotion.
+- **Non-FIPS crypto crates remain in the final binary on macOS+fips.** `ring` is pulled in transitively by `pingora-rustls`, `pingora-pool`, and `ureq`; non-FIPS `aws-lc-rs` is pulled in by rustls's default feature set; `chacha20` is pulled in by the `rand` ecosystem. These are **not invoked** on the TLS data plane (the installed `CryptoProvider` routes every TLS primitive through the validated module) but the symbols are linked into the binary. Linkage smoke (above) confirms no non-validated shared libraries appear at runtime.
 - **Server-side TLS keys load from PEM/DER bytes by default.** The bytes transit user-space memory before reaching `SecKeyCreateWithData` / `BCryptImportKeyPair` / `EVP_PKEY_new`. Strict-FIPS auditors operating under "no plaintext CSPs outside the boundary" require a Keychain / NCrypt / HSM flow; tracked as **TODO-1**.
 
 ### Deep references
@@ -571,7 +571,7 @@ This ensures every new service or module repository starts with the same defense
 The following areas have been identified for future hardening:
 
 1. **FIPS-140-3 — non-TLS crypto cleanup** — the `--features fips` build routes the **TLS data plane** through a CMVP-validated module on Linux, macOS, and Windows (see §9). Open items, tracked in the [FIPS PRD §13](fips/PRD.md#13-open-questions):
-   - **TODO-7** — JWT signature validation (`aliri-tokens` → `jsonwebtoken`) currently uses `ring` / non-FIPS `aws-lc-rs`. Audit the surface and either replace upstream, fork, or restrict JWT to symmetric HMAC. Build-time floor enforced via [`deny-fips.toml`](../../deny-fips.toml) Phase B promotion.
+   - **TODO-7** — JWT signature validation (`jsonwebtoken`) currently uses `ring` / non-FIPS `aws-lc-rs`. Audit the surface and either replace upstream, fork, or restrict JWT to symmetric HMAC. Build-time floor enforced via [`deny-fips.toml`](../../deny-fips.toml) Phase B promotion.
    - **TODO-8** — Runtime Operational Environment validation on Linux + Windows (macOS already has a sysctl-based fail-closed gate). Today OE coverage on Linux + Windows is verified manually per release via CMVP cert search.
    - **TODO-1** — Keychain / NCrypt / HSM-stored private keys for server-side TLS (today's PEM/DER load is acceptable for development and most production deployments where filesystem permissions guard the key).
 2. **Secure ORM type-column auto-injection** — the `ScopableEntity` trait supports a `type_col` dimension, but automatic GTS type constraint injection from PDP → `AccessScope` → SQL `WHERE` is under development

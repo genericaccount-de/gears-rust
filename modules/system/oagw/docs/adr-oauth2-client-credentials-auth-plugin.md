@@ -21,7 +21,7 @@ Current built-in auth plugins (`ApiKeyAuthPlugin`, `NoopAuthPlugin`) handle stat
 
 ### Why `fetch_token()` over `Token`
 
-`modkit-auth` offers two token acquisition APIs. `Token` is a long-lived handle that spawns an `aliri_tokens::TokenWatcher` background task for automatic refresh — designed for service-level singletons where one identity authenticates to one upstream for the process lifetime. `fetch_token()` performs a single HTTP exchange and returns the bearer value alongside `expires_in`, spawning nothing.
+`modkit-auth` offers two token acquisition APIs. `Token` is a long-lived handle that spawns a `token_watcher::TokenWatcher` background task for automatic refresh — designed for service-level singletons where one identity authenticates to one upstream for the process lifetime. `fetch_token()` performs a single HTTP exchange and returns the bearer value alongside `expires_in`, spawning nothing.
 
 The OAGW plugin is multi-tenant: each cache miss resolves a different (tenant, subject, config) tuple. Using `Token` here would spawn a background watcher per miss — potentially thousands of orphaned tokio tasks sleeping until their next refresh cycle, each holding `client_id` and `client_secret` in the captured `source_factory` closure. `fetch_token()` avoids both problems: credentials are transient (dropped after the fetch), and no background tasks are created. The plugin manages its own cache with `pingora-memory-cache`, making `Token`'s built-in refresh redundant.
 
@@ -244,7 +244,7 @@ This is an area of active design. The trait shape, the metadata returned, and th
 - No changes to the `AuthPlugin` trait — existing plugins (`ApiKeyAuthPlugin`, `NoopAuthPlugin`) unchanged
 - `pingora-memory-cache` aligns with planned Pingora adoption (S3-FIFO + TinyLFU eviction, stampede protection)
 - `expires_in`-aware cache TTL via `min(config_ttl, expires_in − 30s)` prevents serving tokens near expiry when IdP issues short-lived tokens
-- No orphaned background tasks — `fetch_token()` performs a single HTTP exchange and returns; no `aliri_tokens::TokenWatcher` is spawned
+- No orphaned background tasks — `fetch_token()` performs a single HTTP exchange and returns; no `TokenWatcher` is spawned
 
 ### Negative
 
@@ -262,7 +262,7 @@ This is an area of active design. The trait shape, the metadata returned, and th
 ### Known Residual Plaintext
 
 - The `format!("Bearer {}", token.expose())` string in `ctx.headers` is a plain `String` — not zeroed, but short-lived (scoped to the request).
-- Inside `OAuthTokenSource::request_token()`, the `AccessToken` from `aliri_tokens` is a plain `String` — not zeroed. However, the source is created, used once, and dropped immediately by `fetch_token()`, so the plaintext lifetime is limited to the fetch call.
+- Inside `OAuthTokenSource::request_token()`, the access token is a plain `String` — not zeroed. However, the source is created, used once, and dropped immediately by `fetch_token()`, so the plaintext lifetime is limited to the fetch call.
 - The long-lived cache entry itself IS zeroed on eviction via `SecretString`'s `ZeroizeOnDrop`. `pingora-memory-cache` uses flurry/seize for deferred reclamation, so there is a small delay between eviction and actual `Drop`. For bearer tokens with ~1 hour TTL, this delay (milliseconds to seconds) is negligible.
 
 ## Out of Scope

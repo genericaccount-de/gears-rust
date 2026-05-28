@@ -39,8 +39,7 @@ modkit-http = { workspace = true }
 url = { workspace = true }
 
 # OAuth2 token lifecycle
-aliri_tokens = { workspace = true }
-aliri_clock = { workspace = true }
+rand = { workspace = true }
 base64 = { workspace = true }
 
 # Shared utilities

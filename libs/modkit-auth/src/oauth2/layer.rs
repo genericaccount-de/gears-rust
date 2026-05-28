@@ -256,7 +256,7 @@ mod tests {
             when.method(POST).path("/token");
             then.status(200)
                 .header("content-type", "application/json")
-                .body(token_json("tok-short-lived", 1));
+                .body(token_json("tok-short-lived", 2));
         });
 
         let token = Token::new(test_config(&server)).await.unwrap();

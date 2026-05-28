@@ -152,9 +152,9 @@ engineering.
 
 - **Cyber Ware itself on the CMVP Validated Modules list.** Cyber Ware is a consumer of validated modules; the validated
   modules are Apple corecrypto, AWS-LC FIPS Provider, and Microsoft Windows CNG.
-- **Non-TLS crypto in the binary.** JWT signature validation (`aliri-tokens` → `jsonwebtoken`) uses `ring` / non-FIPS
+- **Non-TLS crypto in the binary.** JWT signature validation (`jsonwebtoken`) uses `ring` / non-FIPS
   `aws-lc-rs`. `ring`, non-FIPS `aws-lc-rs`, and `chacha20` are linked into the macOS+fips binary via transitive deps
-  from `pingora-pool`, `ureq`, `aliri`, and rustls's default feature set; they are dead-at-runtime on the TLS path but
+  from `pingora-pool`, `ureq`, and rustls's default feature set; they are dead-at-runtime on the TLS path but
   physically present. Dependency policy Phase B (see [ADR 0005](adrs/0005-fips-dependency-policy.md)) tracks the
   cleanup.
 - **TLS 1.2 FIPS claim on macOS.** Apple does not expose a CAVS-listed TLS-PRF primitive; `fips_provider()` on macOS is
@@ -540,7 +540,7 @@ TLS state machine. Only the crypto-primitive backend behind a `cfg` branch MUST 
 - Apple, Microsoft, and AWS Labs each publish a fresh CMVP submission per major OS release within an acceptable time
   window (typically 3–6 months); during the gap window between an OS release and its CMVP cert, the release-checklist
   gate may temporarily exclude that OS version from the supported list.
-- JWT validation paths (`aliri-tokens`, `jsonwebtoken`) and miscellaneous transitive crypto (`ring`, non-FIPS
+- JWT validation paths (`jsonwebtoken`) and miscellaneous transitive crypto (`ring`, non-FIPS
   `aws-lc-rs`, `chacha20`) are out of scope for the FIPS claim; Phase B of `deny-fips.toml` tracks cleanup.
 
 ## 12. Risks
@@ -572,7 +572,7 @@ TLS state machine. Only the crypto-primitive backend behind a `cfg` branch MUST 
   `CC_TLSPrf`; if it ever does, TLS 1.2 cipher suites can move into `fips_provider()`.
 - [ ] **TODO-6**: CMVP-cert-version pinning automation. Today the release checklist asks the engineer to manually verify
   CMVP cert OE coverage. Automate by scraping the CMVP search results into the CI gate.
-- [ ] **TODO-7**: Non-TLS crypto outside the FIPS path. `aliri-tokens` + `jsonwebtoken` (JWT verification) call into
+- [ ] **TODO-7**: Non-TLS crypto outside the FIPS path. `jsonwebtoken` (JWT verification) calls into
   `ring` / non-FIPS `aws-lc-rs`. Audit the dependency surface; evaluate forking `jsonwebtoken` onto a FIPS-friendly
   backend, or restrict JWT validation to symmetric HMAC tokens. Build-time floor enforced
   via [ADR 0005](adrs/0005-fips-dependency-policy.md) `deny-fips.toml` Phase B.

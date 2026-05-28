@@ -1,4 +1,4 @@
-# Outbound OAuth2 Client Credentials for ModKit modules using aliri_tokens
+# Outbound OAuth2 Client Credentials for ModKit modules
 
 ## Context
 
@@ -22,24 +22,27 @@ The platform HTTP client is `modkit-http::HttpClient` (hyper + tower), which alr
 
 ## Decision
 
-Use `aliri_tokens` as the token lifecycle engine, without its `oauth2` feature (so it does not pull `reqwest`). Implement OAuth2 Client Credentials exchange as a custom token source that uses `modkit-http::HttpClient` with `HttpClientConfig::token_endpoint()`.
+Use an in-house `token_watcher` module (`oauth2/token_watcher.rs`) for token lifecycle management — background refresh with jitter, exponential backoff, and lock-free reads via `ArcSwap`. This replaces the earlier `aliri_tokens` dependency, which was removed to eliminate its transitive `ring` dependency (see [ADR 0005 — FIPS Dependency Policy](../../security/fips/adrs/0005-fips-dependency-policy.md)).
 
-Outbound HTTP composition is hyper + tower. Authentication is implemented as a tower layer that composes with the existing `HttpClient` layer stack.
+OAuth2 Client Credentials exchange is implemented as a custom token source that uses `modkit-http::HttpClient` with `HttpClientConfig::token_endpoint()`. Outbound HTTP composition is hyper + tower. Authentication is implemented as a tower layer that composes with the existing `HttpClient` layer stack.
 
 ## Consequences
 
 **Good:**
 
-- refresh scheduling, jitter, concurrency control, and backoff are delegated to `aliri_tokens`
+- refresh scheduling, jitter, concurrency control, and backoff are handled by `token_watcher` — no external dependency needed
+- input validation rejects pathological token lifetimes (zero, NaN, infinity, zero-window) at construction time
+- `valid_token()` prevents callers from accidentally using expired tokens
+- shutdown cancels in-flight refresh requests via `tokio::select!`
 - token endpoint HTTP calls reuse `modkit-http::HttpClient` — retries, timeouts, rate limiting, OTel tracing, and TLS are handled by the existing tower stack; no duplicate implementation needed
 - `HttpClientConfig::token_endpoint()` already configures conservative retry (transport errors, timeout, 429 only) appropriate for token acquisition
 - outbound auth layer is a standard tower layer, composable with the existing `HttpClient` middleware
-- no `reqwest` in `modkit-auth`
+- no `reqwest` or `ring` in `modkit-auth`
 
 **Bad:**
 
-- small amount of glue code is needed: `AsyncTokenSource` implementation wrapping `HttpClient`, optional OIDC discovery, tower auth layer
-- `invalidate()` is not a native operation in `aliri_tokens` and must be implemented via watcher rotation
+- small amount of glue code is needed: `OAuthTokenSource` implementation wrapping `HttpClient`, optional OIDC discovery, tower auth layer
+- `invalidate()` is implemented via watcher rotation (spawn a new watcher, atomically swap it in)
 
 ## Implementation Status
 
@@ -51,12 +54,13 @@ All components are implemented in `libs/modkit-auth/src/oauth2/` and `libs/modki
 |--------|------|-------------|-------------|
 | `config` | `oauth2/config.rs` | `OAuthClientConfig` | Configuration struct with `token_endpoint` / `issuer_url` (mutually exclusive), credentials, scopes, refresh policy, and optional `HttpClientConfig` override. `Debug` redacts `client_secret`. |
 | `types` | `oauth2/types.rs` | `ClientAuthMethod`, `SecretString` | Auth method enum (`Basic` / `Form`). `SecretString` re-exported from `modkit-utils` (backed by `Zeroizing<String>`). |
-| `error` | `oauth2/error.rs` | `TokenError` | `#[non_exhaustive]` error enum: `Http`, `InvalidResponse`, `UnsupportedTokenType`, `ConfigError`, `Unavailable`. All variants are secret-safe. |
-| `token` | `oauth2/token.rs` | `Token` | Handle for obtaining bearer tokens. `Clone + Send + Sync`. Background refresh via `aliri_tokens::TokenWatcher`. Lock-free reads via `ArcSwap`. `get()` returns `SecretString`, `invalidate()` rotates the watcher without repeating OIDC discovery. |
+| `error` | `oauth2/error.rs` | `TokenError` | `#[non_exhaustive]` error enum: `Http`, `InvalidResponse`, `UnsupportedTokenType`, `ConfigError`, `Unavailable`, `InvalidTokenLifetime`. All variants are secret-safe. |
+| `token` | `oauth2/token.rs` | `Token` | Handle for obtaining bearer tokens. `Clone + Send + Sync`. Background refresh via in-house `token_watcher::TokenWatcher`. Lock-free reads via `ArcSwap`. `get()` returns `Result<SecretString, TokenError>` (rejects expired tokens), `invalidate()` rotates the watcher without repeating OIDC discovery. |
 | `layer` | `oauth2/layer.rs` | `BearerAuthLayer` | Tower `Layer` + `Service` that injects `Authorization: Bearer <token>` (or custom header) into outbound requests. |
 | `builder_ext` | `oauth2/builder_ext.rs` | `HttpClientBuilderExt` | Extension trait on `modkit_http::HttpClientBuilder` providing `.with_bearer_auth(token)` and `.with_bearer_auth_header(token, header_name)`. |
 | `discovery` | `oauth2/discovery.rs` | *(crate-internal)* | One-time OIDC discovery: fetches `{issuer_url}/.well-known/openid-configuration` and extracts `token_endpoint`. |
-| `source` | `oauth2/source.rs` | *(crate-internal)* | `AsyncTokenSource` implementation that exchanges client credentials for an access token via `modkit-http::HttpClient`. |
+| `token_watcher` | `oauth2/token_watcher.rs` | *(crate-internal)* | Background refresh loop with jitter, exponential backoff, input validation, and shutdown support. Stores the latest `CachedToken` in `ArcSwap` for lock-free reads. |
+| `source` | `oauth2/source.rs` | *(crate-internal)* | `OAuthTokenSource` that exchanges client credentials for an access token via `modkit-http::HttpClient`. |
 
 All public types are re-exported from `modkit_auth::oauth2` and from the crate root (`modkit_auth::{...}`).
 

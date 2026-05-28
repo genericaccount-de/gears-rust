@@ -1,16 +1,12 @@
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
 
-use aliri_clock::DurationSecs;
-use aliri_tokens::backoff::ErrorBackoffConfig;
-use aliri_tokens::jitter::RandomEarlyJitter;
-use aliri_tokens::{TokenStatus, TokenWatcher};
 use arc_swap::ArcSwap;
 
 use super::config::OAuthClientConfig;
 use super::error::TokenError;
 use super::source::OAuthTokenSource;
+use super::token_watcher::{TokenWatcher, WatcherConfig};
 use modkit_utils::SecretString;
 
 /// Internal state holding the live watcher.
@@ -21,16 +17,10 @@ struct TokenInner {
     watcher: TokenWatcher,
 }
 
-/// Parameters needed to (re-)spawn a [`TokenWatcher`].
-struct WatcherConfig {
-    jitter_max: Duration,
-    min_refresh_period: Duration,
-}
-
 /// Handle for obtaining `OAuth2` bearer tokens.
 ///
-/// Internally drives an `aliri_tokens::TokenWatcher` for background refresh and
-/// exposes lock-free reads via `ArcSwap` (same pattern as the JWKS key
+/// Internally drives a [`token_watcher::TokenWatcher`] for background refresh
+/// and exposes lock-free reads via `ArcSwap` (same pattern as the JWKS key
 /// provider).
 ///
 /// `Token` is [`Clone`] + [`Send`] + [`Sync`] — share freely across tasks.
@@ -75,10 +65,10 @@ impl Token {
             config.token_endpoint = Some(resolved);
         }
 
-        let watcher_config = Arc::new(WatcherConfig {
-            jitter_max: config.jitter_max,
-            min_refresh_period: config.min_refresh_period,
-        });
+        let watcher_config = Arc::new(WatcherConfig::new(
+            config.jitter_max,
+            config.min_refresh_period,
+        )?);
 
         let source = OAuthTokenSource::new(&config)?;
         let watcher = spawn_watcher(source, &watcher_config).await?;
@@ -108,13 +98,8 @@ impl Token {
     /// (the background watcher has not yet refreshed it).
     pub fn get(&self) -> Result<SecretString, TokenError> {
         let guard = self.inner.load();
-        let borrowed = guard.watcher.token();
-        if matches!(borrowed.token_status(), TokenStatus::Expired) {
-            return Err(TokenError::Unavailable(
-                "token expired, refresh pending".into(),
-            ));
-        }
-        let raw = borrowed.access_token().as_str();
+        let cached = guard.watcher.valid_token()?;
+        let raw = cached.access_token();
         Ok(SecretString::new(raw))
     }
 
@@ -151,11 +136,7 @@ async fn spawn_watcher(
     source: OAuthTokenSource,
     config: &WatcherConfig,
 ) -> Result<TokenWatcher, TokenError> {
-    let jitter = RandomEarlyJitter::new(DurationSecs(config.jitter_max.as_secs()));
-    let backoff =
-        ErrorBackoffConfig::new(config.min_refresh_period, config.min_refresh_period * 30, 2);
-
-    TokenWatcher::spawn_from_token_source(source, jitter, backoff).await
+    TokenWatcher::spawn(source, config.clone()).await
 }
 
 #[cfg(test)]
@@ -163,6 +144,7 @@ async fn spawn_watcher(
 mod tests {
     use super::*;
     use httpmock::prelude::*;
+    use std::time::Duration;
     use url::Url;
 
     /// Build a test config pointing at the given mock server.

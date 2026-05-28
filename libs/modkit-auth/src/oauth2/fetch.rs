@@ -10,8 +10,6 @@
 use std::fmt;
 use std::time::Duration;
 
-use aliri_tokens::sources::AsyncTokenSource;
-
 use super::config::OAuthClientConfig;
 use super::error::TokenError;
 use super::source::OAuthTokenSource;
@@ -77,8 +75,8 @@ pub async fn fetch_token(mut config: OAuthClientConfig) -> Result<FetchedToken, 
     let token = source.request_token().await?;
 
     Ok(FetchedToken {
-        bearer: SecretString::new(token.access_token().as_str()),
-        expires_in: Duration::from_secs(token.lifetime().0),
+        bearer: SecretString::new(token.access_token),
+        expires_in: Duration::from_secs(token.lifetime_secs),
     })
 }
 

@@ -311,8 +311,6 @@ arc-swap = "1.7"
 
 # Security
 zeroize = { version = "1", features = ["derive"] }
-aliri_tokens = { version = "0.3", default-features = false, features = ["rand"] }
-aliri_clock = "0.1"
 
 # Logging
 tracing = "0.1"
@@ -568,3 +566,4 @@ gts-macros = "0.9.3"
 
 # GTS validator
 gts-validator = "0.9.3"
+

@@ -12,6 +12,7 @@ pub mod fetch;
 pub mod layer;
 pub(crate) mod source;
 pub mod token;
+pub(crate) mod token_watcher;
 pub mod types;
 
 pub use auto_refresh::{
