@@ -166,8 +166,96 @@ jobs:
       - name: Test modkit-db (mysql integration)
         run: make test-mysql
 
-      - name: Test modkit (FIPS integration)
+  test-fips:
+    name: FIPS verification (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest, windows-latest ]
+    env:
+      RUSTFLAGS: "-C debuginfo=0"
+    steps:
+      - name: Force LF in working tree (w/a for Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Go is only required for the aws-lc-fips-sys build on the Linux lane.
+      - name: Install Go (required for aws-lc-fips-sys FIPS build)
+        if: runner.os == 'Linux'
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: '1.21.x'  # pinned - see docs/security/fips/TOOLCHAIN.md
+          cache: false
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup show
+
+      - name: Install nextest
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: nextest
+
+      # FIPS builds use a SEPARATE sccache bucket from non-FIPS jobs. The `-fips`
+      # cache-key segment guarantees a runner that toggles between FIPS and
+      # non-FIPS builds never reuses non-FIPS object files, which would otherwise
+      # silently produce a mixed binary that passes tests but isn't a true FIPS build.
+      - name: Cache Cargo/target
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          cache-bin: false
+          cache-targets: false
+          shared-key: pr-${{ runner.os }}-stable-1.95-fips
+
+      # Install sccache (cross-platform)
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
+      # Probe sccache; if startup fails, fall back to plain rustc (no hard CI failure).
+      - name: Probe sccache & set RUSTC_WRAPPER
+        shell: bash
+        run: |
+          if sccache --start-server >/dev/null 2>&1; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          else
+            echo "sccache failed, falling back to plain rustc"
+          fi
+
+      # Linux: aws-lc-fips path via the existing make target
+      # (cyberware-modkit + cyberware-modkit-http, bootstrap + fips).
+      - name: FIPS tests (Linux / aws-lc-fips)
+        if: runner.os == 'Linux'
+        shell: bash
         run: make test-fips
+
+      # macOS: exercise the Apple corecrypto TLS provider path.
+      - name: FIPS tests (macOS / corecrypto)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cargo test -p cyberware-rustls-corecrypto-provider --features fips
+          cargo test -p cyberware-modkit-http --features fips
+
+      # Windows: build-verify the CNG provider path. Compile-only is sufficient —
+      # runtime FIPS execution depends on host FIPS-mode policy (see ADR 0003).
+      - name: FIPS build check (Windows / CNG)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cargo check --target x86_64-pc-windows-msvc -p cyberware-modkit-http --features fips
 
   cypilot:
     name: Cypilot
