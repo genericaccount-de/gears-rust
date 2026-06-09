@@ -121,6 +121,204 @@ release-plz updates this file in the Release PR.
 
 ## [0.1.1](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-account-management-v0.1.1) - 2026-06-09
 
+### Added
+
+- *(account-management)* add GET /v1/me identity endpoint (by @diffora)
+- *(account-management)* hierarchy lease, metadata walk-up, authz vocab, GTS 0.10 envelopes + repo_impl coverage (by @diffora)
+
+### Fixed
+
+- *(account-management)* gate coverage(off) with feature(coverage_attribute) in metadata tests (by @diffora)
+- add missing coverage_attribute feature gate in metadata_integration tests (by @Artifizer) - #4039
+
+### Other
+
+- Update gears/system/account-management/account-management/src/infra/lease/manager.rs (by @Artifizer) - #4036
+- complete Module -> Gear term renaming everywhere (by @Artifizer) - #4039
+- mass renaming - Cyber Fabric -> Constructor Fabric
+
+### Contributors
+
+* @Artifizer
+* @diffora
+
+## [0.1.1](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-account-management-sdk-v0.1.1) - 2026-06-09
+
+### Added
+
+- *(account-management)* hierarchy lease, metadata walk-up, authz vocab, GTS 0.10 envelopes + repo_impl coverage (by @diffora)
+
+### Other
+
+- Update gears/system/account-management/account-management-sdk/src/gts.rs (by @Artifizer) - #4036
+- Update gears/system/account-management/account-management-sdk/src/gts.rs (by @Artifizer) - #4036
+- complete Module -> Gear term renaming everywhere (by @Artifizer) - #4039
+- mass renaming - Cyber Fabric -> Constructor Fabric
+
+### Contributors
+
+* @Artifizer
+* @diffora
+
+## [0.6.10](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-toolkit-v0.6.10) - 2026-06-09
+
+### Other
+
+- *(toolkit)* relax local backend process-exit timeout (by @Artifizer)
+- complete Module -> Gear term renaming everywhere (by @Artifizer) - #4039
+- mass renaming - Cyber Fabric -> Constructor Fabric
+
+### Contributors
+
+* @Artifizer
+
+## [0.7.3](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-toolkit-canonical-errors-v0.7.3) - 2026-06-09
+
+### Other
+
+- mass renaming - Cyber Fabric -> Constructor Fabric
+
+## [0.6.1](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-toolkit-canonical-errors-macro-v0.6.1) - 2026-06-09
+
+### Other
+
+- mass renaming - Cyber Fabric -> Constructor Fabric
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-rustls-corecrypto-provider-v0.1.0) - 2026-06-09
+
+### Added
+
+- *(modkit)* Apple corecrypto rustls CryptoProvider for macOS FIPS (by @MikeFalcon77)
+
+### Fixed
+
+- compilation, linter, formatting issues (by @fluiderson)
+
+### Other
+
+- complete Module -> Gear term renaming everywhere (by @Artifizer) - #4039
+- mass renaming - Cyber Fabric -> Constructor Fabric
+- Merge pull request #1961 from fluiderson/docs-all-feats (by @Artifizer)
+- Add MacOS 26 (Taohe) to the FIPS supported list
+
+### Contributors
+
+* @Artifizer
+* @fluiderson
+* @MikeFalcon77
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-oidc-authn-plugin-v0.1.0) - 2026-06-09
+
+### Other
+
+- complete Module -> Gear term renaming everywhere (by @Artifizer) - #4039
+- mass renaming - Cyber Fabric -> Constructor Fabric
+
+### Contributors
+
+* @Artifizer
+
+## [0.1.3](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-tr-authz-plugin-v0.1.3) - 2026-06-09
+
+### Other
+
+- complete Module -> Gear term renaming everywhere (by @Artifizer) - #4039
+- mass renaming - Cyber Fabric -> Constructor Fabric
+
+### Contributors
+
+* @Artifizer
+
+## [0.1.21](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-static-tr-plugin-v0.1.21) - 2026-06-09
+
+### Other
+
+- complete Module -> Gear term renaming everywhere (by @Artifizer) - #4039
+- mass renaming - Cyber Fabric -> Constructor Fabric
+
+### Contributors
+
+* @Artifizer
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-static-idp-plugin-v0.1.0) - 2026-06-09
+
+### Other
+
+- complete Module -> Gear term renaming everywhere (by @Artifizer) - #4039
+- mass renaming - Cyber Fabric -> Constructor Fabric
+
+### Contributors
+
+* @Artifizer
+
+## [0.1.18](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-static-credstore-plugin-v0.1.18) - 2026-06-09
+
+### Other
+
+- complete Module -> Gear term renaming everywhere (by @Artifizer) - #4039
+- mass renaming - Cyber Fabric -> Constructor Fabric
+
+### Contributors
+
+* @Artifizer
+
+## [0.1.20](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-static-authz-plugin-v0.1.20) - 2026-06-09
+
+### Other
+
+- complete Module -> Gear term renaming everywhere (by @Artifizer) - #4039
+- mass renaming - Cyber Fabric -> Constructor Fabric
+
+### Contributors
+
+* @Artifizer
+
+## [0.3.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-static-authn-plugin-v0.3.0) - 2026-06-09
+
+### Other
+
+- complete Module -> Gear term renaming everywhere (by @Artifizer) - #4039
+- mass renaming - Cyber Fabric -> Constructor Fabric
+
+### Contributors
+
+* @Artifizer
+
+## [0.1.22](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-single-tenant-tr-plugin-v0.1.22) - 2026-06-09
+
+### Other
+
+- complete Module -> Gear term renaming everywhere (by @Artifizer) - #4039
+- mass renaming - Cyber Fabric -> Constructor Fabric
+
+### Contributors
+
+* @Artifizer
+
+## [0.1.3](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-rg-tr-plugin-v0.1.3) - 2026-06-09
+
+### Other
+
+- complete Module -> Gear term renaming everywhere (by @Artifizer) - #4039
+- mass renaming - Cyber Fabric -> Constructor Fabric
+
+### Contributors
+
+* @Artifizer
+
+## [0.6.5](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-toolkit-http-v0.6.5) - 2026-06-09
+
+### Other
+
+- complete Module -> Gear term renaming everywhere (by @Artifizer) - #4039
+- mass renaming - Cyber Fabric -> Constructor Fabric
+
+### Contributors
+
+* @Artifizer
+
+## [0.1.1](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-account-management-v0.1.1) - 2026-06-09
+
 ### Fixed
 
 - add missing coverage_attribute feature gate in metadata_integration tests (by @Artifizer) - #4039
