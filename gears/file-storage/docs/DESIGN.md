@@ -33,16 +33,16 @@
 
 ### 1.1 Architectural Vision
 
-FileStorage is a tenant-aware, owner-aware file storage service for Cyber Ware. It owns the platform's content data
+FileStorage is a tenant-aware, owner-aware file storage service for Gears. It owns the platform's content data
 plane: every byte of every upload and every download flows through it (see
 [ADR-0001](./ADR/0001-cpt-cf-file-storage-adr-proxy-content-traffic.md)). FileStorage sits between consumers
-(Cyber Ware modules and the platform UI) and a pluggable layer of backend drivers (local filesystem, S3-compatible
+(Gears and the platform UI) and a pluggable layer of backend drivers (local filesystem, S3-compatible
 object storage; more in later phases). Consumers never address backends directly — they talk to FileStorage over a
 single REST surface (and its in-process SDK trait), and FileStorage talks to backends over a small abstract trait.
 
 The P1 architecture is deliberately narrow:
 
-- One ModKit module, in-process, consumed by other Cyber Ware modules through ClientHub
+- One ToolKit gear, in-process, consumed by other Gears through ClientHub
 - One HTTP URL namespace — auth-required (`/api/file-storage/v1`). All requests are platform-JWT-enforced;
   FileStorage has no anonymous surface in P1
 - Streaming I/O on the proxy path; no full-file buffering at the FileStorage layer regardless of file size
@@ -56,7 +56,7 @@ The P1 architecture is deliberately narrow:
 
 **Sharing boundary (P3).** Anonymous/public access, time-bounded URLs, named recipients, group targeting, per-link
 download counters, and any other sharing primitives are out of P1/P2 scope and deferred to P3. The working name
-for this future capability is "FileShare"; whether it ships as a separate Cyber Ware module or as an extension of
+for this future capability is "FileShare"; whether it ships as a separate Gear or as an extension of
 FileStorage itself is **not decided here** and will be settled by a future ADR at the time the functionality is
 implemented. FileStorage P1/P2 stores no sharing-related state, exposes no anonymous URL namespace, has no JWT-bypass
 paths, and has no endpoints tied to that future decision.
@@ -74,7 +74,7 @@ are deliberately out of scope for this document.
 
 See [PRD.md](./PRD.md) §1 "Overview" and §1.3 "Goals":
 
-- Unified storage for all Cyber Ware modules and platform users
+- Unified storage for all Gears and platform users
 - Tenant-scoped + principal-scoped ownership (`owner_kind ∈ {user, app}`, `tenant_id` mandatory)
 - Persistent URLs that outlive provider-issued URLs (e.g., LLM Gateway media outputs)
 - Pluggable backends without service rebuild
@@ -99,7 +99,7 @@ See [PRD.md](./PRD.md) §1 "Overview" and §1.3 "Goals":
 | `cpt-cf-file-storage-fr-retention-indefinite`          | No background purge in P1; files live until owner deletes                                                                                                                |
 | `cpt-cf-file-storage-fr-backend-abstraction`           | `StorageBackend` async trait with capability sub-traits; P1 drivers: `local-filesystem`, `s3-compatible`                                                                 |
 | `cpt-cf-file-storage-fr-backend-capabilities`          | `BackendCapabilities` struct emitted by each driver, exposed via `GET /storages`; P1 capability allow-list locked to no optional capabilities active                     |
-| `cpt-cf-file-storage-fr-backend-config-source`         | TOML file loaded at module startup → in-memory `BackendRegistry`; surfaced read-only via `/storages`                                                                     |
+| `cpt-cf-file-storage-fr-backend-config-source`         | TOML file loaded at gear startup → in-memory `BackendRegistry`; surfaced read-only via `/storages`                                                                     |
 | `cpt-cf-file-storage-fr-rest-api`                      | Axum router rooted under `/api/file-storage/v1`; raw routes for content endpoints, OperationBuilder for JSON endpoints                                                   |
 | `cpt-cf-file-storage-fr-range-requests`                | See §4.1 Random Read Access for the full mechanics                                                                                                                       |
 | `cpt-cf-file-storage-fr-conditional-requests`          | Content-only `ETag` derived from `(file_id, content_revision)`; `If-Match`/`If-None-Match` enforced uniformly in `http-gateway` middleware                               |
@@ -111,7 +111,7 @@ See [PRD.md](./PRD.md) §1 "Overview" and §1.3 "Goals":
 | `cpt-cf-file-storage-nfr-metadata-latency`      | `<25 ms` p95 metadata queries                                        | `cpt-cf-file-storage-component-metadata-service`, `cpt-cf-file-storage-component-http-gateway`                                            | Single-row Postgres lookup on PK; covering index on `(tenant_id, owner_kind, owner_id, created_at)`. No backend round-trip on `HEAD`/`GET /files/{id}` metadata path                                                                                            | Load test driving `HEAD /files/{id}` at expected p95 traffic; p95 latency captured by OpenTelemetry histogram on `http-gateway`                       |
 | `cpt-cf-file-storage-nfr-transfer-latency`      | `<50 ms` fixed overhead p95 on content transfer                      | `cpt-cf-file-storage-component-stream-proxy`, `cpt-cf-file-storage-component-backend-abstraction`                                         | Streaming I/O end-to-end (axum `Body` ↔ `Stream<Bytes>` ↔ backend client); no full-file buffering. Range translated to backend-native range where supported                                                                                                    | Measure fixed delta between request arrival at FileStorage and first byte returned by backend; histogram per backend driver                           |
 | `cpt-cf-file-storage-nfr-url-availability`      | URLs available for retention duration matching platform SLA          | `cpt-cf-file-storage-component-metadata-service`, `cpt-cf-file-storage-component-backend-abstraction`                                     | URLs are derived from `file_id` and remain valid as long as the file row exists; deleted files return `404`; ETag changes do not invalidate URLs (only their cached representations)                                                                            | Long-running soak: re-fetch a set of `file_id`s over the SLA window; verify no transient `5xx`/`404` for live files                                  |
-| `cpt-cf-file-storage-nfr-durability`            | RPO=0 for committed writes; RTO ≤ 15 min                              | `cpt-cf-file-storage-component-metadata-service`, `cpt-cf-file-storage-component-backend-abstraction`                                     | DB row committed *after* backend `put()` returns success; backend durability is inherited from the chosen driver. A request-scoped **best-effort cleanup guard** fires `backend.delete(backend_path)` on any error between a successful `put()` and the committed `INSERT` (DB blip, client drop, panic), so the only residual leak is a hard process kill in that window — bounded and swept by the P2 `orphan-reconciler`. RTO covered by Postgres HA + module restart procedures                                                                                       | Chaos test: kill module mid-upload — partial uploads MUST NOT leave a committed row pointing to missing content; inject a post-`put()` DB failure and assert the backend object is cleaned up (no orphan)                                       |
+| `cpt-cf-file-storage-nfr-durability`            | RPO=0 for committed writes; RTO ≤ 15 min                              | `cpt-cf-file-storage-component-metadata-service`, `cpt-cf-file-storage-component-backend-abstraction`                                     | DB row committed *after* backend `put()` returns success; backend durability is inherited from the chosen driver. A request-scoped **best-effort cleanup guard** fires `backend.delete(backend_path)` on any error between a successful `put()` and the committed `INSERT` (DB blip, client drop, panic), so the only residual leak is a hard process kill in that window — bounded and swept by the P2 `orphan-reconciler`. RTO covered by Postgres HA + gear restart procedures                                                                                       | Chaos test: kill gear mid-upload — partial uploads MUST NOT leave a committed row pointing to missing content; inject a post-`put()` DB failure and assert the backend object is cleaned up (no orphan)                                       |
 | `cpt-cf-file-storage-nfr-scalability`           | ≥1000 concurrent operations/instance; linear horizontal scaling      | All P1 components — they are stateless except for the metadata DB                                                                         | No instance-local state in the request path; every instance can serve any file given the shared metadata DB and backend driver. Streaming I/O keeps **CPU and memory** bounded per request. The **bandwidth** dimension — the cost consciously accepted by ADR-0001 — is modeled separately in `cpt-cf-file-storage-nfr-bandwidth`                                                                  | Load test: scale N → 2N instances, verify near-2× throughput; per-instance concurrency target measured at saturation                                  |
 | `cpt-cf-file-storage-nfr-bandwidth`             | Per-instance ingress+egress budget; full traffic transits FileStorage | `cpt-cf-file-storage-component-stream-proxy`, `cpt-cf-file-storage-component-backend-abstraction`, deployment topology                    | ADR-0001 routes every uploaded and downloaded byte through FileStorage, so per-instance bandwidth — not CPU/memory — is the binding constraint. P1 deployment budget: **target ≥ 2.5 GiB/s combined ingress+egress per instance** (≈ 1.25 GiB/s each way on a 25 GbE NIC, sized so the ≥1000 concurrent-ops target is bandwidth- rather than CPU-bound at typical media object sizes). Capacity = `ceil(peak aggregate transfer rate / per-instance budget)` instances; transfer load scales horizontally with the stateless replicas. Download caching is offloaded to the API-Gateway / CDN layer using the content-only `ETag`, `Cache-Control`, and `Vary` response headers FileStorage already emits, so repeat-read egress need not re-transit FileStorage | Load test: saturate a single instance's NIC with concurrent downloads, confirm it sustains the per-instance budget before CPU saturates; verify CDN/proxy serves conditional re-reads from cache (no FileStorage egress on `304`/cache hit) |
 
@@ -129,11 +129,11 @@ graph LR
     Client([Client / Browser / SDK]) -->|HTTPS| AGW[API Gateway]
     AGW -->|/api/file-storage/v1<br/>JWT enforced| HGW
 
-    Module[Cyber Ware Module] -->|ClientHub trait| SDK[sdk-facade]
+    Gear[Gear] -->|ClientHub trait| SDK[sdk-facade]
     SDK --> Meta
     SDK --> Stream
 
-    subgraph FileStorage["FileStorage (ModKit module)"]
+    subgraph FileStorage["FileStorage (ToolKit gear)"]
       HGW[http-gateway]
       HGW --> Pipe[content-pipeline]
       HGW --> Stream[stream-proxy]
@@ -213,11 +213,11 @@ capabilities inactive.
 
 ### 2.2 Constraints
 
-#### ModKit in-process module
+#### ToolKit in-process gear
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-constraint-modkit-module`
+- [ ] `p1` - **ID**: `cpt-cf-file-storage-constraint-toolkit-gear`
 
-FileStorage runs as an in-process ModKit module, registered via `#[modkit::module]`. Inter-module callers use the
+FileStorage runs as an in-process ToolKit gear, registered via `#[toolkit::gear]`. Inter-gear callers use the
 generated SDK trait via ClientHub. There is no out-of-process gRPC variant in P1; the OoP path is reserved as a P3
 escape hatch if bandwidth or isolation pressures emerge from production traffic.
 
@@ -232,7 +232,7 @@ Tenant scoping happens through SecureConn — there is no direct un-scoped DB ac
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-constraint-toml-config`
 
-Backend definitions in P1 are loaded from a static TOML file at module startup. Changing the set of backends or
+Backend definitions in P1 are loaded from a static TOML file at gear startup. Changing the set of backends or
 their credentials requires a restart. Runtime/DB-driven configuration with admin tooling is a P3 deliverable
 (`cpt-cf-file-storage-fr-runtime-backends`).
 
@@ -241,10 +241,10 @@ their credentials requires a restart. Runtime/DB-driven configuration with admin
 ### 3.1 Domain Model
 
 **Technology**: Rust structs (`file-storage-sdk` crate) backed by SeaORM entities (`file-storage-infra` crate) per the
-[ModKit SDK layering guide](../../../docs/modkit_unified_system/02_module_layout_and_sdk_pattern.md).
+[ToolKit SDK layering guide](../../../docs/toolkit_unified_system/02_gear_layout_and_sdk_pattern.md).
 
-**Location**: `modules/file-storage/file-storage-sdk/src/types.rs` (intended) for public types;
-`modules/file-storage/file-storage/src/infra/entities/*.rs` for SeaORM entities.
+**Location**: `gears/file-storage/file-storage-sdk/src/types.rs` (intended) for public types;
+`gears/file-storage/file-storage/src/infra/entities/*.rs` for SeaORM entities.
 
 **Core Entities**:
 
@@ -252,7 +252,7 @@ their credentials requires a restart. Runtime/DB-driven configuration with admin
 |-----------------------|--------------------------------------------------------------------------------------------------------------------------------------------|
 | `File`                | Logical file: identity, tenant, owner, mime, gts type, content state, revisions, hash, timestamps                                          |
 | `CustomMetadata`      | User-defined key-value pairs attached to a `File`; one row per `(file_id, key)`                                                            |
-| `OwnerPrincipal`      | Tagged union `{User(UserId), App(ModuleId)}`; carried as `(owner_kind, owner_id)` on `File`                                                |
+| `OwnerPrincipal`      | Tagged union `{User(UserId), App(GearId)}`; carried as `(owner_kind, owner_id)` on `File`                                                |
 | `ContentState`        | Enum `{Pending, Available}`; in P1 every successful `POST /files` lands in `Available`. Pending exists only for P2 multipart pre-completion |
 | `ETag`                | Opaque `String` (HTTP-quoted, base64url payload); derived from `(file_id, content_revision)`; **MUST NOT** equal `hash_value`               |
 | `ByteRange`           | Parsed `Range` request: `Inclusive(start, end)`, `OpenEnded(start)`, `Suffix(length)`                                                       |
@@ -329,7 +329,7 @@ error mapping to RFC 7807 Problem+JSON.
   error occurs after a successful `put()` but before the `files` `INSERT` commits (and on the `415` abort path); on
   `DELETE /files/{id}`, issue `backend.delete(backend_path)` after the row is committed-deleted. Both are
   fire-and-forget — a failed backend delete degrades to an orphan reconciled in P2, never a row pointing at missing bytes
-- Map domain errors to status codes + Problem+JSON bodies per `docs/modkit_unified_system/05_errors_rfc9457.md`
+- Map domain errors to status codes + Problem+JSON bodies per `docs/toolkit_unified_system/05_errors_rfc9457.md`
 - Populate response headers including `ETag`, `Accept-Ranges`, `Last-Modified`, all `X-FS-*` system metadata, and
   `X-FS-Meta-<key>` for custom metadata (with RFC 8187 encoding for non-ASCII values)
 - Route content endpoints (`GET`/`HEAD /files/{id}`, `POST /files`, `PATCH /files/{id}`) through raw axum handlers
@@ -442,7 +442,7 @@ Does not call backend drivers itself. Does not perform authorization checks. Doe
 ##### Related components
 
 - `cpt-cf-file-storage-component-http-gateway` — primary caller
-- `cpt-cf-file-storage-component-sdk-facade` — exposes the same operations to in-process module consumers
+- `cpt-cf-file-storage-component-sdk-facade` — exposes the same operations to in-process gear consumers
 
 #### `backend-abstraction`
 
@@ -513,7 +513,7 @@ AuthZ service every time.
 
 ##### Why this component exists
 
-In-process SDK trait for other Cyber Ware modules (LLM Gateway, Reporting, etc.). Mirrors the REST API one-to-one in
+In-process SDK trait for other Gears (LLM Gateway, Reporting, etc.). Mirrors the REST API one-to-one in
 domain types so that callers see the same logical operations regardless of whether they go through HTTP or
 ClientHub.
 
@@ -523,7 +523,7 @@ ClientHub.
   `Stream<Bytes>`), `download_range`, `head_file`, `update_metadata`, `delete_file`, `list_files`, `list_storages`,
   `get_storage`
 - Internally call `metadata-service` and `stream-proxy` directly (no HTTP round-trip)
-- Carry `SecurityContext` from the calling module's request context; authorization runs through the same
+- Carry `SecurityContext` from the calling gear's request context; authorization runs through the same
   `authz-adapter`
 
 ##### Responsibility boundaries
@@ -610,9 +610,9 @@ schema, status codes — is documented in **[api.md](./api.md)**. The summary:
 
 ### 3.4 Internal Dependencies
 
-| Dependency Module                     | Interface Used                                                              | Purpose                                                                                                   |
+| Dependency Gear                     | Interface Used                                                              | Purpose                                                                                                   |
 |---------------------------------------|-----------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------|
-| ModKit Framework                      | `#[modkit::module]` lifecycle; ClientHub typed registry                     | Module registration; in-process SDK distribution                                                          |
+| ToolKit Framework                      | `#[toolkit::gear]` lifecycle; ClientHub typed registry                     | Gear registration; in-process SDK distribution                                                          |
 | Platform Security                     | `security_context_layer` middleware + `SecurityContext` extractor           | Tenant + principal resolution on auth-required routes                                                     |
 | Platform Authorization (PolicyEnforcer)| In-process SDK trait                                                       | Per-operation access decisions on `gts.cf.fstorage.file.type.v1~` resources                                |
 | SecureORM / SecureConn (`db-runner`)  | SeaORM with tenant-scoped connection wrapper                                | Tenant-isolated DB access; all queries scoped by `SecurityContext.tenant_id`                              |
@@ -620,8 +620,8 @@ schema, status codes — is documented in **[api.md](./api.md)**. The summary:
 | Types Registry SDK (P2)               | SDK trait (forward-ref)                                                     | Validate that the supplied `gts_file_type` is a real registered type (P1 falls back to format-regex only) |
 
 **Dependency Rules**:
-- No circular dependencies (FileStorage has no upstream Cyber Ware module dependencies in P1)
-- All inter-module communication is via SDK traits, not internal types
+- No circular dependencies (FileStorage has no upstream Gear dependencies in P1)
+- All inter-gear communication is via SDK traits, not internal types
 - `SecurityContext` is propagated on every in-process call
 
 ### 3.5 External Dependencies
@@ -631,7 +631,7 @@ schema, status codes — is documented in **[api.md](./api.md)**. The summary:
 - **Contract**: implicit; uses platform DB connection pool — not a tracked external contract
 - **Purpose**: Persist `files`, `files_custom_metadata`, and (P3) `storage_backends_runtime`. Schema-isolated under
   `file_storage` schema in the shared cluster
-- **Interaction**: SeaORM + SecureORM through `db-runner` per `docs/modkit_unified_system/11_database_patterns.md`.
+- **Interaction**: SeaORM + SecureORM through `db-runner` per `docs/toolkit_unified_system/11_database_patterns.md`.
   All connections are `SecureConn` and carry `tenant_id` for row-level scoping
 
 #### Storage backends (drivers)
@@ -652,7 +652,7 @@ schema, status codes — is documented in **[api.md](./api.md)**. The summary:
 
 **Use cases**: `cpt-cf-file-storage-usecase-upload`
 
-**Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-modules`
+**Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
 
 ```mermaid
 sequenceDiagram
@@ -861,8 +861,8 @@ sequenceDiagram
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-db-overview`
 
 **Schema**: `file_storage` in the shared Postgres cluster. SeaORM entities under
-`modules/file-storage/file-storage/src/infra/entities/`. Migrations run through `db-runner` per
-`docs/modkit_unified_system/11_database_patterns.md`.
+`gears/file-storage/file-storage/src/infra/entities/`. Migrations run through `db-runner` per
+`docs/toolkit_unified_system/11_database_patterns.md`.
 
 #### Table: `files`
 
@@ -944,11 +944,11 @@ in P2 (`cpt-cf-file-storage-fr-metadata-limits`); in P1 only sanity limits apply
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-topology-overview`
 
-FileStorage is deployed as part of the Cyber Ware modular monolith — one binary that hosts FileStorage alongside other
-ModKit modules registered in `cyberware-example-server` (or the production server crate). The relevant deployment-time
+FileStorage is deployed as part of the Gears modular monolith — one binary that hosts FileStorage alongside other
+ToolKit gears registered in `gears-example-server` (or the production server crate). The relevant deployment-time
 arrangements:
 
-- **Process**: in-process with other ModKit modules. No separate FileStorage binary in P1
+- **Process**: in-process with other ToolKit gears. No separate FileStorage binary in P1
 - **Scaling**: horizontal at the platform level — each replica embeds its own FileStorage instance. There is no
   FileStorage-internal coordination state (no leader election, no in-memory caches that need to be coherent across
   replicas). Postgres is the shared coordination point
@@ -971,9 +971,9 @@ arrangements:
   the shared DB). Because every replica is already stateless and any instance can serve any file, this needs **no
   wire-contract change, no two-phase upload, and no trait extraction** — it is a deployment/configuration change, not
   an architectural one. Download egress, the dominant cost, is additionally offloaded to the API-Gateway/CDN layer via
-  the content-only `ETag`/`Cache-Control`/`Vary` headers (`cpt-cf-file-storage-nfr-bandwidth`). Inter-module callers
+  the content-only `ETag`/`Cache-Control`/`Vary` headers (`cpt-cf-file-storage-nfr-bandwidth`). Inter-gear callers
   reach such a standalone/co-located instance via the P3 out-of-process gRPC SDK variant noted in
-  `cpt-cf-file-storage-constraint-modkit-module` — the same escape hatch, viewed from the caller side
+  `cpt-cf-file-storage-constraint-toolkit-gear` — the same escape hatch, viewed from the caller side
 
 ## 4. Additional Context
 

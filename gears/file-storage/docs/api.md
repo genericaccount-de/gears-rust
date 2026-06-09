@@ -17,7 +17,7 @@
 FileStorage issues exactly one shape of file URL: `/files/{file_id_uuid}` (`GET` / `HEAD` only), served only on the
 auth-required prefix and reachable only with a valid platform JWT. FileStorage P1 has **no anonymous surface** —
 anonymous/public access, time-bounded URLs, named recipients, download counters, and any other sharing primitives
-are deferred to P3 (see DESIGN.md §1.1 "Sharing boundary"); whether they ship as a separate sibling module or as
+are deferred to P3 (see DESIGN.md §1.1 "Sharing boundary"); whether they ship as a separate sibling gear or as
 an extension of FileStorage is left to a future ADR.
 
 Base URL:

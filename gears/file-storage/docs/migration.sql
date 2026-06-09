@@ -2,8 +2,8 @@
 -- FileStorage — database migrations
 -- =============================================================================
 -- All FileStorage state lives in the `file_storage` schema of the shared
--- Cyber Ware Postgres cluster. Migrations are applied through `db-runner`
--- (see docs/modkit_unified_system/11_database_patterns.md) at module startup
+-- Gears Postgres cluster. Migrations are applied through `db-runner`
+-- (see docs/toolkit_unified_system/11_database_patterns.md) at gear startup
 -- by one elected replica.
 --
 -- The file is split into three phase sections. Each section is intended to
@@ -110,7 +110,7 @@ CREATE TABLE file_storage.files (
 
 COMMENT ON TABLE  file_storage.files                          IS 'FileStorage primary file row. One row per logical file (independent of backend versions).';
 COMMENT ON COLUMN file_storage.files.tenant_id                IS 'Tenant boundary; immutable after creation.';
-COMMENT ON COLUMN file_storage.files.owner_kind               IS 'Owner principal kind: user (platform user) or app (Cyber Ware module).';
+COMMENT ON COLUMN file_storage.files.owner_kind               IS 'Owner principal kind: user (platform user) or app (Gear).';
 COMMENT ON COLUMN file_storage.files.content_revision         IS 'Monotonic counter; bumped only on content writes. Backs the ETag derivation.';
 COMMENT ON COLUMN file_storage.files.metadata_revision        IS 'Monotonic counter; bumped on every successful write (content or metadata).';
 COMMENT ON COLUMN file_storage.files.content_state            IS 'pending = created without content (P2 multipart pre-completion); available = content present.';
@@ -397,7 +397,7 @@ CREATE INDEX retention_rules_scope_idx
 -- Table: file_storage.storage_backends_runtime ------------------------------
 -- DB-resident replacement for the P1 TOML configuration file. When this
 -- table is populated, the BackendRegistry switches its source from TOML to
--- DB on module startup. Credentials are stored encrypted at rest; the
+-- DB on gear startup. Credentials are stored encrypted at rest; the
 -- envelope encryption is managed by the platform secret store
 -- (PRD `cpt-cf-file-storage-fr-runtime-backends`).
 

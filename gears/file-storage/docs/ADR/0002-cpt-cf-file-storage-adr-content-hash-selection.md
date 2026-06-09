@@ -47,7 +47,7 @@ The decision is whether to commit to a single algorithm forever, to commit to a 
 * Phasing — P1 has no multipart upload, so the multipart-finalization cost differential (the load-bearing argument for BLAKE3) does not yet apply; P2 changes that and a strategy that is right for P1 may be wrong for P2 if it forecloses options
 * Operational conservatism in P1 — a single, FIPS-acceptable, universally available default is the lowest-risk shipping choice for the first release
 * Heterogeneous backends and workloads in P2 — different storage backends serve different trust models, throughput profiles, and regulatory regimes; a single global algorithm forces every backend to optimize for the strictest tier
-* Client capability asymmetry — SHA-256 is free in browser WebCrypto (no ship cost) and on every server; BLAKE3 and XXH3 require a WASM module (~75 KB and ~10 KB respectively) on browser clients but are dramatically faster server-side with SIMD
+* Client capability asymmetry — SHA-256 is free in browser WebCrypto (no ship cost) and on every server; BLAKE3 and XXH3 require a WASM gear (~75 KB and ~10 KB respectively) on browser clients but are dramatically faster server-side with SIMD
 * Server-side multipart cost — for sequential hashes (SHA-256, XXH3) multipart finalization requires a streaming pass over the assembled object; BLAKE3's tree mode eliminates this pass by combining per-chunk states
 * Business-logic axes for P2 — the right algorithm for a given upload may depend on the user, the file size, the storage configuration, or the tenant's policy; baking the choice into one global default removes that flexibility
 * Client agency in P2 — clients with WASM/native runtimes should be able to express a preference (e.g. "I have BLAKE3, please use it for this multipart upload") subject to server-side allow-listing
@@ -74,7 +74,7 @@ This shape — full API surface, locked allow-list — gives P1 the same client 
 **P2** (when multipart upload lands per `cpt-cf-file-storage-fr-multipart-upload`): keep the same API surface and expand the `allowed_algorithms` allow-list to include BLAKE3 and XXH3 in addition to SHA-256. The configuration semantics already shipped in P1 — backend default + allow-list + selection rules + client preference — now do real work:
 
 * **Server side** — each storage backend gains a hash-policy configuration block: a `default_algorithm`, an `allowed_algorithms` allow-list, and a `selection_rules` section that maps business-logic predicates (user identity, file size buckets, mime-type classes, storage-tier flags) to a specific algorithm choice. The effective algorithm for a given upload is resolved server-side at request time by evaluating the selection rules and falling back to the default.
-* **Client side** — clients may advertise a preferred algorithm in the upload request (e.g. a browser SDK that has shipped the BLAKE3 WASM module asks for BLAKE3). The server treats the preference as a hint: if the preferred algorithm is in the backend's allowed list and consistent with the selection rules, it is used; otherwise the server resolves the effective algorithm independently and reports it back in the response.
+* **Client side** — clients may advertise a preferred algorithm in the upload request (e.g. a browser SDK that has shipped the BLAKE3 WASM gear asks for BLAKE3). The server treats the preference as a hint: if the preferred algorithm is in the backend's allowed list and consistent with the selection rules, it is used; otherwise the server resolves the effective algorithm independently and reports it back in the response.
 * **Discovery** — clients can query a backend for its allowed-algorithm set so the SDK can avoid ship cost (e.g. skip loading BLAKE3 WASM if the active backend only allows SHA-256).
 
 The result hash and the resolved algorithm identifier are stored as system-managed metadata (`cpt-cf-file-storage-fr-metadata-storage`) and returned on every metadata query so consumers can re-verify.
@@ -88,7 +88,7 @@ The result hash and the resolved algorithm identifier are stored as system-manag
 * **P2 capability discovery** — `cpt-cf-file-storage-fr-backend-capabilities` is extended with a per-backend `supported_hash_algorithms` list; the *active* set per upload is resolved by the server-side selection rules and reported in the response
 * **Forward compatibility** — because P1 already records the algorithm identifier alongside the hash bytes, P2 introduces no migration step for existing P1 objects; they remain valid SHA-256-hashed objects and may be re-hashed under another algorithm only on explicit cross-backend copy or migration
 * **ETag header semantics** (`cpt-cf-file-storage-fr-conditional-requests`) remain decoupled from the content hash; the ETag is an opaque cache validator and clients MUST NOT assume it equals the content hash, regardless of phase
-* **Any future S3-compatible facade module** built on top of FileStorage — in P1 such a facade's content-integrity expectations would be naturally SHA-2-shaped; in P2 the facade would have to surface the active algorithm explicitly because S3 clients have strong assumptions about ETag derivation
+* **Any future S3-compatible facade gear** built on top of FileStorage — in P1 such a facade's content-integrity expectations would be naturally SHA-2-shaped; in P2 the facade would have to surface the active algorithm explicitly because S3 clients have strong assumptions about ETag derivation
 * **FIPS posture** — preserved in P1 (SHA-256 only); in P2 deployments that require FIPS configure their backends with `default_algorithm: SHA-256` and `allowed_algorithms: [SHA-256]`, effectively locking the platform to P1 behavior
 
 ### Confirmation
@@ -134,7 +134,7 @@ Single global algorithm. Every upload, every backend, every client uses BLAKE3.
 * Good, because cryptographically secure (256-bit collision and preimage resistance, same nominal level as SHA-256)
 * Good, because client and server can compute the root hash in parallel — end-to-end verification possible without an extra round-trip
 * Bad, because not FIPS-approved — regulated tenants cannot use the platform without falling back to SHA-256 anyway, so a "BLAKE3 only" rule is unenforceable in practice
-* Bad, because not available in WebCrypto — browser SDKs must ship a ~75 KB WASM module on every page load
+* Bad, because not available in WebCrypto — browser SDKs must ship a ~75 KB WASM gear on every page load
 * Bad, because younger algorithm with less cumulative cryptanalysis vs SHA-256 (academic concern; no practical attacks today)
 * Bad, because removes the ability to offer XXH3 for trusted high-throughput internal workloads where the operator has explicitly accepted the corruption-only model
 
@@ -259,4 +259,4 @@ This decision directly addresses the following requirements or design elements:
 * `cpt-cf-file-storage-fr-get-metadata` — Metadata responses return the `(hash_algorithm, hash_value)` pair so consumers can verify integrity by re-hashing
 * `cpt-cf-file-storage-fr-content-type-validation` — Independent of hash selection; mime detection runs on the same proxy streaming path
 * `cpt-cf-file-storage-fr-conditional-requests` — ETag semantics remain decoupled from content hash; the ETag is opaque and clients MUST NOT assume it equals the content hash
-* Any future S3-compatible facade module — would have to surface the active algorithm explicitly because S3 clients have strong ETag assumptions
+* Any future S3-compatible facade gear — would have to surface the active algorithm explicitly because S3 clients have strong ETag assumptions
