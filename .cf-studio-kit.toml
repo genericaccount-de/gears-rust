@@ -176,6 +176,78 @@ type = "file"
 user_modifiable = true
 
 [[kits.resources]]
+id = "workflow_doc_prd"
+kind = "skill"
+source = "studio-kit-gears/workflows/doc-prd.md"
+install_path = "workflows/doc-prd.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "workflow_doc_upstream_reqs"
+kind = "skill"
+source = "studio-kit-gears/workflows/doc-upstream-reqs.md"
+install_path = "workflows/doc-upstream-reqs.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "workflow_doc_adr"
+kind = "skill"
+source = "studio-kit-gears/workflows/doc-adr.md"
+install_path = "workflows/doc-adr.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "workflow_doc_design"
+kind = "skill"
+source = "studio-kit-gears/workflows/doc-design.md"
+install_path = "workflows/doc-design.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "workflow_decompose"
+kind = "skill"
+source = "studio-kit-gears/workflows/decompose.md"
+install_path = "workflows/decompose.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "workflow_doc_feature"
+kind = "skill"
+source = "studio-kit-gears/workflows/doc-feature.md"
+install_path = "workflows/doc-feature.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "workflow_implement"
+kind = "skill"
+source = "studio-kit-gears/workflows/implement.md"
+install_path = "workflows/implement.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "workflow_change_impact_analysis"
+kind = "skill"
+source = "studio-kit-gears/workflows/change-impact-analysis.md"
+install_path = "workflows/change-impact-analysis.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
 id = "workflow_pr_review"
 kind = "skill"
 source = "studio-kit-gears/workflows/pr-review.md"
