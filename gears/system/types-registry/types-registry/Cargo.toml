@@ -38,7 +38,7 @@ axum = { workspace = true, features = ["macros"] }
 uuid = { workspace = true, features = ["v5"] }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
-lru = "0.16"
+lru = "0.17"
 
 # Local dependencies
 toolkit = { workspace = true }

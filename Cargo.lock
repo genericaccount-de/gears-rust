@@ -2600,7 +2600,7 @@ dependencies = [
  "cf-gears-types-registry-sdk",
  "gts",
  "inventory",
- "lru 0.16.4",
+ "lru 0.17.0",
  "parking_lot",
  "serde",
  "serde_json",
