@@ -41,6 +41,9 @@ enum ChatCompletionEvent {
         arguments: Option<String>,
         /// Additional tool-call deltas from the same chunk.
         extra: Vec<ToolCallPiece>,
+        /// `finish_reason` from the same chunk (some providers embed the
+        /// last argument fragment in the same chunk as `finish_reason`).
+        finish_reason: Option<String>,
     },
     /// Chunk with `finish_reason` set (but usage may arrive in a later chunk).
     FinishReason { finish_reason: String },
@@ -164,22 +167,10 @@ impl FromServerEvent for ChatCompletionEvent {
             return Ok(ChatCompletionEvent::Unknown);
         }
 
-        // Combined finish + usage in a single chunk.
-        if let (Some(reason), Some(usage)) = (finish_reason.clone(), chunk.usage) {
-            return Ok(ChatCompletionEvent::Done {
-                usage,
-                finish_reason: reason,
-            });
-        }
-
-        // Finish reason without usage — usage arrives in a later chunk.
-        if let Some(reason) = finish_reason {
-            return Ok(ChatCompletionEvent::FinishReason {
-                finish_reason: reason,
-            });
-        }
-
-        // Tool call deltas — a chunk may carry more than one.
+        // Tool call deltas — check BEFORE finish_reason so the last
+        // argument fragment is not lost when a provider (e.g. vLLM) embeds
+        // it in the same chunk as `finish_reason`. The finish_reason is
+        // carried on the event and stashed by `translate_chat_event`.
         if let Some(tool_calls) = chunk
             .choices
             .first()
@@ -187,8 +178,6 @@ impl FromServerEvent for ChatCompletionEvent {
             .and_then(|d| d.tool_calls.as_ref())
             && let Some(tc) = tool_calls.first()
         {
-            // Return the first delta as this event; additional deltas in the
-            // same chunk are accumulated in `translate_chat_event`.
             return Ok(ChatCompletionEvent::ToolCallDelta {
                 index: tc.index,
                 id: tc.id.clone(),
@@ -204,6 +193,22 @@ impl FromServerEvent for ChatCompletionEvent {
                         arguments: tc.function.as_ref().and_then(|f| f.arguments.clone()),
                     })
                     .collect(),
+                finish_reason: finish_reason.clone(),
+            });
+        }
+
+        // Combined finish + usage in a single chunk.
+        if let (Some(reason), Some(usage)) = (finish_reason.clone(), chunk.usage) {
+            return Ok(ChatCompletionEvent::Done {
+                usage,
+                finish_reason: reason,
+            });
+        }
+
+        // Finish reason without usage — usage arrives in a later chunk.
+        if let Some(reason) = finish_reason {
+            return Ok(ChatCompletionEvent::FinishReason {
+                finish_reason: reason,
             });
         }
 
@@ -292,6 +297,71 @@ impl ChatCompletionsState {
                 usage: mapped_usage,
                 partial_content: self.accumulated_text.clone(),
             }),
+            // Agentic loop: surface the first accumulated tool call as a
+            // `ToolUse` terminal so the provider task can dispatch it and feed
+            // the result back. Mirrors the Responses / Anthropic adapters.
+            // Chat Completions can return multiple tool calls per turn, but the
+            // agentic loop processes one per iteration (the remaining calls are
+            // re-requested on the next round).
+            //
+            // vLLM quirk: some models/versions emit a phantom entry at index 0
+            // (empty name + id) with the real tool call at a higher index. Skip
+            // phantom entries and pick the first entry with a non-empty `name`.
+            "tool_calls" => {
+                let primary = self
+                    .tool_calls
+                    .iter()
+                    .find(|tc| !tc.name.is_empty());
+                match primary {
+                    Some(tc) => {
+                        // Merge arguments: some providers (e.g. vLLM) split a
+                        // single tool call's arguments across multiple indices in
+                        // the streamed `tool_calls` array, creating continuation
+                        // entries with empty `name`. Concatenate those fragments
+                        // so the JSON is complete before parsing.
+                        let mut combined = tc.arguments.clone();
+                        for cont in &self.tool_calls {
+                            if cont.name.is_empty() {
+                                combined.push_str(&cont.arguments);
+                            }
+                        }
+                        let raw_args = if combined.is_empty() {
+                            "{}".to_owned()
+                        } else {
+                            combined
+                        };
+                        // Surface malformed arguments as a provider protocol error
+                        // rather than silently coercing to `{}` — that would route
+                        // the tool call to the wrong inputs instead of failing.
+                        match serde_json::from_str::<serde_json::Value>(&raw_args) {
+                            Ok(input) => TranslatedEvent::Terminal(TerminalOutcome::ToolUse {
+                                tool_use_id: tc.id.clone(),
+                                name: tc.name.clone(),
+                                input,
+                            }),
+                            Err(e) => TranslatedEvent::Terminal(TerminalOutcome::Failed {
+                                error: LlmProviderError::InvalidResponse {
+                                    detail: format!(
+                                        "function_call arguments were not valid JSON: {e}"
+                                    ),
+                                },
+                                usage: Some(mapped_usage),
+                                partial_content: self.accumulated_text.clone(),
+                            }),
+                        }
+                    }
+                    // finish_reason was "tool_calls" but no real tool call
+                    // accumulated — treat as a normal completion rather than
+                    // stalling the stream.
+                    None => TranslatedEvent::Terminal(TerminalOutcome::Completed {
+                        usage: mapped_usage,
+                        response_id: self.response_id.clone(),
+                        content: self.accumulated_text.clone(),
+                        citations: vec![],
+                        raw_response: serde_json::Value::Null,
+                    }),
+                }
+            }
             _ => TranslatedEvent::Terminal(TerminalOutcome::Completed {
                 usage: mapped_usage,
                 response_id: self.response_id.clone(),
@@ -368,6 +438,7 @@ fn translate_chat_event(
             name,
             arguments,
             extra,
+            finish_reason,
         } => {
             let mut events = accumulate_tool_call(
                 state,
@@ -384,6 +455,14 @@ fn translate_chat_event(
                     piece.name.as_ref(),
                     piece.arguments.as_ref(),
                 ));
+            }
+            // If finish_reason was in the same chunk as the tool-call delta,
+            // stash it and emit Done events just like the FinishReason path.
+            if let Some(reason) = finish_reason {
+                state.finish_reason = Some(reason.clone());
+                if reason == "tool_calls" {
+                    events.extend(state.tool_call_done_events());
+                }
             }
             events
         }
@@ -500,6 +579,14 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
             "content": content
         }));
     }
+    // Append raw input items (function_call + function_call_output from the
+    // agentic loop) converted to Chat Completions format (assistant message
+    // with `tool_calls` + tool-role messages).
+    if !request.raw_input_items.is_empty() {
+        messages.extend(convert_raw_input_items_to_chat_messages(
+            &request.raw_input_items,
+        ));
+    }
     body["messages"] = serde_json::Value::Array(messages);
 
     if let Some(max_tokens) = request.max_output_tokens {
@@ -572,6 +659,72 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
     }
 
     body
+}
+
+/// Convert OpenAI Responses API `raw_input_items` to Chat Completions messages.
+///
+/// Groups consecutive `function_call` items into a single assistant message
+/// with `tool_calls`, and converts `function_call_output` items into `tool`
+/// role messages. This mirrors the conversion in the Anthropic adapter but
+/// targets the Chat Completions message schema.
+fn convert_raw_input_items_to_chat_messages(
+    items: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    let mut messages = Vec::new();
+    let mut pending_tool_calls: Vec<serde_json::Value> = Vec::new();
+
+    for item in items {
+        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match item_type {
+            "function_call" => {
+                let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let arguments = item
+                    .get("arguments")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("{}");
+                pending_tool_calls.push(serde_json::json!({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments,
+                    }
+                }));
+            }
+            "function_call_output" => {
+                // Flush pending tool_calls as an assistant message before
+                // emitting the corresponding tool result.
+                if !pending_tool_calls.is_empty() {
+                    messages.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": serde_json::Value::Null,
+                        "tool_calls": serde_json::Value::Array(pending_tool_calls.drain(..).collect()),
+                    }));
+                }
+                let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                let output = item.get("output").and_then(|v| v.as_str()).unwrap_or("");
+                messages.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": output,
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    // Flush any remaining pending tool_calls (edge case: trailing
+    // function_call with no matching output yet).
+    if !pending_tool_calls.is_empty() {
+        messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": serde_json::Value::Null,
+            "tool_calls": serde_json::Value::Array(pending_tool_calls),
+        }));
+    }
+
+    messages
 }
 
 fn body_to_bytes(body: &serde_json::Value) -> Body {
@@ -1217,6 +1370,7 @@ mod tests {
             name: Some("get_weather".into()),
             arguments: Some(String::new()),
             extra: vec![],
+            finish_reason: None,
         };
         let mut state = ChatCompletionsState::new();
         let translated = translate_one(&event, &mut state);
@@ -1246,6 +1400,7 @@ mod tests {
             name: Some("get_weather".into()),
             arguments: Some("{\"lo".into()),
             extra: vec![],
+            finish_reason: None,
         };
         translate_one(&first, &mut state);
 
@@ -1256,6 +1411,7 @@ mod tests {
             name: None,
             arguments: Some("cation\":\"SF\"}".into()),
             extra: vec![],
+            finish_reason: None,
         };
         let translated = translate_one(&cont, &mut state);
         assert!(matches!(translated, TranslatedEvent::Skip));
@@ -1396,5 +1552,270 @@ mod tests {
         let body = build_request_body(&request, true);
 
         assert!(body.get("tools").is_none());
+    }
+
+    // ── Split argument merging ───────────────────────────────────────────
+
+    #[test]
+    fn make_terminal_merges_split_tool_call_arguments() {
+        let mut state = ChatCompletionsState::new();
+        state.tool_calls.push(AccumulatedToolCall {
+            id: "call_1".into(),
+            name: "timer".into(),
+            arguments: r#"{"action": "start", "name"#.into(),
+        });
+        state.tool_calls.push(AccumulatedToolCall {
+            id: String::new(),
+            name: String::new(),
+            arguments: r#"": "test1"}"#.into(),
+        });
+
+        let usage = ChatUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        };
+        let terminal = state.make_terminal(&usage, "tool_calls");
+        match terminal {
+            TranslatedEvent::Terminal(TerminalOutcome::ToolUse {
+                tool_use_id,
+                name,
+                input,
+            }) => {
+                assert_eq!(tool_use_id, "call_1");
+                assert_eq!(name, "timer");
+                assert_eq!(input["action"], "start");
+                assert_eq!(input["name"], "test1");
+            }
+            _ => panic!("expected Terminal(ToolUse), got {terminal:?}"),
+        }
+    }
+
+    #[test]
+    fn make_terminal_single_entry_tool_call_works() {
+        let mut state = ChatCompletionsState::new();
+        state.tool_calls.push(AccumulatedToolCall {
+            id: "call_1".into(),
+            name: "timer".into(),
+            arguments: r#"{"action":"start"}"#.into(),
+        });
+
+        let usage = ChatUsage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        };
+        let terminal = state.make_terminal(&usage, "tool_calls");
+        assert!(matches!(
+            terminal,
+            TranslatedEvent::Terminal(TerminalOutcome::ToolUse { .. })
+        ));
+    }
+
+    #[test]
+    fn make_terminal_skips_phantom_entry_at_index_zero() {
+        // vLLM quirk: a phantom entry (empty name/id) at index 0 with the
+        // real tool call at index 1. The adapter must skip the phantom and
+        // dispatch the real call.
+        let mut state = ChatCompletionsState::new();
+        state.tool_calls.push(AccumulatedToolCall {
+            id: String::new(),
+            name: String::new(),
+            arguments: String::new(),
+        });
+        state.tool_calls.push(AccumulatedToolCall {
+            id: "call_1".into(),
+            name: "search_confluence".into(),
+            arguments: r#"{"query": "Bytebase"}"#.into(),
+        });
+
+        let usage = ChatUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        };
+        let terminal = state.make_terminal(&usage, "tool_calls");
+        match terminal {
+            TranslatedEvent::Terminal(TerminalOutcome::ToolUse {
+                tool_use_id,
+                name,
+                input,
+            }) => {
+                assert_eq!(tool_use_id, "call_1");
+                assert_eq!(name, "search_confluence");
+                assert_eq!(input["query"], "Bytebase");
+            }
+            _ => panic!("expected Terminal(ToolUse), got {terminal:?}"),
+        }
+    }
+
+    // ── finish_reason in same chunk as tool_call delta ───────────────────
+
+    #[test]
+    fn tool_call_delta_with_finish_reason_accumulates_and_stashes() {
+        let mut state = ChatCompletionsState::new();
+
+        // First delta without finish_reason.
+        let first = ChatCompletionEvent::ToolCallDelta {
+            index: 0,
+            id: Some("call_1".into()),
+            name: Some("timer".into()),
+            arguments: Some(r#"{"action":"#.into()),
+            extra: vec![],
+            finish_reason: None,
+        };
+        translate_chat_event(&first, &mut state);
+
+        // Second delta WITH finish_reason in the same chunk.
+        let last = ChatCompletionEvent::ToolCallDelta {
+            index: 0,
+            id: None,
+            name: None,
+            arguments: Some(r#""start"}"#.into()),
+            extra: vec![],
+            finish_reason: Some("tool_calls".into()),
+        };
+        let events = translate_chat_event(&last, &mut state);
+
+        // Should stash finish_reason.
+        assert_eq!(state.finish_reason.as_deref(), Some("tool_calls"));
+        // Should emit tool_call Done event(s).
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TranslatedEvent::Sse(ClientSseEvent::Tool {
+                phase: ToolPhase::Done,
+                ..
+            })
+        )));
+        // Arguments should be fully accumulated.
+        assert_eq!(state.tool_calls[0].arguments, r#"{"action":"start"}"#);
+    }
+
+    #[test]
+    fn parse_tool_call_delta_with_finish_reason_in_same_chunk() {
+        let event = ServerEvent {
+            event: None,
+            data: r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"end\"}"}}]},"finish_reason":"tool_calls"}]}"#.into(),
+            id: None,
+            retry: None,
+        };
+        let result = ChatCompletionEvent::from_server_event(event).unwrap();
+        match result {
+            ChatCompletionEvent::ToolCallDelta {
+                arguments,
+                finish_reason,
+                ..
+            } => {
+                assert_eq!(arguments.as_deref(), Some("\"end\"}"));
+                assert_eq!(finish_reason.as_deref(), Some("tool_calls"));
+            }
+            _ => panic!("expected ToolCallDelta, got {result:?}"),
+        }
+    }
+
+    // ── raw_input_items conversion ───────────────────────────────────────
+
+    #[test]
+    fn convert_raw_input_items_produces_chat_messages() {
+        let items = vec![
+            serde_json::json!({
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "timer",
+                "arguments": r#"{"action":"start"}"#,
+            }),
+            serde_json::json!({
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "Timer 'default' started.",
+            }),
+        ];
+        let messages = convert_raw_input_items_to_chat_messages(&items);
+        assert_eq!(messages.len(), 2);
+
+        // Assistant message with tool_calls.
+        assert_eq!(messages[0]["role"], "assistant");
+        assert!(messages[0]["content"].is_null());
+        let tool_calls = messages[0]["tool_calls"].as_array().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["id"], "call_1");
+        assert_eq!(tool_calls[0]["type"], "function");
+        assert_eq!(tool_calls[0]["function"]["name"], "timer");
+
+        // Tool message with result.
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "call_1");
+        assert_eq!(messages[1]["content"], "Timer 'default' started.");
+    }
+
+    #[test]
+    fn convert_raw_input_items_empty_returns_empty() {
+        assert!(convert_raw_input_items_to_chat_messages(&[]).is_empty());
+    }
+
+    #[test]
+    fn convert_raw_input_items_trailing_function_call_flushed() {
+        let items = vec![serde_json::json!({
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "timer",
+            "arguments": "{}",
+        })];
+        let messages = convert_raw_input_items_to_chat_messages(&items);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["tool_calls"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn convert_raw_input_items_multiple_calls_grouped() {
+        let items = vec![
+            serde_json::json!({"type":"function_call","call_id":"c1","name":"timer","arguments":"{}"}),
+            serde_json::json!({"type":"function_call","call_id":"c2","name":"timer","arguments":"{}"}),
+            serde_json::json!({"type":"function_call_output","call_id":"c1","output":"r1"}),
+            serde_json::json!({"type":"function_call_output","call_id":"c2","output":"r2"}),
+        ];
+        let messages = convert_raw_input_items_to_chat_messages(&items);
+        // 2 function_calls → 1 assistant with 2 tool_calls
+        // 2 function_call_outputs → 2 tool messages
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[2]["role"], "tool");
+    }
+
+    #[test]
+    fn request_raw_input_items_appended_as_chat_messages() {
+        let request = llm_request("gpt-4o")
+            .message(LlmMessage::user("start timer"))
+            .raw_input_items(vec![
+                serde_json::json!({
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "timer",
+                    "arguments": r#"{"action":"start"}"#,
+                }),
+                serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "Timer started.",
+                }),
+            ])
+            .build_streaming();
+
+        let body = build_request_body(&request, true);
+        let messages = body["messages"].as_array().unwrap();
+
+        // user message + assistant (tool_calls) + tool (result)
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"][0]["function"]["name"], "timer");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["content"], "Timer started.");
     }
 }

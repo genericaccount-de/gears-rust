@@ -1,8 +1,10 @@
 #![allow(clippy::non_ascii_literal, clippy::cognitive_complexity)]
 
 pub(super) mod provider_task;
+pub(super) mod timer_store;
 mod types;
 
+pub use timer_store::TimerStore;
 pub use types::{StreamError, StreamOutcome};
 
 use std::sync::Arc;
@@ -74,6 +76,11 @@ pub struct StreamService<
     metrics: Arc<dyn MiniChatMetricsPort>,
     knowledge_search_config: crate::config::KnowledgeSearchConfig,
     knowledge_retriever: Option<Arc<dyn crate::domain::ports::KnowledgeRetriever>>,
+    timer_config: crate::config::TimerToolConfig,
+    timer_store: TimerStore,
+    rest_config: crate::config::RestAPIToolConfig,
+    rest_registry: Option<Arc<crate::domain::service::RestAPIConnectorRegistry>>,
+    rest_client: Option<Arc<dyn crate::domain::ports::RestClient>>,
 }
 
 impl<
@@ -109,6 +116,11 @@ impl<
         metrics: Arc<dyn MiniChatMetricsPort>,
         knowledge_search_config: crate::config::KnowledgeSearchConfig,
         knowledge_retriever: Option<Arc<dyn crate::domain::ports::KnowledgeRetriever>>,
+        timer_config: crate::config::TimerToolConfig,
+        timer_store: TimerStore,
+        rest_config: crate::config::RestAPIToolConfig,
+        rest_registry: Option<Arc<crate::domain::service::RestAPIConnectorRegistry>>,
+        rest_client: Option<Arc<dyn crate::domain::ports::RestClient>>,
     ) -> Self {
         Self {
             db,
@@ -129,6 +141,11 @@ impl<
             metrics,
             knowledge_search_config,
             knowledge_retriever,
+            timer_config,
+            timer_store,
+            rest_config,
+            rest_registry,
+            rest_client,
         }
     }
 
@@ -250,6 +267,40 @@ impl<
             max_calls: self.knowledge_search_config.max_calls_per_message,
             max_chunk_chars: self.knowledge_search_config.max_chunk_chars,
             use_search_result_blocks,
+        })
+    }
+
+    /// Build the `timer` tool parameters for a request.
+    ///
+    /// Returns `None` when the feature is disabled. The shared in-memory store
+    /// is cloned (cheap `Arc` clone) so all requests observe the same timers.
+    fn build_timer_params(&self) -> Option<provider_task::TimerToolParams> {
+        if !self.timer_config.enabled {
+            return None;
+        }
+        Some(provider_task::TimerToolParams {
+            store: self.timer_store.clone(),
+            max_calls: self.timer_config.max_calls_per_message,
+        })
+    }
+
+    /// Build the REST connector tool parameters for a request.
+    ///
+    /// Returns `None` unless the feature is enabled, a non-empty registry is
+    /// wired, and a transport client is present.
+    fn build_rest_params(&self) -> Option<provider_task::RestToolParams> {
+        if !self.rest_config.enabled {
+            return None;
+        }
+        let registry = self.rest_registry.as_ref()?;
+        if registry.tools().is_empty() {
+            return None;
+        }
+        let client = self.rest_client.as_ref()?;
+        Some(provider_task::RestToolParams {
+            registry: Arc::clone(registry),
+            client: Arc::clone(client),
+            max_calls: self.rest_config.max_calls_per_message,
         })
     }
 
@@ -686,6 +737,8 @@ impl<
                 provider_file_id_map,
                 anthropic_file_ids,
                 knowledge_search: self.build_knowledge_search_params(&tenant_id_str),
+                timer: self.build_timer_params(),
+                rest: self.build_rest_params(),
             },
             cancel,
             tx,
@@ -1002,18 +1055,30 @@ impl<
             })
             .collect();
 
+        // REST connector tools: enabled only when configured + registry wired.
+        let rest_enabled = self.rest_config.enabled && self.rest_registry.is_some();
+        let rest_tools: &[crate::domain::llm::LlmTool] = self
+            .rest_registry
+            .as_ref()
+            .map_or(&[], |r| r.tools());
+
         let assembled =
             super::context_assembly::assemble_context(&super::context_assembly::ContextInput {
                 system_prompt,
                 web_search_guard: &self.context_config.web_search_guard,
                 file_search_guard: &self.context_config.file_search_guard,
                 knowledge_search_guard: &self.knowledge_search_config.guard,
+                timer_guard: &self.timer_config.guard,
                 thread_summary: thread_summary.as_ref().map(|ts| ts.content.as_str()),
                 recent_messages: &context_messages,
                 user_message,
                 web_search_enabled,
                 file_search_enabled,
                 knowledge_search_enabled,
+                timer_enabled: self.timer_config.enabled,
+                rest_enabled,
+                rest_guard: &self.rest_config.guard,
+                rest_tools,
                 vector_store_ids,
                 file_search_filters,
                 web_search_context_size,
@@ -1420,6 +1485,8 @@ impl<
                 provider_file_id_map,
                 anthropic_file_ids,
                 knowledge_search: self.build_knowledge_search_params(&tenant_id_str),
+                timer: self.build_timer_params(),
+                rest: self.build_rest_params(),
             },
             cancel,
             tx,
@@ -1808,8 +1875,467 @@ mod tests {
         }
     }
 
+    /// The full event list a provider emits for one streaming round.
+    type ProviderRound = Vec<Result<TranslatedEvent, StreamingError>>;
+
+    /// A mock provider whose `stream()` returns a fresh batch of events on each
+    /// call — required for the agentic loop, which re-invokes `stream()` once
+    /// per iteration after handling a `ToolUse` terminal. Each element of the
+    /// queue is the full event list for one provider round.
+    #[allow(de0309_must_have_domain_model)]
+    struct ScriptedProvider {
+        rounds: std::sync::Mutex<std::collections::VecDeque<ProviderRound>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(rounds: Vec<ProviderRound>) -> Self {
+            Self {
+                rounds: std::sync::Mutex::new(rounds.into()),
+            }
+        }
+
+        fn tool_use_round(name: &str, input: serde_json::Value) -> ProviderRound {
+            vec![Ok(TranslatedEvent::Terminal(TerminalOutcome::ToolUse {
+                tool_use_id: format!("call-{name}"),
+                name: name.to_owned(),
+                input,
+            }))]
+        }
+
+        fn completed_round(text: &str) -> ProviderRound {
+            vec![
+                Ok(TranslatedEvent::Sse(ClientSseEvent::Delta {
+                    r#type: "text",
+                    content: text.to_owned(),
+                })),
+                Ok(TranslatedEvent::Terminal(TerminalOutcome::Completed {
+                    usage: Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        cache_read_input_tokens: 0,
+                        cache_write_input_tokens: 0,
+                        reasoning_tokens: 0,
+                    },
+                    response_id: "resp-test".to_owned(),
+                    content: text.to_owned(),
+                    citations: vec![],
+                    raw_response: serde_json::Value::Null,
+                })),
+            ]
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ScriptedProvider {
+        async fn stream(
+            &self,
+            _ctx: SecurityContext,
+            _request: LlmRequest<Streaming>,
+            _upstream_alias: &str,
+            cancel: CancellationToken,
+        ) -> Result<ProviderStream, LlmProviderError> {
+            let events = self
+                .rounds
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default();
+            Ok(ProviderStream::new(stream::iter(events), cancel))
+        }
+
+        async fn complete(
+            &self,
+            _ctx: SecurityContext,
+            _request: LlmRequest<NonStreaming>,
+            _upstream_alias: &str,
+        ) -> Result<ResponseResult, LlmProviderError> {
+            unimplemented!("not needed for streaming tests")
+        }
+    }
+
     fn mock_ctx() -> SecurityContext {
         SecurityContext::anonymous()
+    }
+
+    fn timer_task_config(
+        provider: Arc<dyn LlmProvider>,
+        timer: Option<provider_task::TimerToolParams>,
+    ) -> provider_task::ProviderTaskConfig {
+        provider_task::ProviderTaskConfig {
+            llm: provider,
+            upstream_alias: "test-alias".to_owned(),
+            messages: vec![LlmMessage::user("hi")],
+            system_instructions: None,
+            tools: vec![],
+            model: "test-model".into(),
+            provider_model_id: "test-model".into(),
+            max_output_tokens: 4096,
+            max_tool_calls: 2,
+            web_search_max_calls: 2,
+            code_interpreter_max_calls: 2,
+            api_params: mini_chat_sdk::ModelApiParams {
+                temperature: 0.7,
+                top_p: 1.0,
+                frequency_penalty: 0.0,
+                presence_penalty: 0.0,
+                stop: vec![],
+                extra_body: None,
+                reasoning_effort: None,
+            },
+            provider_file_id_map: std::collections::HashMap::new(),
+            anthropic_file_ids: std::collections::HashMap::new(),
+            knowledge_search: None,
+            timer,
+            rest: None,
+        }
+    }
+
+    /// Build a task config wired with REST connector params for connector tests.
+    fn rest_task_config(
+        provider: Arc<dyn LlmProvider>,
+        rest: Option<provider_task::RestToolParams>,
+    ) -> provider_task::ProviderTaskConfig {
+        let mut cfg = timer_task_config(provider, None);
+        cfg.rest = rest;
+        cfg
+    }
+
+    /// Timer tool: model calls `timer start`, loop injects the result and
+    /// re-invokes the provider, which then completes. The named timer must
+    /// exist in the shared store afterwards.
+    #[tokio::test]
+    async fn timer_tool_start_then_complete() {
+        let store = TimerStore::new();
+        let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(vec![
+            ScriptedProvider::tool_use_round(
+                "timer",
+                serde_json::json!({"action": "start", "name": "task1"}),
+            ),
+            ScriptedProvider::completed_round("Timer started."),
+        ]));
+        let (tx, mut rx) = mpsc::channel::<StreamEvent>(32);
+        let cancel = CancellationToken::new();
+
+        let handle = provider_task::spawn_provider_task::<TurnRepo, MsgRepo>(
+            mock_ctx(),
+            timer_task_config(
+                provider,
+                Some(provider_task::TimerToolParams {
+                    store: store.clone(),
+                    max_calls: 4,
+                }),
+            ),
+            cancel,
+            tx,
+            None,
+        );
+
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            let is_term = ev.is_terminal();
+            events.push(ev);
+            if is_term {
+                break;
+            }
+        }
+
+        let outcome = handle.await.expect("task should complete");
+        assert_eq!(outcome.terminal, StreamTerminal::Completed);
+        assert_eq!(outcome.accumulated_text, "Timer started.");
+        // chat_id is the empty string when there is no finalization context.
+        assert!(store.elapsed("", "task1").is_some());
+    }
+
+    /// Timer tool: an unknown `action` produces a graceful function output and
+    /// the stream still completes (no provider failure).
+    #[tokio::test]
+    async fn timer_tool_unknown_action_completes_gracefully() {
+        let store = TimerStore::new();
+        let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(vec![
+            ScriptedProvider::tool_use_round("timer", serde_json::json!({"action": "frobnicate"})),
+            ScriptedProvider::completed_round("ok"),
+        ]));
+        let (tx, mut rx) = mpsc::channel::<StreamEvent>(32);
+        let cancel = CancellationToken::new();
+
+        let handle = provider_task::spawn_provider_task::<TurnRepo, MsgRepo>(
+            mock_ctx(),
+            timer_task_config(
+                provider,
+                Some(provider_task::TimerToolParams {
+                    store: store.clone(),
+                    max_calls: 4,
+                }),
+            ),
+            cancel,
+            tx,
+            None,
+        );
+
+        while let Some(ev) = rx.recv().await {
+            if ev.is_terminal() {
+                break;
+            }
+        }
+
+        let outcome = handle.await.expect("task should complete");
+        assert_eq!(outcome.terminal, StreamTerminal::Completed);
+        assert_eq!(outcome.accumulated_text, "ok");
+    }
+
+    /// Timer disabled: a `timer` `ToolUse` falls through to `unexpected_tool_use`.
+    #[tokio::test]
+    async fn timer_tool_use_when_disabled_fails() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(vec![
+            ScriptedProvider::tool_use_round("timer", serde_json::json!({"action": "start"})),
+        ]));
+        let (tx, mut rx) = mpsc::channel::<StreamEvent>(32);
+        let cancel = CancellationToken::new();
+
+        let handle = provider_task::spawn_provider_task::<TurnRepo, MsgRepo>(
+            mock_ctx(),
+            timer_task_config(provider, None),
+            cancel,
+            tx,
+            None,
+        );
+
+        while let Some(ev) = rx.recv().await {
+            if ev.is_terminal() {
+                break;
+            }
+        }
+
+        let outcome = handle.await.expect("task should complete");
+        assert_eq!(outcome.terminal, StreamTerminal::Failed);
+        assert_eq!(outcome.error_code.as_deref(), Some("unexpected_tool_use"));
+    }
+
+    // ── REST connector tool tests ──
+
+    /// A `RestClient` that returns a canned response and records each call.
+    #[allow(de0309_must_have_domain_model)]
+    struct MockRestClient {
+        response: crate::domain::ports::rest_client::RestResponse,
+        calls: std::sync::Mutex<u32>,
+    }
+
+    impl MockRestClient {
+        fn new(body: &str) -> Self {
+            Self {
+                response: crate::domain::ports::rest_client::RestResponse {
+                    status: 200,
+                    content_type: Some("application/json".to_owned()),
+                    body_text: body.to_owned(),
+                    truncated: false,
+                },
+                calls: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::domain::ports::RestClient for MockRestClient {
+        async fn call(
+            &self,
+            _ctx: SecurityContext,
+            _req: crate::domain::ports::rest_client::RestRequest,
+        ) -> Result<
+            crate::domain::ports::rest_client::RestResponse,
+            crate::domain::ports::rest_client::RestError,
+        > {
+            *self.calls.lock().unwrap() += 1;
+            Ok(self.response.clone())
+        }
+    }
+
+    fn confluence_registry() -> Arc<crate::domain::service::RestAPIConnectorRegistry> {
+        use crate::config::{ParamIn, RestAPIConnector, RestAPIToolConfig, RestMethod, RestParam};
+        let cfg = RestAPIToolConfig {
+            enabled: true,
+            connectors: vec![RestAPIConnector {
+                tool_name: "search_confluence".to_owned(),
+                description: "Search Confluence.".to_owned(),
+                method: RestMethod::Get,
+                base_url: "https://adn.acronis.com".to_owned(),
+                path: "/wiki/rest/api/search".to_owned(),
+                params: vec![RestParam {
+                    name: "query".to_owned(),
+                    location: ParamIn::Query,
+                    required: true,
+                    r#type: "string".to_owned(),
+                    description: "What to search for.".to_owned(),
+                    wire_name: Some("cql".to_owned()),
+                    value_template: Some("text~\"{value}\"".to_owned()),
+                }],
+                headers: std::collections::HashMap::new(),
+                auth: None,
+            }],
+            ..Default::default()
+        };
+        Arc::new(crate::domain::service::RestAPIConnectorRegistry::new(&cfg))
+    }
+
+    /// Connector tool: model calls `search_confluence`, the loop executes the
+    /// request via the client, injects the result, and the stream completes.
+    #[tokio::test]
+    async fn connector_tool_get_then_complete() {
+        let registry = confluence_registry();
+        let client: Arc<dyn crate::domain::ports::RestClient> =
+            Arc::new(MockRestClient::new("{\"results\":[]}"));
+        let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(vec![
+            ScriptedProvider::tool_use_round(
+                "search_confluence",
+                serde_json::json!({"query": "datacenters list"}),
+            ),
+            ScriptedProvider::completed_round("Found pages."),
+        ]));
+        let (tx, mut rx) = mpsc::channel::<StreamEvent>(32);
+        let cancel = CancellationToken::new();
+
+        let handle = provider_task::spawn_provider_task::<TurnRepo, MsgRepo>(
+            mock_ctx(),
+            rest_task_config(
+                provider,
+                Some(provider_task::RestToolParams {
+                    registry,
+                    client,
+                    max_calls: 4,
+                }),
+            ),
+            cancel,
+            tx,
+            None,
+        );
+
+        while let Some(ev) = rx.recv().await {
+            if ev.is_terminal() {
+                break;
+            }
+        }
+        let outcome = handle.await.expect("task should complete");
+        assert_eq!(outcome.terminal, StreamTerminal::Completed);
+        assert_eq!(outcome.accumulated_text, "Found pages.");
+    }
+
+    /// Connector disabled: an unknown connector tool falls through to
+    /// `unexpected_tool_use`.
+    #[tokio::test]
+    async fn connector_disabled_fails() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(vec![
+            ScriptedProvider::tool_use_round(
+                "search_confluence",
+                serde_json::json!({"query": "x"}),
+            ),
+        ]));
+        let (tx, mut rx) = mpsc::channel::<StreamEvent>(32);
+        let cancel = CancellationToken::new();
+
+        let handle = provider_task::spawn_provider_task::<TurnRepo, MsgRepo>(
+            mock_ctx(),
+            rest_task_config(provider, None),
+            cancel,
+            tx,
+            None,
+        );
+
+        while let Some(ev) = rx.recv().await {
+            if ev.is_terminal() {
+                break;
+            }
+        }
+        let outcome = handle.await.expect("task should complete");
+        assert_eq!(outcome.terminal, StreamTerminal::Failed);
+        assert_eq!(outcome.error_code.as_deref(), Some("unexpected_tool_use"));
+    }
+
+    /// Connector soft cap: once `max_calls` is reached the loop injects a notice
+    /// instead of calling the client again, and still completes gracefully.
+    #[tokio::test]
+    async fn connector_soft_cap() {
+        let registry = confluence_registry();
+        let mock = Arc::new(MockRestClient::new("{}"));
+        let client: Arc<dyn crate::domain::ports::RestClient> = mock.clone();
+        let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(vec![
+            ScriptedProvider::tool_use_round(
+                "search_confluence",
+                serde_json::json!({"query": "a"}),
+            ),
+            ScriptedProvider::tool_use_round(
+                "search_confluence",
+                serde_json::json!({"query": "b"}),
+            ),
+            ScriptedProvider::completed_round("done"),
+        ]));
+        let (tx, mut rx) = mpsc::channel::<StreamEvent>(32);
+        let cancel = CancellationToken::new();
+
+        let handle = provider_task::spawn_provider_task::<TurnRepo, MsgRepo>(
+            mock_ctx(),
+            rest_task_config(
+                provider,
+                Some(provider_task::RestToolParams {
+                    registry,
+                    client,
+                    // Cap of 1 → second call hits the soft limit notice.
+                    max_calls: 1,
+                }),
+            ),
+            cancel,
+            tx,
+            None,
+        );
+
+        while let Some(ev) = rx.recv().await {
+            if ev.is_terminal() {
+                break;
+            }
+        }
+        let outcome = handle.await.expect("task should complete");
+        assert_eq!(outcome.terminal, StreamTerminal::Completed);
+        assert_eq!(outcome.accumulated_text, "done");
+        // Cap of 1 → only the first connector call reached the client.
+        assert_eq!(*mock.calls.lock().unwrap(), 1);
+    }
+
+    /// Connector bad args: a missing required parameter surfaces a graceful
+    /// error to the model (no turn failure) and the stream completes.
+    #[tokio::test]
+    async fn connector_bad_args_surface_error() {
+        let registry = confluence_registry();
+        let client: Arc<dyn crate::domain::ports::RestClient> =
+            Arc::new(MockRestClient::new("{}"));
+        let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(vec![
+            // Missing the required `query` param.
+            ScriptedProvider::tool_use_round("search_confluence", serde_json::json!({})),
+            ScriptedProvider::completed_round("recovered"),
+        ]));
+        let (tx, mut rx) = mpsc::channel::<StreamEvent>(32);
+        let cancel = CancellationToken::new();
+
+        let handle = provider_task::spawn_provider_task::<TurnRepo, MsgRepo>(
+            mock_ctx(),
+            rest_task_config(
+                provider,
+                Some(provider_task::RestToolParams {
+                    registry,
+                    client,
+                    max_calls: 4,
+                }),
+            ),
+            cancel,
+            tx,
+            None,
+        );
+
+        while let Some(ev) = rx.recv().await {
+            if ev.is_terminal() {
+                break;
+            }
+        }
+        let outcome = handle.await.expect("task should complete");
+        assert_eq!(outcome.terminal, StreamTerminal::Completed);
+        assert_eq!(outcome.accumulated_text, "recovered");
     }
 
     // ── Integration tests ──
@@ -1848,6 +2374,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                timer: None,
+                rest: None,
             },
             cancel,
             tx,
@@ -1913,6 +2441,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                timer: None,
+                rest: None,
             },
             cancel,
             tx,
@@ -1971,6 +2501,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                timer: None,
+                rest: None,
             },
             cancel,
             tx,
@@ -2078,6 +2610,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                timer: None,
+                rest: None,
             },
             cancel.clone(),
             tx,
@@ -2254,6 +2788,11 @@ mod tests {
             crate::config::RagConfig::default(),
             metrics,
             crate::config::KnowledgeSearchConfig::default(),
+            None,
+            crate::config::TimerToolConfig::default(),
+            TimerStore::new(),
+            crate::config::RestAPIToolConfig::default(),
+            None,
             None,
         )
     }
@@ -2998,6 +3537,11 @@ mod tests {
             metrics,
             crate::config::KnowledgeSearchConfig::default(),
             None,
+            crate::config::TimerToolConfig::default(),
+            TimerStore::new(),
+            crate::config::RestAPIToolConfig::default(),
+            None,
+            None,
         )
     }
 
@@ -3431,6 +3975,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                timer: None,
+                rest: None,
             },
             cancel,
             tx,
@@ -3611,6 +4157,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                timer: None,
+                rest: None,
             },
             cancel,
             tx,
@@ -3790,6 +4338,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                timer: None,
+                rest: None,
             },
             cancel,
             tx,
@@ -3950,6 +4500,11 @@ mod tests {
             crate::config::RagConfig::default(),
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
             crate::config::KnowledgeSearchConfig::default(),
+            None,
+            crate::config::TimerToolConfig::default(),
+            TimerStore::new(),
+            crate::config::RestAPIToolConfig::default(),
+            None,
             None,
         )
     }
@@ -4561,6 +5116,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                timer: None,
+                rest: None,
             },
             cancel,
             tx,
@@ -4620,6 +5177,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                timer: None,
+                rest: None,
             },
             cancel,
             tx,
@@ -4689,6 +5248,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                timer: None,
+                rest: None,
             },
             cancel,
             tx,
@@ -4745,6 +5306,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                timer: None,
+                rest: None,
             },
             cancel,
             tx,
@@ -4803,6 +5366,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                timer: None,
+                rest: None,
             },
             cancel,
             tx,
@@ -4872,6 +5437,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                timer: None,
+                rest: None,
             },
             cancel,
             tx,
@@ -5613,6 +6180,11 @@ mod tests {
             crate::config::RagConfig::default(),
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
             crate::config::KnowledgeSearchConfig::default(),
+            None,
+            crate::config::TimerToolConfig::default(),
+            TimerStore::new(),
+            crate::config::RestAPIToolConfig::default(),
+            None,
             None,
         )
     }

@@ -7,4 +7,5 @@ pub(crate) mod model_policy;
 pub(crate) mod oagw_provisioning;
 pub(crate) mod outbox;
 pub mod plugins;
+pub(crate) mod rest;
 pub(crate) mod workers;

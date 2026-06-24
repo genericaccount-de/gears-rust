@@ -65,6 +65,17 @@ pub struct ContextInput<'a> {
     pub file_search_enabled: bool,
     /// Whether the `search_knowledge` function tool is enabled for this request.
     pub knowledge_search_enabled: bool,
+    /// Whether the `timer` function tool is enabled for this request.
+    pub timer_enabled: bool,
+    /// Guard instruction appended when `timer` is enabled.
+    pub timer_guard: &'a str,
+    /// Whether REST connector function tools are enabled for this request.
+    pub rest_enabled: bool,
+    /// Guard instruction appended when REST connectors are enabled.
+    pub rest_guard: &'a str,
+    /// Prebuilt REST connector function tools (one per configured connector).
+    /// Passed in so context assembly stays decoupled from config types.
+    pub rest_tools: &'a [LlmTool],
     /// Vector store IDs for `file_search` (empty = no `file_search` tool).
     pub vector_store_ids: &'a [String],
     /// Optional metadata filter for file search (e.g. filter by `attachment_ids`).
@@ -213,12 +224,13 @@ pub fn assemble_context(
     // ── System instructions ──
     let system_instructions = build_system_instructions(
         input.system_prompt,
-        input.web_search_enabled,
-        input.web_search_guard,
-        input.file_search_enabled,
-        input.file_search_guard,
-        input.knowledge_search_enabled,
-        input.knowledge_search_guard,
+        &[
+            (input.web_search_enabled, input.web_search_guard),
+            (input.file_search_enabled, input.file_search_guard),
+            (input.knowledge_search_enabled, input.knowledge_search_guard),
+            (input.timer_enabled, input.timer_guard),
+            (input.rest_enabled, input.rest_guard),
+        ],
     );
 
     // ── Tools ──
@@ -264,6 +276,37 @@ pub fn assemble_context(
                 "required": ["query"]
             }),
         });
+    }
+    if input.timer_enabled {
+        tools.push(LlmTool::Function {
+            name: "timer".to_owned(),
+            description: "Track elapsed wall-clock time using named timers. Use this when \
+                          the user asks to start a timer or how much time has elapsed since \
+                          one was started. Timers persist across messages within the chat."
+                .to_owned(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["start", "elapsed", "reset", "list"],
+                        "description": "start: begin/restart a timer. elapsed: report time since start. \
+                                        reset: forget a timer. list: show active timers."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Short stable timer name derived from the user's wording \
+                                        (e.g. \"task1\"). Reuse the same name for later queries. \
+                                        Omit to use the default timer. Ignored for \"list\"."
+                    }
+                },
+                "required": ["action"]
+            }),
+        });
+    }
+    if input.rest_enabled {
+        // Prebuilt by the connector registry — one function tool per connector.
+        tools.extend(input.rest_tools.iter().cloned());
     }
 
     // ── Truncation ──
@@ -378,30 +421,21 @@ pub fn assemble_context(
     }
 }
 
-/// Build system instructions from base prompt + conditional guard strings.
-/// Returns `None` if the result would be empty.
-fn build_system_instructions(
-    system_prompt: &str,
-    web_search_enabled: bool,
-    web_search_guard: &str,
-    file_search_enabled: bool,
-    file_search_guard: &str,
-    knowledge_search_enabled: bool,
-    knowledge_search_guard: &str,
-) -> Option<String> {
+/// Build system instructions from a base prompt plus conditional guard strings.
+///
+/// Each `guards` entry is `(enabled, guard_text)`; a guard is appended only when
+/// `enabled` is `true` and the text is non-empty. Returns `None` if the result
+/// would be empty.
+fn build_system_instructions(system_prompt: &str, guards: &[(bool, &str)]) -> Option<String> {
     let mut parts: Vec<&str> = Vec::new();
 
     if !system_prompt.is_empty() {
         parts.push(system_prompt);
     }
-    if web_search_enabled && !web_search_guard.is_empty() {
-        parts.push(web_search_guard);
-    }
-    if file_search_enabled && !file_search_guard.is_empty() {
-        parts.push(file_search_guard);
-    }
-    if knowledge_search_enabled && !knowledge_search_guard.is_empty() {
-        parts.push(knowledge_search_guard);
+    for &(enabled, guard) in guards {
+        if enabled && !guard.is_empty() {
+            parts.push(guard);
+        }
     }
 
     if parts.is_empty() {
@@ -442,6 +476,11 @@ mod tests {
             token_budget: None,
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &[],
         })
         .unwrap();
@@ -470,6 +509,11 @@ mod tests {
             token_budget: None,
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &[],
         })
         .unwrap();
@@ -498,6 +542,11 @@ mod tests {
             token_budget: None,
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &[],
         })
         .unwrap();
@@ -526,6 +575,11 @@ mod tests {
             token_budget: None,
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &[],
         })
         .unwrap();
@@ -555,6 +609,11 @@ mod tests {
             token_budget: None,
             knowledge_search_enabled: true,
             knowledge_search_guard: "Use search_knowledge for internal docs.",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &[],
         })
         .unwrap();
@@ -594,6 +653,11 @@ mod tests {
             token_budget: None,
             knowledge_search_enabled: false,
             knowledge_search_guard: "Use search_knowledge for internal docs.",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &[],
         })
         .unwrap();
@@ -607,6 +671,166 @@ mod tests {
             )
         });
         assert!(!has_search_knowledge);
+    }
+
+    // 5.9d: timer enabled → single `timer` function tool added + guard appended
+    #[test]
+    fn timer_adds_function_tool_and_appends_guard() {
+        let result = assemble_context(&ContextInput {
+            system_prompt: "Base prompt.",
+            web_search_guard: "",
+            file_search_guard: "",
+            knowledge_search_guard: "",
+            thread_summary: None,
+            recent_messages: &[],
+            user_message: "start a timer",
+            web_search_enabled: false,
+            file_search_enabled: false,
+            vector_store_ids: &[],
+            file_search_filters: None,
+            web_search_context_size: crate::domain::llm::WebSearchContextSize::Low,
+            file_search_max_num_results: 5,
+            code_interpreter_file_ids: vec![],
+            token_budget: None,
+            knowledge_search_enabled: false,
+            timer_enabled: true,
+            timer_guard: "Use the timer tool for elapsed time.",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
+            image_file_ids: &[],
+        })
+        .unwrap();
+        let instructions = result.system_instructions.unwrap();
+        assert!(instructions.contains("Base prompt."));
+        assert!(instructions.contains("Use the timer tool for elapsed time."));
+
+        let timer_tools: Vec<&str> = result
+            .tools
+            .iter()
+            .filter_map(|t| match t {
+                crate::domain::llm::LlmTool::Function { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .filter(|n| *n == "timer")
+            .collect();
+        assert_eq!(timer_tools, vec!["timer"], "exactly one timer tool");
+    }
+
+    // 5.9e: timer disabled → no timer tool, no guard
+    #[test]
+    fn timer_disabled_adds_nothing() {
+        let result = assemble_context(&ContextInput {
+            system_prompt: "Base prompt.",
+            web_search_guard: "",
+            file_search_guard: "",
+            knowledge_search_guard: "",
+            thread_summary: None,
+            recent_messages: &[],
+            user_message: "hi",
+            web_search_enabled: false,
+            file_search_enabled: false,
+            vector_store_ids: &[],
+            file_search_filters: None,
+            web_search_context_size: crate::domain::llm::WebSearchContextSize::Low,
+            file_search_max_num_results: 5,
+            code_interpreter_file_ids: vec![],
+            token_budget: None,
+            knowledge_search_enabled: false,
+            timer_enabled: false,
+            timer_guard: "Use the timer tool for elapsed time.",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
+            image_file_ids: &[],
+        })
+        .unwrap();
+        let instructions = result.system_instructions.unwrap();
+        assert!(!instructions.contains("timer tool"));
+        let has_timer = result.tools.iter().any(|t| {
+            matches!(t, crate::domain::llm::LlmTool::Function { name, .. } if name == "timer")
+        });
+        assert!(!has_timer);
+    }
+
+    // REST connectors enabled → prebuilt connector tools appended + guard added
+    #[test]
+    fn rest_connectors_added_when_enabled() {
+        let rest_tools = vec![LlmTool::Function {
+            name: "search_confluence".to_owned(),
+            description: "Search Confluence.".to_owned(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }];
+        let result = assemble_context(&ContextInput {
+            system_prompt: "Base prompt.",
+            web_search_guard: "",
+            file_search_guard: "",
+            knowledge_search_guard: "",
+            thread_summary: None,
+            recent_messages: &[],
+            user_message: "find a wiki page",
+            web_search_enabled: false,
+            file_search_enabled: false,
+            vector_store_ids: &[],
+            file_search_filters: None,
+            web_search_context_size: crate::domain::llm::WebSearchContextSize::Low,
+            file_search_max_num_results: 5,
+            code_interpreter_file_ids: vec![],
+            token_budget: None,
+            knowledge_search_enabled: false,
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: true,
+            rest_guard: "Use REST connector tools for external data.",
+            rest_tools: &rest_tools,
+            image_file_ids: &[],
+        })
+        .unwrap();
+        let instructions = result.system_instructions.unwrap();
+        assert!(instructions.contains("Base prompt."));
+        assert!(instructions.contains("Use REST connector tools for external data."));
+        let has_connector = result.tools.iter().any(|t| {
+            matches!(t, LlmTool::Function { name, .. } if name == "search_confluence")
+        });
+        assert!(has_connector, "connector tool must be present");
+    }
+
+    // REST connectors disabled → nothing appended even if rest_tools provided
+    #[test]
+    fn rest_disabled_adds_nothing() {
+        let rest_tools = vec![LlmTool::Function {
+            name: "search_confluence".to_owned(),
+            description: "Search Confluence.".to_owned(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }];
+        let result = assemble_context(&ContextInput {
+            system_prompt: "Base prompt.",
+            web_search_guard: "",
+            file_search_guard: "",
+            knowledge_search_guard: "",
+            thread_summary: None,
+            recent_messages: &[],
+            user_message: "hi",
+            web_search_enabled: false,
+            file_search_enabled: false,
+            vector_store_ids: &[],
+            file_search_filters: None,
+            web_search_context_size: crate::domain::llm::WebSearchContextSize::Low,
+            file_search_max_num_results: 5,
+            code_interpreter_file_ids: vec![],
+            token_budget: None,
+            knowledge_search_enabled: false,
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "Use REST connector tools for external data.",
+            rest_tools: &rest_tools,
+            image_file_ids: &[],
+        })
+        .unwrap();
+        let instructions = result.system_instructions.unwrap();
+        assert!(!instructions.contains("REST connector tools"));
+        assert!(result.tools.is_empty());
     }
 
     // 5.10: thread summary present → included as first message with prefix
@@ -630,6 +854,11 @@ mod tests {
             token_budget: None,
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &[],
         })
         .unwrap();
@@ -671,6 +900,11 @@ mod tests {
             token_budget: None,
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &[],
         })
         .unwrap();
@@ -702,6 +936,11 @@ mod tests {
             token_budget: None,
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &[],
         })
         .unwrap();
@@ -730,6 +969,11 @@ mod tests {
             token_budget: None,
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &[],
         })
         .unwrap();
@@ -765,6 +1009,11 @@ mod tests {
             token_budget: None,
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &[],
         })
         .unwrap();
@@ -801,6 +1050,11 @@ mod tests {
             token_budget: None,
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &[],
         })
         .unwrap();
@@ -824,6 +1078,11 @@ mod tests {
             token_budget: None,
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &[],
         })
         .unwrap();
@@ -942,6 +1201,11 @@ mod tests {
             token_budget: Some(test_budget(context_window, 4096)),
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &[],
         })
         .unwrap();
@@ -984,6 +1248,11 @@ mod tests {
             token_budget: Some(test_budget(context_window, 4096)),
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &[],
         })
         .unwrap();
@@ -1036,6 +1305,11 @@ mod tests {
             token_budget: Some(test_budget(context_window, 4096)),
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &[],
         })
         .unwrap();
@@ -1065,6 +1339,11 @@ mod tests {
             token_budget: Some(test_budget(5000, 4096)),
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &[],
         });
 
@@ -1099,6 +1378,11 @@ mod tests {
             token_budget: None,
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &[],
         })
         .unwrap();
@@ -1141,6 +1425,11 @@ mod tests {
             token_budget: None,
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &[],
         })
         .unwrap();
@@ -1171,6 +1460,11 @@ mod tests {
             token_budget: None,
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &[],
         })
         .unwrap();
@@ -1215,6 +1509,11 @@ mod tests {
             token_budget: None,
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &images,
         })
         .unwrap();
@@ -1245,6 +1544,11 @@ mod tests {
             token_budget: None,
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &images,
         })
         .unwrap();
@@ -1273,6 +1577,11 @@ mod tests {
             token_budget: None,
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &[],
         })
         .unwrap();
@@ -1301,6 +1610,11 @@ mod tests {
             token_budget: Some(test_budget(10_000, 4096)),
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &images,
         });
         assert!(result.is_ok());
@@ -1326,6 +1640,11 @@ mod tests {
             token_budget: Some(test_budget(5100, 4096)),
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
+            timer_enabled: false,
+            timer_guard: "",
+            rest_enabled: false,
+            rest_guard: "",
+            rest_tools: &[],
             image_file_ids: &images,
         });
         assert!(matches!(

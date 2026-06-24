@@ -57,6 +57,13 @@ pub struct MiniChatConfig {
     /// Knowledge search (RAG) feature configuration.
     #[serde(default)]
     pub knowledge_search: KnowledgeSearchConfig,
+    /// `timer` custom-tool feature configuration.
+    #[serde(default)]
+    pub timer: TimerToolConfig,
+    /// REST connector custom-tool feature configuration.
+    #[expand_vars]
+    #[serde(default)]
+    pub rest: RestAPIToolConfig,
 }
 
 /// Which file/vector-store implementation to use for RAG operations.
@@ -441,6 +448,8 @@ impl Default for MiniChatConfig {
             cleanup_worker: CleanupWorkerConfig::default(),
             thumbnail: ThumbnailConfig::default(),
             knowledge_search: KnowledgeSearchConfig::default(),
+            timer: TimerToolConfig::default(),
+            rest: RestAPIToolConfig::default(),
         }
     }
 }
@@ -1042,6 +1051,373 @@ impl KnowledgeSearchConfig {
         }
         Ok(())
     }
+}
+
+// ── Timer tool config ────────────────────────────────────────────────────
+
+fn default_timer_max_calls() -> u32 {
+    4
+}
+
+fn default_timer_guard() -> String {
+    "You have access to a tool called timer for tracking elapsed time. Call it with \
+     an `action` of \"start\" (begin or restart a timer), \"elapsed\" (report how much \
+     time has passed since a timer started), \"reset\" (forget a timer), or \"list\" \
+     (show active timers). Pass a short, stable `name` derived from the user's wording \
+     (e.g. \"task1\") and reuse the exact same name when the user later asks about that \
+     timer. Omit `name` to use the default timer. Use this tool whenever the user asks \
+     to start a timer or how much time has elapsed."
+        .to_owned()
+}
+
+/// Configuration for the `timer` custom function tool.
+///
+/// When `enabled` is `true`, the model can call a single `timer` function with
+/// an `action` (`start` | `elapsed` | `reset` | `list`) and optional `name`.
+/// The agentic loop in the provider task intercepts the call, mutates an
+/// in-memory [`crate::domain::service::stream_service::TimerStore`] keyed by
+/// `(chat_id, name)`, and injects the result back as a `function_call_output`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimerToolConfig {
+    /// Enable the `timer` function tool. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Maximum `timer` calls per message in the agentic loop. Default: 4.
+    #[serde(default = "default_timer_max_calls")]
+    pub max_calls_per_message: u32,
+
+    /// Guard instruction appended to the system prompt when enabled.
+    #[serde(default = "default_timer_guard")]
+    pub guard: String,
+}
+
+impl Default for TimerToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_calls_per_message: default_timer_max_calls(),
+            guard: default_timer_guard(),
+        }
+    }
+}
+
+impl TimerToolConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_calls_per_message == 0 {
+            return Err("timer.max_calls_per_message must be > 0".to_owned());
+        }
+        Ok(())
+    }
+}
+
+// ── REST connector tool config ───────────────────────────────────────────
+
+/// Built-in tool names reserved by the gear. A connector `tool_name` must not
+/// collide with any of these (the model would otherwise be unable to
+/// disambiguate, and the agentic dispatch matches built-ins first).
+const RESERVED_TOOL_NAMES: &[&str] = &[
+    "search_knowledge",
+    "timer",
+    "web_search",
+    "file_search",
+    "code_interpreter",
+];
+
+fn default_rest_max_calls() -> u32 {
+    4
+}
+
+fn default_rest_timeout_secs() -> u64 {
+    15
+}
+
+fn default_rest_max_response_bytes() -> usize {
+    32_768
+}
+
+fn default_rest_param_type() -> String {
+    "string".to_owned()
+}
+
+fn default_rest_guard() -> String {
+    "You have access to one or more REST connector tools that call external \
+     services on your behalf. Each tool's description states which service it \
+     queries and when to use it. Call the matching tool whenever the user asks \
+     for data those services provide. The tools inject any required hosts and \
+     credentials automatically — never fabricate IDs, URLs, hostnames, tokens, \
+     or authentication headers, and only pass the documented parameters."
+        .to_owned()
+}
+
+/// HTTP method a REST connector uses. Limited to the read/create verbs the
+/// connector tool surfaces (see plan "Out of scope" for PUT/PATCH/DELETE).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RestMethod {
+    #[serde(rename = "GET", alias = "get")]
+    Get,
+    #[serde(rename = "POST", alias = "post")]
+    Post,
+}
+
+/// Where a connector parameter is placed when building the outbound request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParamIn {
+    /// URL query string parameter.
+    Query,
+    /// Path placeholder (`{name}` in the connector `path`).
+    Path,
+    /// JSON body field (POST only).
+    Body,
+}
+
+/// A single connector parameter. Drives both the JSON schema surfaced to the
+/// model and the request mapping performed by the connector registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestParam {
+    /// Parameter name as the model sees it (JSON schema property key).
+    pub name: String,
+    /// Where the value is placed in the outbound request.
+    pub location: ParamIn,
+    /// Whether the model must supply this parameter.
+    #[serde(default)]
+    pub required: bool,
+    /// JSON schema type (`string`, `integer`, `number`, `boolean`). Default `string`.
+    #[serde(default = "default_rest_param_type", rename = "type")]
+    pub r#type: String,
+    /// LLM-facing description of the parameter.
+    #[serde(default)]
+    pub description: String,
+    /// Wire name used when building the request (query key / path placeholder /
+    /// body field). Defaults to `name` when omitted.
+    #[serde(default)]
+    pub wire_name: Option<String>,
+    /// Optional template wrapping the value, e.g. `text~"{value}"`. The literal
+    /// `{value}` token is replaced with the model-supplied value.
+    #[serde(default)]
+    pub value_template: Option<String>,
+}
+
+/// A single REST connector surfaced to the model as its own function tool.
+#[derive(Debug, Clone, Serialize, Deserialize, toolkit_macros::ExpandVars)]
+#[serde(deny_unknown_fields)]
+pub struct RestAPIConnector {
+    /// Function name the LLM sees (e.g. `search_confluence`).
+    pub tool_name: String,
+    /// LLM-facing "when to use this" description (primary tool-selection signal).
+    pub description: String,
+    /// HTTP method.
+    pub method: RestMethod,
+    /// Base URL, e.g. `https://adn.acronis.com`. Its host populates the allowlist.
+    pub base_url: String,
+    /// Path, e.g. `/wiki/rest/api/search`. May contain `{param}` placeholders.
+    pub path: String,
+    /// Parameters driving the JSON schema + request mapping.
+    #[serde(default)]
+    pub params: Vec<RestParam>,
+    /// Static HTTP headers attached to every request this connector makes.
+    /// `${VAR}`-expanded. Reserved/hop-by-hop names are stripped by the adapter.
+    #[expand_vars]
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Static auth headers, `${VAR}`-expanded; applied after `headers` so a
+    /// connector cannot accidentally drop its own auth. The model never sees these.
+    ///
+    /// Credentials are optional: use the `${VAR:-}` default form so a missing
+    /// env var expands to empty instead of failing startup. The connector then
+    /// omits any header whose value is empty or a bare auth scheme (e.g.
+    /// `Bearer` with no token).
+    #[expand_vars]
+    #[serde(default)]
+    pub auth: Option<HashMap<String, String>>,
+
+}
+
+/// Configuration for the REST connector custom tools.
+///
+/// When `enabled` is `true`, each entry in `connectors` is surfaced to the
+/// model as its own dedicated function tool. The agentic loop intercepts the
+/// call, builds a request via the connector registry, executes it through a
+/// direct `reqwest` client (host-allowlisted, SSRF-guarded), and injects the
+/// response back as a `function_call_output`.
+#[derive(Debug, Clone, Serialize, Deserialize, toolkit_macros::ExpandVars)]
+#[serde(deny_unknown_fields)]
+pub struct RestAPIToolConfig {
+    /// Enable the REST connector tools. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Maximum connector calls per message in the agentic loop. Default: 4.
+    #[serde(default = "default_rest_max_calls")]
+    pub max_calls_per_message: u32,
+
+    /// Per-request timeout in seconds. Default: 15.
+    #[serde(default = "default_rest_timeout_secs")]
+    pub timeout_secs: u64,
+
+    /// Maximum response bytes read before truncation. Default: 32768.
+    #[serde(default = "default_rest_max_response_bytes")]
+    pub max_response_bytes: usize,
+
+    /// Guard instruction appended to the system prompt when enabled.
+    #[serde(default = "default_rest_guard")]
+    pub guard: String,
+
+    /// When `true`, disable the SSRF private-IP check so connectors can reach
+    /// internal/corporate hosts that resolve to private addresses (e.g.
+    /// `10.x.x.x`). Default: `false` (block private IPs).
+    #[serde(default)]
+    pub allow_private_ips: bool,
+
+    /// Configured connectors. Each becomes one function tool.
+    #[expand_vars]
+    #[serde(default)]
+    pub connectors: Vec<RestAPIConnector>,
+}
+
+impl Default for RestAPIToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_calls_per_message: default_rest_max_calls(),
+            timeout_secs: default_rest_timeout_secs(),
+            max_response_bytes: default_rest_max_response_bytes(),
+            guard: default_rest_guard(),
+            allow_private_ips: false,
+            connectors: Vec::new(),
+        }
+    }
+}
+
+impl RestAPIToolConfig {
+    /// Validate the REST connector configuration.
+    ///
+    /// Checks numeric bounds, and (when enabled) that connectors are present,
+    /// each `tool_name` is unique / regex-valid / non-reserved, each `base_url`
+    /// parses to a host, and every `{placeholder}` in a path has a matching
+    /// `Path` param.
+    #[allow(clippy::too_many_lines)]
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_calls_per_message == 0 {
+            return Err("rest.max_calls_per_message must be > 0".to_owned());
+        }
+        if self.timeout_secs == 0 {
+            return Err("rest.timeout_secs must be > 0".to_owned());
+        }
+        if self.max_response_bytes == 0 {
+            return Err("rest.max_response_bytes must be > 0".to_owned());
+        }
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.connectors.is_empty() {
+            return Err("rest.connectors must be non-empty when rest.enabled is true".to_owned());
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for c in &self.connectors {
+            if !is_valid_tool_name(&c.tool_name) {
+                return Err(format!(
+                    "rest.connectors: invalid tool_name '{}' (must match ^[a-zA-Z0-9_-]{{1,48}}$)",
+                    c.tool_name
+                ));
+            }
+            if RESERVED_TOOL_NAMES.contains(&c.tool_name.as_str()) {
+                return Err(format!(
+                    "rest.connectors: tool_name '{}' collides with a reserved built-in tool",
+                    c.tool_name
+                ));
+            }
+            if !seen.insert(c.tool_name.clone()) {
+                return Err(format!(
+                    "rest.connectors: duplicate tool_name '{}'",
+                    c.tool_name
+                ));
+            }
+            if c.description.trim().is_empty() {
+                return Err(format!(
+                    "rest.connectors: tool_name '{}' must have a non-empty description",
+                    c.tool_name
+                ));
+            }
+
+            // base_url must parse and have a host.
+            let parsed = url::Url::parse(&c.base_url).map_err(|e| {
+                format!(
+                    "rest.connectors: tool_name '{}' has invalid base_url '{}': {e}",
+                    c.tool_name, c.base_url
+                )
+            })?;
+            if parsed.host_str().is_none_or(str::is_empty) {
+                return Err(format!(
+                    "rest.connectors: tool_name '{}' base_url '{}' has no host",
+                    c.tool_name, c.base_url
+                ));
+            }
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(format!(
+                    "rest.connectors: tool_name '{}' base_url '{}' must use http or https",
+                    c.tool_name, c.base_url
+                ));
+            }
+
+            // Body params require POST.
+            if c.method == RestMethod::Get
+                && c.params.iter().any(|p| p.location == ParamIn::Body)
+            {
+                return Err(format!(
+                    "rest.connectors: tool_name '{}' uses GET but declares body params",
+                    c.tool_name
+                ));
+            }
+
+            // Every path placeholder must have a matching Path param.
+            for placeholder in path_placeholders(&c.path) {
+                let matched = c.params.iter().any(|p| {
+                    p.location == ParamIn::Path
+                        && p.wire_name.as_deref().unwrap_or(&p.name) == placeholder
+                });
+                if !matched {
+                    return Err(format!(
+                        "rest.connectors: tool_name '{}' path placeholder '{{{placeholder}}}' \
+                         has no matching Path param",
+                        c.tool_name
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Validate a connector tool name against `^[a-zA-Z0-9_-]{1,48}$`.
+fn is_valid_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 48
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Extract `{placeholder}` names from a path template.
+fn path_placeholders(path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = path;
+    while let Some(open) = rest.find('{') {
+        if let Some(close_rel) = rest[open + 1..].find('}') {
+            let name = &rest[open + 1..open + 1 + close_rel];
+            if !name.is_empty() {
+                out.push(name.to_owned());
+            }
+            rest = &rest[open + 1 + close_rel + 1..];
+        } else {
+            break;
+        }
+    }
+    out
 }
 
 fn default_url_prefix() -> String {

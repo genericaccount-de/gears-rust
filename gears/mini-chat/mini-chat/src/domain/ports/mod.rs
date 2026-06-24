@@ -28,9 +28,11 @@ pub type FileStream =
 pub(crate) mod knowledge_retriever;
 pub(crate) mod metric_labels;
 pub(crate) mod metrics;
+pub(crate) mod rest_client;
 
 pub(crate) use knowledge_retriever::KnowledgeRetriever;
 pub(crate) use metrics::MiniChatMetricsPort;
+pub(crate) use rest_client::RestClient;
 
 // ── Error type ──────────────────────────────────────────────────────────
 

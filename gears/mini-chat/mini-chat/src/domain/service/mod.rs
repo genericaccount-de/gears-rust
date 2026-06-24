@@ -34,6 +34,7 @@ mod quota_service;
 pub(crate) mod quota_settler;
 mod reaction_service;
 pub(crate) mod replay;
+pub(crate) mod rest_connectors;
 mod stream_service;
 #[cfg(test)]
 pub(crate) mod test_helpers;
@@ -49,7 +50,8 @@ pub(crate) use message_service::MessageService;
 pub(crate) use model_service::ModelService;
 pub(crate) use quota_service::QuotaService;
 pub(crate) use reaction_service::ReactionService;
-pub(crate) use stream_service::{StreamError, StreamService};
+pub(crate) use rest_connectors::RestAPIConnectorRegistry;
+pub(crate) use stream_service::{StreamError, StreamService, TimerStore};
 pub(crate) use turn_service::{MutationError, MutationResult, TurnService};
 
 /// Extract the W3C trace ID from the current tracing span.
@@ -210,6 +212,11 @@ impl<
         summary_config: crate::config::background::ThreadSummaryWorkerConfig,
         knowledge_search_config: crate::config::KnowledgeSearchConfig,
         knowledge_retriever: Option<Arc<dyn crate::domain::ports::KnowledgeRetriever>>,
+        timer_config: crate::config::TimerToolConfig,
+        timer_store: TimerStore,
+        rest_config: crate::config::RestAPIToolConfig,
+        rest_registry: Option<Arc<RestAPIConnectorRegistry>>,
+        rest_client: Option<Arc<dyn crate::domain::ports::RestClient>>,
         anthropic_files_client: Option<
             Arc<crate::infra::llm::providers::anthropic_files_client::AnthropicFilesClient>,
         >,
@@ -287,6 +294,11 @@ impl<
                 Arc::clone(&metrics),
                 knowledge_search_config,
                 knowledge_retriever,
+                timer_config,
+                timer_store,
+                rest_config,
+                rest_registry,
+                rest_client,
             ),
             turns,
             reactions: ReactionService::new(

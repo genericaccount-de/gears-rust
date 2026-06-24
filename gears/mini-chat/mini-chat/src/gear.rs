@@ -166,6 +166,12 @@ impl Gear for MiniChatGear {
         cfg.knowledge_search
             .validate()
             .map_err(|e| anyhow::anyhow!("knowledge_search config: {e}"))?;
+        cfg.timer
+            .validate()
+            .map_err(|e| anyhow::anyhow!("timer config: {e}"))?;
+        cfg.rest
+            .validate()
+            .map_err(|e| anyhow::anyhow!("rest config: {e}"))?;
 
         let vendor = cfg.vendor.trim().to_owned();
         if vendor.is_empty() {
@@ -369,6 +375,32 @@ impl Gear for MiniChatGear {
             None
         };
 
+        // ── Timer tool store ────────────────────────────────────────────────
+        //
+        // Process-local in-memory store of named timers, shared across all
+        // requests for the lifetime of the gear. Built unconditionally (cheap);
+        // the feature is gated by `cfg.timer.enabled` inside `StreamService`.
+        let timer_store = crate::domain::service::TimerStore::new();
+
+        // ── REST connector tools ────────────────────────────────────────────
+        //
+        // Built only when `cfg.rest.enabled`. The registry derives the tool
+        // schemas + host allowlist from config; the reqwest client enforces the
+        // allowlist + SSRF safeguards. Both are `None` when the feature is off.
+        let (rest_registry, rest_client): (
+            Option<Arc<crate::domain::service::RestAPIConnectorRegistry>>,
+            Option<Arc<dyn crate::domain::ports::RestClient>>,
+        ) = if cfg.rest.enabled {
+            let registry = Arc::new(
+                crate::domain::service::RestAPIConnectorRegistry::new(&cfg.rest),
+            );
+            let client = crate::infra::rest::reqwest_rest_client::ReqwestRestClient::new(&cfg.rest)
+                .map_err(|e| anyhow::anyhow!("rest client: {e}"))?;
+            (Some(registry), Some(Arc::new(client) as Arc<dyn crate::domain::ports::RestClient>))
+        } else {
+            (None, None)
+        };
+
         // ── Anthropic Files API client ──────────────────────────────────────
         //
         // Constructed only when at least one provider entry uses the
@@ -434,6 +466,11 @@ impl Gear for MiniChatGear {
             cfg.thread_summary_worker,
             cfg.knowledge_search,
             knowledge_retriever,
+            cfg.timer,
+            timer_store,
+            cfg.rest,
+            rest_registry,
+            rest_client,
             anthropic_files_client,
         ));
 

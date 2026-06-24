@@ -1,0 +1,254 @@
+
+Design Summary
+JIRA
+
+
+Business requirements document link
+Event Manager
+PoC / mockups / research
+
+
+Problem Overview
+Acronis Cyber Cloud currently has no simple, reliable mechanism to enable event-responsive behavior that is accessible via standard Acronis domain model semantics (i.e. Acronis JWT, roles, etc...)
+Some small subset of applications use amqp, but there's a variety of practical and architectural problems that prevent more widespread usage/adoption
+Our existing usage of amqp does not have any form of archive allowing event playback, so missed messages are unrecoverable
+Many applications rely upon polling to receive updates, which causes unnecessary load and causes direct coupling of applications, i.e. one application being down will directly cause many others to fail.
+Task manager in particular is used/abused as a long-running event manager, with heavy polling load.
+Many application designs can be simplified with a common event platform providing push delivery, smart polling support and full event playback.
+New Components
+Event Producer Library
+Event Ingest Manager
+NATS (3rd Party)
+Event Delivery Manager
+Event Consumer Library
+Relevant Existing Components
+Event Archive
+Requirements, Design And Test Strategy Outline
+ #
+Requirement
+Design Details
+1	Functional requirements	
+1.1	At least once delivery guarantee option	Topics with configurable durability can provide guarantees about message delivery due to persistence to durable media, in this case, PostgreSQL.
+1.2	Best-effort delivery option	
+Topics which do not require strict ordering or delivery guarantees may be delivered in non-persisted best-effort mode.
+Producers and consumers should expect the possibility of out of order and/or lost messages.
+1.3	Multiple independent, configurable event topics	
+Different topics will require different configuration parameters.
+Topics and sharding will be configured via JSON in a repository.
+1.4	Reliable, global ordering of events within a persisted topic	So that consumers may rely on the causal relationship preserved in time ordering of events, topics will guarantee causal ordering (may implement stricter ordering)
+1.5	Event durability at the earliest possible opportunity	
+Producers with databases will persist events in the same database transaction where possible to prevent lost events.
+Producers without databases may make synchronous calls to Event Ingest Manager's API to POST events, and fail their own business transaction if the event cannot be accepted.
+1.6	Enable consumers to use event collaboration	Because causal relationship is preserved, consumers may rely upon events to form accurate local views of information as required, or update their corresponding state as required reliably.
+1.7	Provide in-order delivery of events	
+Event Delivery Manager may redeliver previous batches, but it will never deliver newer batches until previous batches have been accepted.
+Consumers do not need to handle the case of buffering or deciphering sparse events: either the event is below the last delivered counter and therefore a redelivery, or it is new and in order.
+1.8	
+Provide interface to publish events
+Event Ingest Manager provides a REST API for producers to publish events.
+1.9	Event Short Polling	Event Delivery Manager provides a REST API for consumers to frequently poll for new events, with a server-side cursor tracking the consumer's confirmed deliveries (delivered to complete connection termination or optional last-received parameter).
+1.10	Event Long Polling	Event Delivery Manager provides a REST API for consumers to open a connection waiting for the next message(s) matching their subscription.
+1.11	Event Push Delivery	Event Delivery Manager provides a REST API for consumers to register a web endpoint for EDM to push events to in batches (as small as one).
+1.12	Event Replay	
+Event Delivery Manager ensures that Event Archive receives all messages as a special subscriber, and the event archive API allows both simple and complex filtering event playback.
+Event Archive is also used internally, i.e. for Event Delivery Manager pod start/restart.
+1.13	Event Archive	Event Archive component provides full event archive functionality using existing API.
+1.14	Support Cloud Events Spec	Event Manager follows the Cloud Events spec
+2	Performance	
+2.1	Planned Throughput	
+For the prototype release, we expect trivial load from a single test topic, occasional events for testing with no continuous or heavy load.
+2.2	Design Throughput	
+The system is currently designed to support Max 10'000 events/sec, Avg: 1'000/sec, Min 1'000/sec for a big message of 5 user-defined fields size of the event is close to 1024B. In this way amount of traffic shall be around 10MB/sec.
+
+2.3	
+Minimize Delivery Latency
+The design goal is to minimize delivery latency for short-duration pollers and push recipients without sacrificing any guarantees.
+2.3	
+Sharding
+The overall architecture and guarantees are intended to allow sharding by topic.
+Event Delivery Manager implements static, topic-based sharding.
+2.4	Horizontal Scaling	
+Event Ingest Manager and Event Delivery Manager are both designed for horizontal scaling beyond database performance limits.
+NATS uses a highly scalable architecture, and because there's database transactions involved, NATS throughput is not expected to be a limiting factor.
+3	LongHaul	
+3.1	Tested as Platform	As different real workflows are added, existing long haul tests will test Event Manager, or new tests should be created as required for those features as normal
+4	Security	
+4.1	Producer Authentication & Authorization	
+oauth2
+scope "urn:acronis.com:event-ingest-manager:event-ingest-manager:topics:<topic>:publisher|push ".
+4.2	Consumer Authentication & Authorization	
+oauth2
+scope "urn:acronis.com:event-delivery-manager:event-delivery-manager:topics:<topic>:subscriber".
+4.3	Webhook Authentication & Authorization	
+Consumer endpoints
+oauth2
+scope "urn:acronis.com:event-delivery-manager:event-delivery-manager:topics:<topic>:delivery".
+4.4	New 3rd Party - NATS	
+NATS is a well regarded, distributed, fault tolerant messaging platform.
+We will utilize it in ephemeral, at most once mode, and implement our own durability mechanism integrated into our service framework and platform.
+4.5	NATS Authentication	
+Username/Password stored in Kubernetes Secrets in prod, no auth on dev stands
+4.6	NATS Allowed Usage	
+Currently, NATS will only be available to event-ingest-manager and event-delivery-manager.
+NATS Streaming was evaluated and rejected explicitly, so it should not be used.
+NATS is only intended to be used between two closely related functions within one overall service domain for the purposes of scalability.  It shall not be used as a general API for services, instead, Event Manager itself must be used in such cases.
+4.7	Personal Data/Privacy	
+Currently, only a test topic will be included in event manager.
+Personal data and privacy considerations should be made on a topic-by-topic basis with specific use cases subject to security review.
+As a starting policy, each new topic or type would require architectural and security review & approval.  This may be reviewed later if clearer procedures can be drafted from experience.
+5	Database requirements	
+5.1	Postgres/Patroni Used for All State	
+Both event-ingest-manager and event-delivery-manager use PostgreSQL for storing state.
+5.2	Standard Patroni Instance	The standard cloud patroni cluster will be used in production.
+5.3	No current migrations	
+The database schemas are currently simple and only column additions and other simple operations are currently planned.
+5.4	Database Performance	A dedicated testing suite was used to evaluate various options, including database tuning parameters.  We have good understanding of parameters necessary for tuning, and a plan for applied testing.
+6	Operational requirements	
+6.1	Deployment Requirements	
+All components deployed to kubernetes via standard mechanisms.
+6.2	
+Cloud Requirements
+Review Tickets
+
+Acronis Event Ingest Manger
+Event Ingest Manager Scaling Guide
+
+Event Delivery Manager SLI
+Event Delivery Manager Scaling Guide
+Platform Event Delivery Manager Troubleshooting
+DCO Training (EDM)
+6.3	State	
+Event Ingest Manager: Stateless 
+Event Delivery Manager: Stateful. The deployment is done via a StatefulSet, each pod is responsible for storing in-memory events for a subset of subscribers. On startup, the service retrieves missing subscriber events from Event Archive and NATS subscription to Event Ingest Manager.
+NATS: Stateless
+6.4	Sharding	
+Event Ingest Manager: None 
+Event Delivery Manager: Static sharding by topic.  Horizontally scalable within a shard.
+NATS: None
+6.5	High Availability	
+Event Ingest Manager: Stateless HA Application
+Event Delivery Manager: Graceful failover and restart of stateful aspects and horizontal scalability with hot spare
+NATS: Core NATS supports full mesh clustering with self-healing features to provide high availability to clients.
+6.6	Zero-downtime update	
+All: Supported by design due to k8s deployment with stable database schema
+6.7	Kubernetes ready	All
+6.10	Network	Private for prototype and initial phase until public API epics
+6.11	Monitoring & Metrics	
+Container monitoring comes for free with k8s deployment.
+We will also export metrics via Prometheus at /metrics endpoint.
+Specific metrics to be evaluated by implementation review
+6.12	Logging	
+Kibana Logging
+All services will expose logs to Kibana via ELK
+Logs will be in JSON formal so searching through Kibana is easier
+Mapping
+Glossary
+EIM: Event Ingest Manager
+EDM: Event Delivery Manager
+NATS: Neural Autonomic Transport System, an open source application
+Logical And Deployment Diagram
+
+Workflow Diagrams
+@startuml
+boundary "Producer Service" as prod
+database "Producer DB" as proddb
+participant "Event Ingest Manager" as eim
+queue "NATS" as nats
+participant "Event Delivery Manager" as edm
+participant "Event Archive" as ea
+database "Event Archive DB" as eadb
+boundary "Consumer Service" as cons
+autonumber
+prod -> proddb: Producer persists event to database in original tx
+prod -> eim: Publish the event
+eim -> nats: Publish the event
+nats -> edm: Receive the event (fanout)
+alt Happens asynchronously
+	edm -> ea: Push the event to special archive subscriber
+	ea -> eadb: Persist the event
+	edm -> nats: Ack the event
+	nats -> eim: Propagate the ack
+else EDM unable to ack
+	loop Until acks begin again
+		eim -> nats: Resend events intelligently
+	end
+end
+Group Push Delivery
+	edm -> cons: Push the event
+end
+...
+autonumber stop
+Group Pull Consumers
+	cons -> edm: Poll for events
+	cons -> ea: Replay or query archive
+end
+@enduml
+
+@startuml
+boundary "Producer Service" as prod
+participant "Event Ingest Manager" as eim
+database "Event Ingest Manager DB" as eimdb
+queue "NATS" as nats
+participant "Event Delivery Manager" as edm
+participant "Event Archive" as ea
+database "Event Archive DB" as eadb
+boundary "Consumer Service" as cons
+autonumber
+prod -> eim: Publish the event synchronously
+eim -> eimdb: Persist the event
+eim -> nats: Publish the event
+nats -> edm: Receive the event (fanout)
+alt Happens asynchronously
+	edm -> ea: Push the event to special archive subscriber
+	ea -> eadb: Persist the event
+	edm -> nats: Ack the event
+	nats -> eim: Propagate the ack
+else EDM unable to ack
+	loop Until acks begin again
+		eim -> nats: Resend events intelligently
+	end
+end
+Group Push Delivery
+	edm -> cons: Push the event
+end
+...
+autonumber stop
+Group Pull Consumers
+	cons -> edm: Poll for events
+	cons -> ea: Replay or query archive
+end
+@enduml
+
+@startuml
+boundary "Producer Service" as prod
+participant "Event Ingest Manager" as eim
+database "Event Ingest Manager DB" as eimdb
+queue "NATS" as nats
+participant "Event Delivery Manager" as edm
+participant "Event Archive" as ea
+database "Event Archive DB" as eadb
+boundary "Consumer Service" as cons
+autonumber
+prod -> eim: Publish the event
+eim -> nats: Publish the event
+nats -> edm: Receive the event (fanout)
+Group Push Delivery
+	edm -> cons: Push the event
+end
+...
+autonumber stop
+Group Pull Consumers
+	cons -> edm: Poll for events
+	cons -> ea: Replay or query archive
+end
+@enduml
+Technologies Considered
+Scalability Fanout
+NATS was chosen because it is the most resilient technology available.  From our research and testing, NATS gives the most reliable performance with the least operational intervention.
+Rabbitmq was considered and rejected because of past negative experience and inferior scaling and resiliency.
+Raw HTTP communication between ingest and delivery was considered, using either some shared configuration or intermediate proxy.  However, this is a dramatically more complex solution with no real benefit beyond avoidance of new technology.
+Message Durability
+PostgreSQL was chosen because the performance was similar to or beyond other options, and Acronis has good experience with PostgreSQL in terms of reliability and operational performance.
+NATS Streaming was considered, but offered no performance improvements but introduced a new and unfamiliar data persistence layer that provided no benefit, because consumers would not be able to directly use it because it does not support the various Acronis authorization and tenant filtering behaviors.
+
+

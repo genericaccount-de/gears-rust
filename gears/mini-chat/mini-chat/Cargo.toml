@@ -67,6 +67,11 @@ utoipa = { workspace = true, features = ["time"] }
 # HTTP and REST
 axum = { workspace = true, features = ["macros", "multipart"] }
 http = { workspace = true }
+# Direct HTTP client for REST connector tools (bypasses OAGW). rustls + aws-lc-rs (FIPS-compatible).
+reqwest = { workspace = true, features = ["json"] }
+# URL parsing / query encoding for REST connector request building
+url = { workspace = true }
+urlencoding = { workspace = true }
 
 # Time handling
 time = { workspace = true }
@@ -107,5 +112,6 @@ k8s-openapi = { workspace = true, features = ["latest"], optional = true }
 chrono = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 temp-env = { workspace = true }
+httpmock = { workspace = true }
 
 

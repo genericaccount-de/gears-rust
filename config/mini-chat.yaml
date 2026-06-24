@@ -138,6 +138,64 @@ gears:
         summary_model_id: "gpt-4.1-mini"
         compression_threshold_pct: 80
         summary_system_prompt: "You are a conversation summarizer. Given a conversation (and optionally an existing summary), produce a detailed structured summary. Respond with an <analysis> block (your reasoning) followed by a <summary> block (the final summary). Only the <summary> content will be stored. Do not invent information not present in the conversation."
+      # ── Timer custom tool ───────────────────────────────────────────────
+      # Exposes a single `timer` function tool the model can call to track
+      # elapsed time within a chat (actions: start / elapsed / reset / list).
+      # Timers are kept in a process-local, per-chat in-memory store, so they
+      # do not survive a gear restart. Disabled by default.
+      timer:
+        enabled: true
+        # Max `timer` calls the model may make per user message (soft cap;
+        # once reached the loop injects a notice instead of failing). Default: 4.
+        max_calls_per_message: 4
+        # System-prompt guard appended when the tool is enabled. Omit to use
+        # the built-in default instructions.
+        guard: "You have access to a tool called timer for tracking elapsed time. Call it with an `action` of \"start\" (begin or restart a timer), \"elapsed\" (report how much time has passed since a timer started), \"reset\" (forget a timer), or \"list\" (show active timers). Pass a short, stable `name` derived from the user's wording (e.g. \"task1\") and reuse the exact same name when the user later asks about that timer. Omit `name` to use the default timer. Use this tool whenever the user asks to start a timer or how much time has elapsed."
+      # ── REST connector custom tools ─────────────────────────────────────
+      # Each connector is surfaced to the model as its own dedicated function
+      # tool (e.g. `search_confluence`). Calls go through a direct reqwest
+      # client that BYPASSES OAGW, so the adapter enforces its own safeguards:
+      # a host allowlist derived from each connector's base_url, blocking of
+      # private/loopback/link-local/metadata IPs, no auto-redirects, a per-request
+      # timeout, and a max-response-bytes cap. The model never sees hosts or
+      # credentials. Disabled by default.
+      rest:
+        enabled: false
+        # Max connector calls per user message (soft cap; once reached the loop
+        # injects a notice instead of failing).
+        max_calls_per_message: 4
+        # Per-request timeout in seconds.
+        timeout_secs: 15
+        # Maximum response bytes read before truncation.
+        max_response_bytes: 32768
+        connectors:
+          - tool_name: search_confluence
+            description: "Search Acronis Confluence wiki pages. Use when the user wants to find a Confluence/wiki page or internal documentation."
+            method: GET
+            base_url: "https://adn.acronis.com"
+            path: "/wiki/rest/api/search"
+            params:
+              - name: query
+                location: query
+                required: true
+                type: string
+                description: "What to search for."
+                wire_name: cql
+                value_template: 'text~"{value}"'
+            # Static headers attached to EVERY request this connector makes.
+            headers:
+              Accept: "application/json"
+              X-Atlassian-Token: "no-check"
+            # Static auth, expanded by toolkit_macros::ExpandVars. Because the
+            # REST tool bypasses OAGW it does NOT go through
+            # static-credstore-plugin — set the env var directly.
+            #
+            # CONFLUENCE_TOKEN is OPTIONAL: the `${VAR:-}` default means a missing
+            # env var expands to empty instead of failing gear startup, and the
+            # connector then omits the Authorization header entirely (rather than
+            # sending a malformed `Bearer `). To require auth, set the env var.
+            auth:
+              Authorization: "Bearer ${CONFLUENCE_TOKEN:-}"
       providers:
         azure_openai:
           kind: openai_responses
