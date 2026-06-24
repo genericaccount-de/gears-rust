@@ -259,6 +259,101 @@ async fn list_children_explicit_status_filter_returns_deleted() {
     );
 }
 
+// ---- grouped direct-child counts ------------------------------------
+
+/// `count_children_grouped` powers the public `child_count` field. It
+/// tallies *direct* children per parent in one grouped query, and the
+/// public-surface semantics differ from the delete-saga
+/// `count_children` guard: `Provisioning` is **excluded**, `Deleted`
+/// is **included**, and parents with no matching child are simply
+/// absent from the map (callers default them to `0`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn count_children_grouped_excludes_provisioning_includes_deleted() {
+    let h = setup_sqlite().await.expect("harness");
+    let root = Uuid::from_u128(ROOT_ID);
+    seed_root(&h, root).await;
+
+    let type_a = Uuid::from_u128(0xAA);
+    // Two direct children of root; `child_a` is a branch, `child_b` a leaf.
+    let child_a = Uuid::from_u128(0x201);
+    let child_b = Uuid::from_u128(0x202);
+    seed_tenant_at(&h, child_a, root, ACTIVE, false, type_a, ts_at(1)).await;
+    seed_tenant_at(&h, child_b, root, ACTIVE, false, type_a, ts_at(2)).await;
+
+    // Grandchildren under `child_a`: active + suspended + deleted are
+    // all counted (3); the provisioning row is excluded.
+    seed_tenant_at(
+        &h,
+        Uuid::from_u128(0x301),
+        child_a,
+        ACTIVE,
+        false,
+        type_a,
+        ts_at(3),
+    )
+    .await;
+    seed_tenant_at(
+        &h,
+        Uuid::from_u128(0x302),
+        child_a,
+        SUSPENDED,
+        false,
+        type_a,
+        ts_at(4),
+    )
+    .await;
+    seed_tenant_at(
+        &h,
+        Uuid::from_u128(0x303),
+        child_a,
+        DELETED,
+        false,
+        type_a,
+        ts_at(5),
+    )
+    .await;
+    seed_tenant_at(
+        &h,
+        Uuid::from_u128(0x304),
+        child_a,
+        PROVISIONING,
+        false,
+        type_a,
+        ts_at(6),
+    )
+    .await;
+
+    let counts = h
+        .repo
+        .count_children_grouped(&allow_all(), &[child_a, child_b])
+        .await
+        .expect("grouped count");
+
+    assert_eq!(
+        counts.get(&child_a).copied(),
+        Some(3),
+        "child_a: active + suspended + deleted counted; provisioning excluded"
+    );
+    assert_eq!(
+        counts.get(&child_b).copied(),
+        None,
+        "child_b has no children -> absent from the map (caller defaults to 0)"
+    );
+}
+
+/// Empty input short-circuits to an empty map (no query, no panic on an
+/// empty `IN ()` predicate).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn count_children_grouped_empty_input_is_empty() {
+    let h = setup_sqlite().await.expect("harness");
+    let counts = h
+        .repo
+        .count_children_grouped(&allow_all(), &[])
+        .await
+        .expect("grouped count");
+    assert!(counts.is_empty(), "empty parent set -> empty map");
+}
+
 /// `status` filter values outside the public SDK contract — including
 /// the AM-internal `'provisioning'` — surface as a validation error
 /// from `TenantODataMapper::map_value` before the predicate reaches

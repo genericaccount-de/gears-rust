@@ -5,10 +5,13 @@
 //! structural closure question and intentionally bypasses the per-row
 //! scope (PEP gate is the service-layer guard).
 
+use std::collections::HashMap;
+
 use account_management_sdk::TenantInfoFilterField;
 use bigdecimal::BigDecimal;
 use gts::GtsID;
-use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
+use sea_orm::sea_query::Expr;
+use sea_orm::{ColumnTrait, Condition, EntityTrait, FromQueryResult, Order, QuerySelect};
 use serde_json::Value;
 use toolkit_db::odata::sea_orm_filter::{
     FieldToColumn, LimitCfg, ODataFieldMapping, PaginateOdataTryError, paginate_odata_try,
@@ -435,6 +438,65 @@ pub(super) async fn count_children(
         .count(&connection)
         .await
         .map_err(map_scope_err)
+}
+
+/// Direct-child counts for a batch of parent ids, keyed by parent.
+///
+/// Powers the public `child_count` read-shape field (`list_children`
+/// page rows + single-tenant reads). The semantics are deliberately
+/// different from [`count_children`], which is an internal
+/// delete-saga guard (`allow_all`, always counts `Provisioning`):
+///
+/// * **Scope-filtered** — bounded by the caller's `scope` through
+///   `SecureORM`, so direct children behind a self-managed barrier the
+///   caller cannot penetrate collapse to `0`. This matches the
+///   visibility rule the rest of the public read surface obeys.
+/// * **`Provisioning` excluded** — those rows have no public
+///   representation anywhere on the SDK boundary. `Deleted` rows are
+///   *included*, mirroring that they stay reachable via
+///   `$filter=status eq 'deleted'`.
+///
+/// One grouped `COUNT ... GROUP BY parent_id` for the whole batch — no
+/// N+1 across the page. Parents with no matching child are absent from
+/// the returned map; callers default those to `0`.
+pub(super) async fn count_children_grouped(
+    repo: &TenantRepoImpl,
+    scope: &AccessScope,
+    parent_ids: &[Uuid],
+) -> Result<HashMap<Uuid, u64>, DomainError> {
+    #[derive(FromQueryResult)]
+    struct ChildCountRow {
+        parent_id: Uuid,
+        cnt: i64,
+    }
+
+    if parent_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let connection = repo.db.conn()?;
+
+    let rows = tenants::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(
+            Condition::all()
+                .add(tenants::Column::ParentId.is_in(parent_ids.iter().copied()))
+                .add(tenants::Column::Status.ne(TenantStatus::Provisioning.as_smallint())),
+        )
+        .project_all(&connection, |q| {
+            q.select_only()
+                .column(tenants::Column::ParentId)
+                .column_as(Expr::col(tenants::Column::Id).count(), "cnt")
+                .group_by(tenants::Column::ParentId)
+                .into_model::<ChildCountRow>()
+        })
+        .await
+        .map_err(map_scope_err)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.parent_id, u64::try_from(r.cnt).unwrap_or(0)))
+        .collect())
 }
 
 pub(super) async fn count_tenants_by_status(

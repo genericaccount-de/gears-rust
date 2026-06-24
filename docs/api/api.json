@@ -3667,6 +3667,12 @@
       "TenantDto": {
         "description": "AM-internal projection. Wider than `tenant_resolver_sdk::TenantInfo` for\nadmin/UI consumers (carries lifecycle timestamps + depth).\n\nInternal columns (raw `tenant_type_uuid`, retention/claim columns) never\ncross this boundary. `tenant_type: None` only on a transient registry\nblip — reads do not block on it.",
         "properties": {
+          "child_count": {
+            "description": "Number of **direct** children visible to the caller, resolved at\nread time: scope-filtered (children behind a self-managed barrier\nthe caller cannot penetrate are not counted), excludes\nAM-internal `provisioning` rows, includes soft-`deleted`\nchildren. `0` for a leaf. Derived field (not a stored column) —\nnot available in `$filter` / `$orderby`.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
           "created_at": {
             "format": "date-time",
             "type": "string"
@@ -3721,6 +3727,7 @@
           "status",
           "self_managed",
           "depth",
+          "child_count",
           "created_at",
           "updated_at"
         ],

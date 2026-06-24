@@ -646,6 +646,49 @@ async fn list_children_status_filter_applies() {
 }
 
 #[tokio::test]
+async fn list_children_reports_direct_child_count_per_child() {
+    let root = Uuid::from_u128(0x100);
+    let repo = Arc::new(FakeTenantRepo::with_root(root));
+    let svc = make_service(repo.clone(), FakeOutcome::Ok);
+
+    // Two direct children of root: `c1` is a branch, `c2` a leaf.
+    let c1 = Uuid::from_u128(0x301);
+    let c2 = Uuid::from_u128(0x302);
+    svc.create_tenant(&ctx_for(root), child_input(c1, root))
+        .await
+        .expect("c1");
+    svc.create_tenant(&ctx_for(root), child_input(c2, root))
+        .await
+        .expect("c2");
+
+    // Two grandchildren under `c1`; `c2` stays a leaf.
+    svc.create_tenant(&ctx_for(root), child_input(Uuid::from_u128(0x401), c1))
+        .await
+        .expect("gc1");
+    svc.create_tenant(&ctx_for(root), child_input(Uuid::from_u128(0x402), c1))
+        .await
+        .expect("gc2");
+
+    let page = svc
+        .list_children(&ctx_for(root), root, &ODataQuery::default())
+        .await
+        .expect("list ok");
+
+    let by_id: std::collections::HashMap<Uuid, u32> =
+        page.items.iter().map(|t| (t.id.0, t.child_count)).collect();
+    assert_eq!(
+        by_id.get(&c1).copied(),
+        Some(2),
+        "c1 surfaces its two direct children"
+    );
+    assert_eq!(
+        by_id.get(&c2).copied(),
+        Some(0),
+        "c2 is a leaf - child_count defaults to 0"
+    );
+}
+
+#[tokio::test]
 async fn update_tenant_accepts_name_then_status_transitions_via_dedicated_methods() {
     let root = Uuid::from_u128(0x100);
     let repo = Arc::new(FakeTenantRepo::with_root(root));

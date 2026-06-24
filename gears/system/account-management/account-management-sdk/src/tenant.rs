@@ -87,6 +87,16 @@ pub struct Tenant {
     /// Hierarchy depth recorded at insert. `0` for the root, `parent.depth + 1`
     /// for every child.
     pub depth: u32,
+    /// Number of **direct** children of this tenant visible to the
+    /// caller, resolved at read time. Scope-filtered (direct children
+    /// behind a self-managed barrier the caller cannot penetrate are
+    /// not counted), **excludes** AM-internal `Provisioning` rows, and
+    /// **includes** soft-`Deleted` children. `0` for a leaf. This is a
+    /// derived, read-only field — not a stored column — so it is
+    /// unavailable in `$filter` / `$orderby` over the `listChildren`
+    /// surface.
+    #[serde(default)]
+    pub child_count: u32,
     #[serde(with = "rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "rfc3339")]
