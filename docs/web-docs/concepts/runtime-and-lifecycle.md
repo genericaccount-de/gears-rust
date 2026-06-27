@@ -24,22 +24,29 @@ registry from the declared `deps`, and wires the system from those declarations.
 The runtime (`HostRuntime`) drives all gears through one shared, ordered sequence of phases:
 
 ```text
-pre_init → DB migration → init → post_init → REST wiring → gRPC wiring → start → stop
+pre_init → DB migration → init → post_init → REST wiring → gRPC wiring → start → OoP spawn → wait for cancellation → stop
 ```
 
-- **`pre_init`** — setup before migrations run.
-- **DB migration** — gear-owned migrations executed by the runtime.
+- **`pre_init`** — setup before migrations run (system gears only).
+- **DB migration** — gear-owned migrations executed by the runtime (gears with `db` capability).
 - **`init`** — build services, resolve dependencies via `ClientHub`, and register the gear's
   own SDK implementation.
 - **`post_init`** — a **barrier**: it begins only after every gear's `init` has completed, so
-  any cross-gear wiring is safe here.
+  any cross-gear wiring is safe here (system gears only).
 - **REST / gRPC wiring** — routes and gRPC services are registered.
-- **`start` / `stop`** — background work starts; shutdown runs in **reverse dependency
-  order** with a platform deadline. Cancellation tokens propagate so background tasks
-  cooperate with shutdown rather than outliving the host.
+- **`start`** — background work starts for stateful gears.
+- **`OoP spawn`** — out-of-process gears are spawned after the gRPC hub is listening, so they
+  can connect to the directory endpoint.
+- **Wait for cancellation** — the runtime blocks until a cancellation signal is received
+  (Ctrl-C, SIGTERM, or programmatic).
+- **`stop`** — shutdown runs in **reverse dependency order** with a platform deadline.
+  Cancellation tokens propagate so background tasks cooperate with shutdown rather than
+  outliving the host.
 
 This gives every gear one predictable operational model — stable ordering, shared
 cancellation semantics, and consistent startup/shutdown — instead of ad-hoc lifecycle code.
+
+![Runtime lifecycle](../assets/runtime-lifecycle.drawio.svg)
 
 ## Async boundaries
 

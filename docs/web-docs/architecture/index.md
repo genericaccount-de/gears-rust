@@ -24,19 +24,25 @@ The runtime (`HostRuntime`) discovers every gear, builds a dependency-ordered re
 drives all gears through one shared sequence of phases:
 
 ```text
-pre_init → DB migration → init → post_init → REST wiring → gRPC wiring → start → stop
+pre_init → DB migration → init → post_init → REST wiring → gRPC wiring → start → OoP spawn → wait for cancellation → stop
 ```
 
-- **`pre_init`** — setup before migrations run.
-- **DB migration** — gear-owned migrations executed by the runtime.
-- **`init`** — build services, resolve dependencies via `ClientHub`, register the gear's
-  own SDK implementation.
-- **`post_init`** — a **barrier**: it begins only after every gear's `init` has completed,
-  so cross-gear wiring is safe here.
-- **REST / gRPC wiring** — routes and gRPC services are registered.
-- **`start` / `stop`** — background work starts; shutdown runs in **reverse dependency
-  order** with a platform deadline. Cancellation tokens propagate so background tasks
-  cooperate with shutdown instead of outliving the host.
+1. **`pre_init`** — setup before migrations run (system gears only).
+2. **DB migration** — gear-owned migrations executed by the runtime (gears with `db` capability).
+3. **`init`** — build services, resolve dependencies via `ClientHub`, register the gear's
+   own SDK implementation.
+4. **`post_init`** — a **barrier**: it begins only after every gear's `init` has completed,
+   so cross-gear wiring is safe here (system gears only).
+5. **REST wiring** — routes registered with the API Gateway (gears with `rest` capability).
+6. **gRPC wiring** — gRPC services registered with the gRPC hub (gears with `grpc` capability).
+7. **`start`** — background work starts for stateful gears.
+8. **OoP spawn** — out-of-process gears are spawned after the gRPC hub is listening.
+9. **Wait for cancellation** — the runtime blocks until a cancellation signal (Ctrl-C, SIGTERM).
+10. **`stop`** — shutdown runs in **reverse dependency order** with a platform deadline.
+    Cancellation tokens propagate so background tasks cooperate with shutdown instead of
+    outliving the host.
+
+![Runtime lifecycle](../assets/runtime-lifecycle.drawio.svg)
 
 A gear opts into work in each phase by declaring **capabilities** (`db`, `rest`, `grpc`,
 `stateful`) and implementing the matching capability traits (e.g. `DatabaseCapability`,

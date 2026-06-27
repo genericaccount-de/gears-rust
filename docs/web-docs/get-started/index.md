@@ -81,6 +81,24 @@ curl -s "http://127.0.0.1:8087/cf/users-info/v1/users" | python3 -m json.tool
 pkill -f cf-gears-server
 ```
 
+## Alternative: use the CLI
+
+If you prefer to scaffold and run a Gears project from scratch instead of using
+the example server, the `cargo gears` CLI provides a manifest-driven workflow:
+
+```sh
+cargo install cargo-gears
+cargo gears new /tmp/cf-demo
+cd /tmp/cf-demo
+cargo gears generate module --template background-worker
+cargo gears generate config --template dev --app app1 --env dev
+cargo gears config mod add background-worker -c config/app1-dev.yml
+cargo gears run --app app1 --env dev
+```
+
+See the [CLI getting started guide](/cli/getting-started/) for a full end-to-end
+walkthrough and the [command reference](/cli/commands/) for every command.
+
 ## Next
 
 - [Build your first gear](/get-started/your-first-gear/) — write an SDK, a domain service,

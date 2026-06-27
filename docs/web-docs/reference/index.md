@@ -18,6 +18,8 @@ designed and documented but not yet in the source tree.
 
 The low-level substrate every gear builds on.
 
+![Libraries dependency graph](../assets/libs-dependencies.drawio.svg)
+
 | Crate | What it provides | Key types / macros |
 | --- | --- | --- |
 | `toolkit` | Core runtime: gear lifecycle (`HostRuntime`), in-process composition (`ClientHub`), REST/OpenAPI wiring, SSE, transactional outbox, telemetry | `#[toolkit::gear]`, `GearCtx`, `ClientHub`, `OperationBuilder`, `SseBroadcaster` |

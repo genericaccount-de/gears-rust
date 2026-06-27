@@ -47,6 +47,9 @@ Gears ships a substantial substrate so you build features, not plumbing:
 - **Observability** — OpenTelemetry tracing, request IDs, and health endpoints.
 - **Out-of-process gears** over gRPC, selected by configuration — no code changes.
 - **FIPS 140-3-ready** crypto on Linux, macOS, and Windows.
+- **`cargo gears` CLI** — a manifest-driven command-line tool for scaffolding
+  workspaces, generating runnable servers, managing runtime config, building,
+  deploying, and linting. See the [CLI documentation](/cli/).
 
 See [Components & features](/reference/) for the full catalog of toolkit libraries
 and ready-made system gears.

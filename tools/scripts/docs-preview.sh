@@ -52,9 +52,9 @@ cd "$CACHE_DIR"
 if command -v pnpm >/dev/null 2>&1; then
   pnpm install
   echo "==> Starting docs site at http://localhost:4321 (content from $REPO_ROOT/docs/web-docs)"
-  GEARS_RUST_PATH="$REPO_ROOT" pnpm dev
+  GEARS_RUST_PATH="$REPO_ROOT" BASE=/ pnpm dev
 else
   npm install
   echo "==> Starting docs site at http://localhost:4321 (content from $REPO_ROOT/docs/web-docs)"
-  GEARS_RUST_PATH="$REPO_ROOT" npm run dev
+  GEARS_RUST_PATH="$REPO_ROOT" BASE=/ npm run dev
 fi
