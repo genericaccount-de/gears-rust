@@ -2,9 +2,10 @@
 //!
 //! Owns the P1 flows: create + presign upload, finalize + bind (optimistic CAS),
 //! download-URL issuance, metadata CRUD, listing, versioning, and delete. It
-//! depends on the repositories (tenant-scoped persistence), the backend registry
-//! (byte storage), the signed-URL issuer, and an [`Authorizer`]. Content bytes
-//! never flow through this service — they move via [`crate::domain::data_plane::DataPlaneService`].
+//! depends on the [`Store`] persistence facade (tenant-scoped persistence), the
+//! backend registry (byte storage), the signed-URL issuer, and an [`Authorizer`].
+//! Content bytes never flow through this service — they move via
+//! [`crate::domain::data_plane::DataPlaneService`].
 
 // Domain terms (ETag, If-Match, FileStorage, GET/PUT) recur throughout the docs.
 #![allow(clippy::doc_markdown)]
@@ -12,22 +13,19 @@
 use std::sync::Arc;
 
 use time::OffsetDateTime;
-use toolkit_db::{DBProvider, DbError};
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use file_storage_sdk::{
     CustomMetadataEntry, CustomMetadataPatch, File, FileVersion, NewFile, OwnerFilter,
-    VersionStatus,
 };
 
 use crate::domain::authz::{Authorizer, actions};
 use crate::domain::error::DomainError;
 use crate::domain::etag;
 use crate::infra::backend::{BackendCapabilities, BackendRegistry};
-use crate::infra::content::hash;
 use crate::infra::signed_url::{Claims, Issuer, Op, UploadConstraints};
-use crate::infra::storage::repo::{FileRepo, MetadataRepo, VersionRepo};
+use crate::infra::storage::Store;
 
 /// Service-level configuration distilled from [`crate::config::FileStorageConfig`].
 #[allow(unknown_lints, de0309_must_have_domain_model)]
@@ -63,10 +61,7 @@ pub struct DownloadTicket {
 /// The control-plane file service.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 pub struct FileService {
-    db: Arc<DBProvider<DbError>>,
-    files: FileRepo,
-    versions: VersionRepo,
-    metadata: MetadataRepo,
+    store: Store,
     backends: BackendRegistry,
     issuer: Arc<Issuer>,
     authorizer: Arc<dyn Authorizer>,
@@ -74,19 +69,15 @@ pub struct FileService {
 }
 
 impl FileService {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        db: Arc<DBProvider<DbError>>,
+        store: Store,
         backends: BackendRegistry,
         issuer: Arc<Issuer>,
         authorizer: Arc<dyn Authorizer>,
         cfg: ServiceConfig,
     ) -> Self {
         Self {
-            db,
-            files: FileRepo::new(),
-            versions: VersionRepo::new(),
-            metadata: MetadataRepo::new(),
+            store,
             backends,
             issuer,
             authorizer,
@@ -143,19 +134,6 @@ impl FileService {
         ))
     }
 
-    /// Fetch a file within the caller's tenant or fail with `FileNotFound`.
-    async fn require_file<C: toolkit_db::secure::DBRunner>(
-        &self,
-        conn: &C,
-        scope: &AccessScope,
-        file_id: Uuid,
-    ) -> Result<File, DomainError> {
-        self.files
-            .get(conn, scope, file_id)
-            .await?
-            .ok_or_else(|| DomainError::file_not_found(file_id))
-    }
-
     // ── create + presign ─────────────────────────────────────────────────────
 
     /// `POST /files`: create a file and presign the first content upload.
@@ -170,7 +148,6 @@ impl FileService {
             .authorize(ctx, actions::WRITE, &new.gts_file_type, None)
             .await?;
 
-        let conn = self.db.conn().map_err(DomainError::from)?;
         let now = OffsetDateTime::now_utc();
         let file_id = Uuid::now_v7();
         let version_id = Uuid::now_v7();
@@ -178,46 +155,17 @@ impl FileService {
         let backend_id = backend.id().to_owned();
         let backend_path = Self::backend_path(file_id, version_id);
 
-        let file = File {
-            file_id,
-            tenant_id: ctx.subject_tenant_id(),
-            owner_kind: new.owner_kind,
-            owner_id: new.owner_id,
-            name: new.name,
-            gts_file_type: new.gts_file_type.clone(),
-            content_id: None,
-            meta_version: 0,
-            created_at: now,
-            last_modified_at: now,
-        };
-        self.files
-            .create(&conn, &AccessScope::allow_all(), &file)
+        self.store
+            .create_file_with_pending_version(
+                &new,
+                file_id,
+                version_id,
+                ctx.subject_tenant_id(),
+                &backend_id,
+                &backend_path,
+                now,
+            )
             .await?;
-
-        let pending = pending_version(
-            file_id,
-            version_id,
-            &new.mime_type,
-            &backend_id,
-            &backend_path,
-            now,
-        );
-        self.versions
-            .insert(&conn, &AccessScope::allow_all(), &pending)
-            .await?;
-
-        for entry in &new.custom_metadata {
-            self.metadata
-                .upsert(
-                    &conn,
-                    &AccessScope::allow_all(),
-                    file_id,
-                    &entry.key,
-                    &entry.value,
-                    now,
-                )
-                .await?;
-        }
 
         let upload_url = self.sign_url(
             Op::Put,
@@ -244,8 +192,7 @@ impl FileService {
         file_id: Uuid,
     ) -> Result<UploadTicket, DomainError> {
         let prefetch = Self::tenant_scope(ctx);
-        let conn = self.db.conn().map_err(DomainError::from)?;
-        let file = self.require_file(&conn, &prefetch, file_id).await?;
+        let file = self.store.require_file(&prefetch, file_id).await?;
         let _scope = self
             .authorizer
             .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(file_id))
@@ -259,19 +206,20 @@ impl FileService {
 
         // Reuse the current version's mime as the declared type placeholder.
         let mime_type = self
-            .current_version_mime(&conn, &AccessScope::allow_all(), &file)
+            .store
+            .current_version_mime(&file)
             .await
             .unwrap_or_else(|| "application/octet-stream".to_owned());
-        let pending = pending_version(
-            file_id,
-            version_id,
-            &mime_type,
-            &backend_id,
-            &backend_path,
-            now,
-        );
-        self.versions
-            .insert(&conn, &AccessScope::allow_all(), &pending)
+
+        self.store
+            .insert_pending_version(
+                file_id,
+                version_id,
+                &mime_type,
+                &backend_id,
+                &backend_path,
+                now,
+            )
             .await?;
 
         let upload_url = self.sign_url(
@@ -291,21 +239,6 @@ impl FileService {
         })
     }
 
-    async fn current_version_mime<C: toolkit_db::secure::DBRunner>(
-        &self,
-        conn: &C,
-        scope: &AccessScope,
-        file: &File,
-    ) -> Option<String> {
-        let content_id = file.content_id?;
-        self.versions
-            .get(conn, scope, file.file_id, content_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|v| v.mime_type)
-    }
-
     // ── finalize + bind (the optimistic CAS) ──────────────────────────────────
 
     /// Record an uploaded version's size+hash and mark it available. Called by
@@ -319,22 +252,14 @@ impl FileService {
         hash_value: Vec<u8>,
     ) -> Result<(), DomainError> {
         let prefetch = Self::tenant_scope(ctx);
-        let conn = self.db.conn().map_err(DomainError::from)?;
-        let file = self.require_file(&conn, &prefetch, file_id).await?;
+        let file = self.store.require_file(&prefetch, file_id).await?;
         let _scope = self
             .authorizer
             .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(file_id))
             .await?;
         let ok = self
-            .versions
-            .finalize(
-                &conn,
-                &AccessScope::allow_all(),
-                file_id,
-                version_id,
-                size,
-                hash_value,
-            )
+            .store
+            .finalize_version(file_id, version_id, size, hash_value)
             .await?;
         if !ok {
             return Err(DomainError::version_not_found(file_id, version_id));
@@ -357,8 +282,7 @@ impl FileService {
         if_match: Option<&str>,
     ) -> Result<File, DomainError> {
         let prefetch = Self::tenant_scope(ctx);
-        let conn = self.db.conn().map_err(DomainError::from)?;
-        let file = self.require_file(&conn, &prefetch, file_id).await?;
+        let file = self.store.require_file(&prefetch, file_id).await?;
         let scope = self
             .authorizer
             .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(file_id))
@@ -366,11 +290,11 @@ impl FileService {
 
         // The version must exist and be available.
         let version = self
-            .versions
-            .get(&conn, &AccessScope::allow_all(), file_id, version_id)
+            .store
+            .get_version(file_id, version_id)
             .await?
             .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
-        if version.status != VersionStatus::Available {
+        if version.status != file_storage_sdk::VersionStatus::Available {
             return Err(DomainError::conflict(
                 "cannot bind a version whose upload has not been finalized",
             ));
@@ -404,37 +328,9 @@ impl FileService {
         // transaction so `files.content_id` and `file_versions.is_current` can
         // never diverge if a later write fails (DESIGN §3.7 bind invariant).
         let now = OffsetDateTime::now_utc();
-        let files = self.files.clone();
-        let versions = self.versions.clone();
-        let bind_scope = scope.clone();
         let swapped = self
-            .db
-            .db()
-            .transaction_ref_mapped(move |tx| {
-                Box::pin(async move {
-                    let swapped = files
-                        .bind_content_cas(
-                            tx,
-                            &bind_scope,
-                            file_id,
-                            expected_content_id,
-                            version_id,
-                            now,
-                        )
-                        .await?;
-                    if !swapped {
-                        return Ok(false);
-                    }
-                    // Promote the new version as current (unique-current index honoured).
-                    versions
-                        .clear_current(tx, &AccessScope::allow_all(), file_id)
-                        .await?;
-                    versions
-                        .set_current(tx, &AccessScope::allow_all(), file_id, version_id)
-                        .await?;
-                    Ok::<bool, DomainError>(true)
-                })
-            })
+            .store
+            .bind_atomic(&scope, file_id, expected_content_id, version_id, now)
             .await?;
         if !swapped {
             return Err(DomainError::precondition_failed(
@@ -442,7 +338,7 @@ impl FileService {
             ));
         }
 
-        self.require_file(&conn, &scope, file_id).await
+        self.store.require_file(&scope, file_id).await
     }
 
     // ── reads ─────────────────────────────────────────────────────────────────
@@ -454,13 +350,12 @@ impl FileService {
         file_id: Uuid,
     ) -> Result<File, DomainError> {
         let prefetch = Self::tenant_scope(ctx);
-        let conn = self.db.conn().map_err(DomainError::from)?;
-        let file = self.require_file(&conn, &prefetch, file_id).await?;
+        let file = self.store.require_file(&prefetch, file_id).await?;
         let scope = self
             .authorizer
             .authorize(ctx, actions::READ, &file.gts_file_type, Some(file_id))
             .await?;
-        self.require_file(&conn, &scope, file_id).await
+        self.store.require_file(&scope, file_id).await
     }
 
     /// Get a file plus its custom metadata.
@@ -470,11 +365,7 @@ impl FileService {
         file_id: Uuid,
     ) -> Result<(File, Vec<CustomMetadataEntry>), DomainError> {
         let file = self.get_file(ctx, file_id).await?;
-        let conn = self.db.conn().map_err(DomainError::from)?;
-        let meta = self
-            .metadata
-            .list(&conn, &AccessScope::allow_all(), file_id)
-            .await?;
+        let meta = self.store.list_metadata(file_id).await?;
         Ok((file, meta))
     }
 
@@ -494,9 +385,8 @@ impl FileService {
         let limit = limit
             .unwrap_or(self.cfg.default_page_size)
             .min(self.cfg.max_page_size);
-        let conn = self.db.conn().map_err(DomainError::from)?;
-        self.files
-            .list(&conn, &Self::tenant_scope(ctx), owner, limit, offset)
+        self.store
+            .list_files(&Self::tenant_scope(ctx), owner, limit, offset)
             .await
     }
 
@@ -512,8 +402,7 @@ impl FileService {
         expected_meta_version: Option<i64>,
     ) -> Result<File, DomainError> {
         let prefetch = Self::tenant_scope(ctx);
-        let conn = self.db.conn().map_err(DomainError::from)?;
-        let file = self.require_file(&conn, &prefetch, file_id).await?;
+        let file = self.store.require_file(&prefetch, file_id).await?;
         let scope = self
             .authorizer
             .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(file_id))
@@ -526,40 +415,16 @@ impl FileService {
         // per-key delete-then-insert upsert is also covered by the rollback, so
         // a failed insert can never leave a key permanently removed.
         let now = OffsetDateTime::now_utc();
-        let files = self.files.clone();
-        let metadata = self.metadata.clone();
-        let patch_scope = scope.clone();
-        self.db
-            .db()
-            .transaction_ref_mapped(move |tx| {
-                Box::pin(async move {
-                    let bumped = files
-                        .touch_meta(tx, &patch_scope, file_id, expected_meta_version, now)
-                        .await?;
-                    if !bumped {
-                        return Err(DomainError::precondition_failed(
-                            "metadata revision changed concurrently (If-Match-Metadata)",
-                        ));
-                    }
-                    for (key, value) in &patch.entries {
-                        match value {
-                            Some(v) => {
-                                metadata
-                                    .upsert(tx, &AccessScope::allow_all(), file_id, key, v, now)
-                                    .await?;
-                            }
-                            None => {
-                                metadata
-                                    .delete_key(tx, &AccessScope::allow_all(), file_id, key)
-                                    .await?;
-                            }
-                        }
-                    }
-                    Ok::<(), DomainError>(())
-                })
-            })
+        let bumped = self
+            .store
+            .patch_metadata_atomic(&scope, file_id, expected_meta_version, patch, now)
             .await?;
-        self.require_file(&conn, &scope, file_id).await
+        if !bumped {
+            return Err(DomainError::precondition_failed(
+                "metadata revision changed concurrently (If-Match-Metadata)",
+            ));
+        }
+        self.store.require_file(&scope, file_id).await
     }
 
     // ── delete ──────────────────────────────────────────────────────────────────
@@ -572,19 +437,15 @@ impl FileService {
         file_id: Uuid,
     ) -> Result<(), DomainError> {
         let prefetch = Self::tenant_scope(ctx);
-        let conn = self.db.conn().map_err(DomainError::from)?;
-        let file = self.require_file(&conn, &prefetch, file_id).await?;
+        let file = self.store.require_file(&prefetch, file_id).await?;
         let scope = self
             .authorizer
             .authorize(ctx, actions::DELETE, &file.gts_file_type, Some(file_id))
             .await?;
 
         // Collect backend blobs before the metadata row (and FK children) vanish.
-        let versions = self
-            .versions
-            .list_by_file(&conn, &AccessScope::allow_all(), file_id)
-            .await?;
-        let removed = self.files.delete(&conn, &scope, file_id).await?;
+        let versions = self.store.list_versions(file_id).await?;
+        let removed = self.store.delete_file(&scope, file_id).await?;
         if !removed {
             return Err(DomainError::file_not_found(file_id));
         }
@@ -607,8 +468,7 @@ impl FileService {
         version_id: Option<Uuid>,
     ) -> Result<DownloadTicket, DomainError> {
         let prefetch = Self::tenant_scope(ctx);
-        let conn = self.db.conn().map_err(DomainError::from)?;
-        let file = self.require_file(&conn, &prefetch, file_id).await?;
+        let file = self.store.require_file(&prefetch, file_id).await?;
         let _scope = self
             .authorizer
             .authorize(ctx, actions::READ, &file.gts_file_type, Some(file_id))
@@ -621,8 +481,8 @@ impl FileService {
                 .ok_or_else(|| DomainError::conflict("file has no bound content yet"))?,
         };
         let version = self
-            .versions
-            .get(&conn, &AccessScope::allow_all(), file_id, target)
+            .store
+            .get_version(file_id, target)
             .await?
             .ok_or_else(|| DomainError::version_not_found(file_id, target))?;
 
@@ -650,15 +510,12 @@ impl FileService {
         file_id: Uuid,
     ) -> Result<Vec<FileVersion>, DomainError> {
         let prefetch = Self::tenant_scope(ctx);
-        let conn = self.db.conn().map_err(DomainError::from)?;
-        let file = self.require_file(&conn, &prefetch, file_id).await?;
+        let file = self.store.require_file(&prefetch, file_id).await?;
         let _scope = self
             .authorizer
             .authorize(ctx, actions::READ, &file.gts_file_type, Some(file_id))
             .await?;
-        self.versions
-            .list_by_file(&conn, &AccessScope::allow_all(), file_id)
-            .await
+        self.store.list_versions(file_id).await
     }
 
     /// Restore a prior version as current (a rebind: pointer swap, no re-upload).
@@ -683,17 +540,13 @@ impl FileService {
         version_id: Uuid,
     ) -> Result<(), DomainError> {
         let prefetch = Self::tenant_scope(ctx);
-        let conn = self.db.conn().map_err(DomainError::from)?;
-        let file = self.require_file(&conn, &prefetch, file_id).await?;
+        let file = self.store.require_file(&prefetch, file_id).await?;
         let _scope = self
             .authorizer
             .authorize(ctx, actions::DELETE, &file.gts_file_type, Some(file_id))
             .await?;
 
-        let all = self
-            .versions
-            .list_by_file(&conn, &AccessScope::allow_all(), file_id)
-            .await?;
+        let all = self.store.list_versions(file_id).await?;
         if all.len() <= 1 {
             // Last version → delete the whole file.
             return self.delete_file(ctx, file_id).await;
@@ -706,9 +559,7 @@ impl FileService {
                 "cannot delete the current version; bind another version first",
             ));
         }
-        self.versions
-            .delete(&conn, &AccessScope::allow_all(), file_id, version_id)
-            .await?;
+        self.store.delete_version(file_id, version_id).await?;
         self.best_effort_blob_delete(&version.backend_id, &version.backend_path)
             .await;
         Ok(())
@@ -746,9 +597,9 @@ impl FileService {
         &self.backends
     }
 
-    /// Database provider (shared with the data plane).
-    pub(crate) fn db(&self) -> &Arc<DBProvider<DbError>> {
-        &self.db
+    /// Store (shared with the data plane).
+    pub(crate) fn store(&self) -> &Store {
+        &self.store
     }
 }
 
@@ -759,29 +610,4 @@ struct VersionRef {
     version_id: Uuid,
     backend_id: String,
     backend_path: String,
-}
-
-/// Build a `pending` version row with placeholder size/hash (filled at finalize).
-fn pending_version(
-    file_id: Uuid,
-    version_id: Uuid,
-    mime_type: &str,
-    backend_id: &str,
-    backend_path: &str,
-    now: OffsetDateTime,
-) -> FileVersion {
-    FileVersion {
-        file_id,
-        version_id,
-        mime_type: mime_type.to_owned(),
-        size: 0,
-        hash_algorithm: hash::ALGORITHM.to_owned(),
-        // 32 zero bytes — satisfies the NOT NULL + length-32 CHECK until finalize.
-        hash_value: vec![0u8; 32],
-        status: VersionStatus::Pending,
-        is_current: false,
-        backend_id: backend_id.to_owned(),
-        backend_path: backend_path.to_owned(),
-        created_at: now,
-    }
 }

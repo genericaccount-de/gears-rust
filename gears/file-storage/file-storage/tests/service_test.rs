@@ -21,6 +21,7 @@ use file_storage::domain::etag;
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
 use file_storage::infra::signed_url::Issuer;
+use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
 use file_storage_sdk::{CustomMetadataEntry, CustomMetadataPatch, NewFile, OwnerFilter, OwnerKind};
 
@@ -62,7 +63,8 @@ async fn build_service() -> (Arc<FileService>, DataPlaneService) {
         default_page_size: 50,
         max_page_size: 1000,
     };
-    let svc = Arc::new(FileService::new(db, backends, issuer, authorizer, cfg));
+    let store = Store::new(Arc::clone(&db));
+    let svc = Arc::new(FileService::new(store, backends, issuer, authorizer, cfg));
     let dp = DataPlaneService::new(Arc::clone(&svc));
     (svc, dp)
 }

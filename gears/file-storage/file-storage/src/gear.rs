@@ -21,6 +21,7 @@ use crate::domain::service::{FileService, ServiceConfig};
 use crate::infra::authz::PolicyEnforcerAuthorizer;
 use crate::infra::backend::{BackendRegistry, InMemoryBackend, LocalFsBackend, StorageBackend};
 use crate::infra::signed_url::Issuer;
+use crate::infra::storage::Store;
 
 /// Default + in-memory backend ids configured in P1 (static).
 const LOCAL_FS_ID: &str = "local-fs";
@@ -108,7 +109,10 @@ impl Gear for FileStorageGear {
             max_page_size: cfg.max_page_size,
         };
 
-        let service = Arc::new(FileService::new(db, backends, issuer, authorizer, svc_cfg));
+        let store = Store::new(Arc::clone(&db));
+        let service = Arc::new(FileService::new(
+            store, backends, issuer, authorizer, svc_cfg,
+        ));
         self.service
             .set(service)
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;

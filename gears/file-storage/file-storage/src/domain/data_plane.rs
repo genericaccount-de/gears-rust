@@ -21,8 +21,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use toolkit_db::{DBProvider, DbError};
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use file_storage_sdk::ByteRange;
@@ -31,37 +30,33 @@ use crate::domain::error::DomainError;
 use crate::domain::service::FileService;
 use crate::infra::backend::BackendRegistry;
 use crate::infra::content::{hash, mime};
-use crate::infra::storage::repo::VersionRepo;
+use crate::infra::storage::Store;
 
 /// Data-plane service: moves bytes between callers and the storage backend.
 ///
 /// Constructed from an `Arc<FileService>` to access the control-plane
-/// `finalize_upload` callback; it borrows the backend registry and DB from the
-/// same `FileService` via `pub(crate)` accessors.
+/// `finalize_upload` callback; it borrows the backend registry and `Store`
+/// from the same `FileService` via `pub(crate)` accessors.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 pub struct DataPlaneService {
     control: Arc<FileService>,
     backends: BackendRegistry,
-    db: Arc<DBProvider<DbError>>,
-    versions: VersionRepo,
+    store: Store,
 }
 
 impl DataPlaneService {
     /// Build a `DataPlaneService` that delegates finalize to `control`.
     ///
-    /// The backends, DB connection pool, and version repository are cloned from
-    /// the control-plane service so both layers share the same resources without
-    /// duplication.
+    /// The backends and `Store` are cloned from the control-plane service so
+    /// both layers share the same resources without duplication.
     #[must_use]
     pub fn new(control: Arc<FileService>) -> Self {
         let backends = control.backends().clone();
-        let db = control.db().clone();
-        let versions = VersionRepo::new();
+        let store = control.store().clone();
         Self {
             control,
             backends,
-            db,
-            versions,
+            store,
         }
     }
 
@@ -81,10 +76,9 @@ impl DataPlaneService {
         // Content-type validation against the actual bytes.
         mime::validate(declared_mime, &bytes)?;
 
-        let conn = self.db.conn().map_err(DomainError::from)?;
         let version = self
-            .versions
-            .get(&conn, &AccessScope::allow_all(), file_id, version_id)
+            .store
+            .get_version(file_id, version_id)
             .await?
             .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
 
@@ -106,10 +100,9 @@ impl DataPlaneService {
         version_id: Uuid,
         range: Option<ByteRange>,
     ) -> Result<Bytes, DomainError> {
-        let conn = self.db.conn().map_err(DomainError::from)?;
         let version = self
-            .versions
-            .get(&conn, &AccessScope::allow_all(), file_id, version_id)
+            .store
+            .get_version(file_id, version_id)
             .await?
             .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
 
