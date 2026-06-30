@@ -52,6 +52,8 @@ members = [
     "gears/credstore/credstore",
     "gears/credstore/plugins/static-credstore-plugin",
     "gears/file-parser",
+    "gears/file-storage/file-storage-sdk",
+    "gears/file-storage/file-storage",
     "gears/system/account-management/account-management",
     "gears/system/account-management/account-management-sdk",
     "gears/system/account-management/plugins/static-idp-plugin",

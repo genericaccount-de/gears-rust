@@ -11,6 +11,8 @@ use authz_resolver as _;
 use credstore as _;
 #[cfg(not(feature = "oop-example"))]
 use file_parser as _;
+#[cfg(feature = "file-storage")]
+use file_storage as _;
 use gear_orchestrator as _;
 use grpc_hub as _;
 use nodes_registry as _;

@@ -200,14 +200,21 @@ pub fn is_in_sdk_crate(cx: &rustc_lint::EarlyContext<'_>, span: Span) -> bool {
 
 /// Check if span is within the allow-list for non-FIPS hasher imports (DE0708).
 ///
-/// Currently empty — all direct `sha2`/`sha1`/`md5` call sites have been
-/// replaced. The only remaining `sha2` usage (`rustls-corecrypto-provider`)
-/// is `#[cfg(test)]`-gated and invisible to the lint.
+/// Entries are confined `sha2` call sites approved per `SECURITY.md §9`:
+/// - `gears/file-storage/file-storage/src/infra/content/hash.rs` — the single
+///   SHA-256 site in file-storage, used for content addressing/integrity
+///   (`expected_hash`, version identity) and the opaque ETag, **not** for
+///   signatures. The signed-URL signing primitive lives behind its own
+///   provider abstraction (ADR-0004), not here.
 ///
-/// Add entries here if a legitimate non-cryptographic or FIPS-validated
-/// usage is introduced in the future.
-pub fn is_in_hasher_allow_list(_source_map: &SourceMap, _span: Span) -> bool {
-    false
+/// Add entries here only for legitimate non-cryptographic or FIPS-validated
+/// usage, with a corresponding `SECURITY.md §9` disclaimer.
+pub fn is_in_hasher_allow_list(source_map: &SourceMap, span: Span) -> bool {
+    check_span_path(
+        source_map,
+        span,
+        "gears/file-storage/file-storage/src/infra/content/hash.rs",
+    ) || check_span_path(source_map, span, "file-storage/src/infra/content/hash.rs")
 }
 
 /// Check if span is within libs/toolkit-db/ - the internal sqlx wrapper library

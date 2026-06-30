@@ -1530,6 +1530,7 @@ dependencies = [
  "cf-gears-authz-resolver",
  "cf-gears-credstore",
  "cf-gears-file-parser",
+ "cf-gears-file-storage",
  "cf-gears-gear-orchestrator",
  "cf-gears-grpc-hub",
  "cf-gears-mini-chat",
@@ -1583,6 +1584,50 @@ dependencies = [
  "tokio",
  "tracing",
  "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-file-storage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "cf-gears-authz-resolver-sdk",
+ "cf-gears-file-storage-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-db",
+ "cf-gears-toolkit-db-macros",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
+ "hex",
+ "http",
+ "infer",
+ "inventory",
+ "ring",
+ "sea-orm",
+ "sea-orm-migration",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tracing",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-file-storage-sdk"
+version = "0.1.0"
+dependencies = [
+ "cf-gears-toolkit-canonical-errors",
+ "time",
  "uuid",
 ]
 

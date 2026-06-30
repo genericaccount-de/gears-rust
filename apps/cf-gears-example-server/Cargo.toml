@@ -28,6 +28,7 @@ k8s = ["mini-chat/k8s"]
 otel = ["toolkit/otel"]
 account-management = ["dep:account_management"]
 static-idp = ["dep:static-idp-plugin"]
+file-storage = ["dep:file_storage"]
 
 [dependencies]
 mimalloc = { version = "0.1" }
@@ -61,6 +62,7 @@ resource_group = { package = "cf-gears-resource-group", path = "../../gears/syst
 
 # user modules
 file_parser = { package = "cf-gears-file-parser", path = "../../gears/file-parser" }
+file_storage = { package = "cf-gears-file-storage", path = "../../gears/file-storage/file-storage", optional = true }
 nodes_registry = { package = "cf-gears-nodes-registry", path = "../../gears/system/nodes-registry/nodes-registry" }
 simple_user_settings = { package = "cf-gears-simple-user-settings", path = "../../gears/simple-user-settings/simple-user-settings" }
 credstore = { package = "cf-gears-credstore", path = "../../gears/credstore/credstore" }

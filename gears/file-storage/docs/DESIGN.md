@@ -1777,8 +1777,8 @@ with the design intent above and is recorded here so the doc matches what ships.
   independently of the PDP (point operations prefetch within the caller's tenant; listing applies the tenant scope).
 - **Listing.** Offset pagination with a mandatory owner filter (PRD allows offset *or* cursor); OData `$filter`/
   `$orderby` is a deferred enhancement.
-- **Remaining for full P1** (tracked in [PLAN-P1.md §7](./PLAN-P1.md)): wiring the sidecar→control s2s callback
-  end-to-end, a PostgreSQL E2E pass, TOML-driven `backend-config-source`, and the FIPS crate/provider selection.
+- **Remaining for full P1**: wiring the sidecar→control s2s callback end-to-end, a PostgreSQL E2E pass,
+  TOML-driven `backend-config-source`, and the FIPS crate/provider selection.
 
 ## 5. Traceability
 
