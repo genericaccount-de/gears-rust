@@ -6,8 +6,10 @@ package continue to run against the shared CI server (they don't use test_env).
 
 Prerequisites
 -------------
-* ``E2E_BINARY`` must point at a ``cf-gears-example-server`` binary built with
-  ``--features file-storage``.  Without it the whole package is skipped.
+* ``FS_E2E_BINARY`` must point at a ``cf-gears-example-server`` binary built
+  with ``--features file-storage``.  Without it the whole package is skipped.
+  A dedicated var (not the shared ``E2E_BINARY``) so enabling this suite does
+  not accidentally un-skip other gears (e.g. mini-chat) gated on ``E2E_BINARY``.
 * ``FS_SIDECAR_BINARY`` (optional) may point at a pre-built ``sidecar`` binary.
   If absent the conftest resolves ``target/debug/sidecar`` relative to the repo
   root (same strategy as the orchestrator's server binary fallback).
@@ -336,21 +338,23 @@ def require_file_storage_mounted():
 
 @pytest.fixture(scope="session", autouse=True)
 def _require_e2e_binary():
-    """Skip the whole lifecycle package when E2E_BINARY is not set.
+    """Skip the whole lifecycle package when FS_E2E_BINARY is not set.
 
     The lifecycle tests need a server binary built with --features file-storage
-    AND the sidecar binary.  Without E2E_BINARY we skip gracefully (mirrors the
-    mini-chat conftest pattern).
+    AND the sidecar binary.  We gate on a DEDICATED env var (``FS_E2E_BINARY``)
+    rather than the shared ``E2E_BINARY`` so that enabling this suite does not
+    accidentally un-skip other gears (e.g. mini-chat) that gate on ``E2E_BINARY``
+    and expect their own scoped invocation (``make e2e-mini-chat``).
     """
-    if not os.environ.get("E2E_BINARY"):
+    if not os.environ.get("FS_E2E_BINARY"):
         pytest.skip(
-            "E2E_BINARY not set — lifecycle tests need a binary built with\n"
+            "FS_E2E_BINARY not set — lifecycle tests need a binary built with\n"
             "  --features file-storage\n"
             "Build:\n"
             "  cargo build -p cf-gears-example-server --features file-storage\n"
             "  cargo build -p cf-gears-file-storage --bin sidecar\n"
             "Run:\n"
-            "  E2E_BINARY=target/debug/cf-gears-example-server \\\n"
+            "  FS_E2E_BINARY=target/debug/cf-gears-example-server \\\n"
             "  pytest testing/e2e/gears/file_storage/lifecycle/ -vv",
             allow_module_level=True,
         )
@@ -391,7 +395,8 @@ def _lifecycle_test_env(fs_storage_root, fs_signing_seed):
 
     1. Start the sidecar (so its port is known).
     2. Patch the config (inject sidecar URL, storage root, signing seed, port).
-    3. Resolve the server binary (E2E_BINARY env var).
+    3. Resolve the server binary (FS_E2E_BINARY env var — dedicated to this
+       suite so it does not un-skip other gears gated on E2E_BINARY).
     4. Start the server.
     5. Wait for health.
     6. Yield a RunningTestEnv-compatible namespace.
@@ -428,16 +433,16 @@ def _lifecycle_test_env(fs_storage_root, fs_signing_seed):
     from lib.orchestrator import _prepare_config
     config_path = _prepare_config(env)
 
-    # 3. Resolve binary from E2E_BINARY env var
-    binary_str = os.environ.get("E2E_BINARY")
+    # 3. Resolve binary from FS_E2E_BINARY env var (dedicated to this suite).
+    binary_str = os.environ.get("FS_E2E_BINARY")
     if not binary_str:
         pytest.fail(
-            "E2E_BINARY not set — lifecycle tests need a binary built with\n"
+            "FS_E2E_BINARY not set — lifecycle tests need a binary built with\n"
             "  --features file-storage"
         )
     binary_path = Path(binary_str)
     if not binary_path.exists():
-        pytest.fail(f"E2E_BINARY={binary_str!r} does not exist")
+        pytest.fail(f"FS_E2E_BINARY={binary_str!r} does not exist")
 
     # 4. Start server (private process — does NOT write to the global _server_proc)
     log = _log_path(env)

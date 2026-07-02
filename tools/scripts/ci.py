@@ -479,11 +479,16 @@ def cmd_e2e(args):
 
     # Export the release server + sidecar paths so the orchestrator-based
     # lifecycle suite (testing/e2e/gears/file_storage/lifecycle/) can start
-    # its own private server+sidecar pair.  Without E2E_BINARY the lifecycle
-    # conftest skips gracefully; without FS_SIDECAR_BINARY it falls back to
-    # target/debug/sidecar (which won't exist in the release-only local path).
+    # its own private server+sidecar pair.
+    #
+    # NOTE: we deliberately use DEDICATED vars (FS_E2E_BINARY / FS_SIDECAR_BINARY)
+    # rather than the shared E2E_BINARY.  Other gears (e.g. mini-chat) gate their
+    # own suites on E2E_BINARY and expect a scoped invocation (make e2e-mini-chat);
+    # setting E2E_BINARY here would un-skip them under generic e2e-local and they
+    # would fail/time-out without their bespoke fixtures.  The lifecycle conftest
+    # reads FS_E2E_BINARY for the server and FS_SIDECAR_BINARY for the sidecar.
     if release_bin is not None:
-        env.setdefault("E2E_BINARY", release_bin)
+        env.setdefault("FS_E2E_BINARY", release_bin)
     if release_sidecar_bin is not None:
         env.setdefault("FS_SIDECAR_BINARY", release_sidecar_bin)
 
