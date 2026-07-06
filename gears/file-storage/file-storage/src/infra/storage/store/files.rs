@@ -338,23 +338,7 @@ impl Store {
                     // conflict (concurrent duplicate) is tolerated inside the
                     // repo; any real DB error rolls the whole creation back.
                     if let Some(idem) = idempotency {
-                        idempotency_repo
-                            .insert(
-                                tx,
-                                idem.tenant_id,
-                                &idem.owner_kind,
-                                idem.owner_id,
-                                &idem.key,
-                                idem.subject_id,
-                                file_id,
-                                idem.response_status,
-                                &idem.response_body,
-                                &idem.response_etag,
-                                &idem.request_hash,
-                                idem.expires_at,
-                                now,
-                            )
-                            .await?;
+                        idempotency_repo.insert(tx, &idem, file_id, now).await?;
                     }
                     Ok::<(), DomainError>(())
                 })

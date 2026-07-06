@@ -1655,6 +1655,7 @@ async fn run_sweep_deletes_expired_idempotency_rows() {
 
     use file_storage::infra::storage::entity::idempotency_key;
     use file_storage::infra::storage::repo::IdempotencyRepo;
+    use file_storage::infra::storage::store::IdempotencyInsert;
 
     let db = build_db().await;
     let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
@@ -1710,17 +1711,19 @@ async fn run_sweep_deletes_expired_idempotency_rows() {
     // Expired row: `expires_at` is in the past, so the sweep must delete it.
     repo.insert(
         &conn,
-        tenant_id,
-        "user",
-        Uuid::now_v7(),
-        "expired-key",
-        subject_id,
+        &IdempotencyInsert {
+            tenant_id,
+            owner_kind: "user".to_owned(),
+            owner_id: Uuid::now_v7(),
+            key: "expired-key".to_owned(),
+            subject_id,
+            response_status: 201,
+            response_body: "{}".to_owned(),
+            response_etag: "etag-expired".to_owned(),
+            request_hash: b"expired-hash".to_vec(),
+            expires_at: now - time::Duration::hours(1),
+        },
         expired_ticket.file_id,
-        201,
-        "{}",
-        "etag-expired",
-        b"expired-hash",
-        now - time::Duration::hours(1),
         now - time::Duration::hours(2),
     )
     .await
@@ -1732,17 +1735,19 @@ async fn run_sweep_deletes_expired_idempotency_rows() {
     let live_file_id = live_ticket.file_id;
     repo.insert(
         &conn,
-        tenant_id,
-        "user",
-        live_owner_id,
-        "live-key",
-        subject_id,
+        &IdempotencyInsert {
+            tenant_id,
+            owner_kind: "user".to_owned(),
+            owner_id: live_owner_id,
+            key: "live-key".to_owned(),
+            subject_id,
+            response_status: 201,
+            response_body: "{\"ok\":true}".to_owned(),
+            response_etag: "etag-live".to_owned(),
+            request_hash: b"live-hash".to_vec(),
+            expires_at: now + time::Duration::days(1),
+        },
         live_file_id,
-        201,
-        "{\"ok\":true}",
-        "etag-live",
-        b"live-hash",
-        now + time::Duration::days(1),
         now,
     )
     .await

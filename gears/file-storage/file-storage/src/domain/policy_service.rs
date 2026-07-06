@@ -330,17 +330,29 @@ impl PolicyService {
 
     // ── authorization helpers ────────────────────────────────────────────────
 
-    /// Try `ADMIN_POLICY` first (cross-owner / tenant-wide administration); on
-    /// `Forbidden`, fall back to `fallback_action` (`READ`/`WRITE`) and require
-    /// `scope_owner_id` — when present — to match the caller's own subject id.
-    /// `scope_owner_id == None` means "tenant scope" for the policy endpoints,
-    /// which has no owner to compare, so the fallback succeeds on
-    /// `fallback_action` alone in that case.
-    async fn authorize_scope_owner(
+    /// Shared "try `ADMIN_POLICY` first, else require owner == subject" gate
+    /// used by both [`Self::authorize_scope_owner`] (policy read/write) and
+    /// the `RetentionScope::User` arm of [`Self::authorize_retention_scope`].
+    ///
+    /// Tries `ADMIN_POLICY` first (cross-owner / tenant-wide administration);
+    /// on `Forbidden`, falls back to `fallback_action` (`READ`/`WRITE`) and
+    /// requires `required_owner_id` — when present — to match the caller's
+    /// own subject id.
+    ///
+    /// `required_owner_id == None` is ambiguous between the two callers:
+    /// - the policy endpoints use `None` for "tenant scope", which has no
+    ///   owner to compare, so the fallback should succeed on
+    ///   `fallback_action` alone;
+    /// - a `User`-scope retention rule always has a target user, so a missing
+    ///   target must be treated as a mismatch, not as "no check".
+    ///
+    /// `treat_missing_owner_as_authorized` picks between the two.
+    async fn authorize_admin_or_owner(
         &self,
         ctx: &SecurityContext,
         fallback_action: &str,
-        scope_owner_id: Option<Uuid>,
+        required_owner_id: Option<Uuid>,
+        treat_missing_owner_as_authorized: bool,
     ) -> Result<AccessScope, DomainError> {
         match self
             .authorizer
@@ -353,15 +365,33 @@ impl PolicyService {
                     .authorizer
                     .authorize(ctx, fallback_action, "", None)
                     .await?;
-                if let Some(scope_owner_id) = scope_owner_id
-                    && scope_owner_id != ctx.subject_id()
-                {
+                let is_owner = match required_owner_id {
+                    Some(owner_id) => owner_id == ctx.subject_id(),
+                    None => treat_missing_owner_as_authorized,
+                };
+                if !is_owner {
                     return Err(DomainError::Forbidden);
                 }
                 Ok(scope)
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// Try `ADMIN_POLICY` first (cross-owner / tenant-wide administration); on
+    /// `Forbidden`, fall back to `fallback_action` (`READ`/`WRITE`) and require
+    /// `scope_owner_id` — when present — to match the caller's own subject id.
+    /// `scope_owner_id == None` means "tenant scope" for the policy endpoints,
+    /// which has no owner to compare, so the fallback succeeds on
+    /// `fallback_action` alone in that case.
+    async fn authorize_scope_owner(
+        &self,
+        ctx: &SecurityContext,
+        fallback_action: &str,
+        scope_owner_id: Option<Uuid>,
+    ) -> Result<AccessScope, DomainError> {
+        self.authorize_admin_or_owner(ctx, fallback_action, scope_owner_id, true)
+            .await
     }
 
     /// Authorize a retention-rule mutation (create or delete) for the given
@@ -388,24 +418,10 @@ impl PolicyService {
                     .authorize(ctx, actions::WRITE, "", None)
                     .await
             }
-            RetentionScope::User => match self
-                .authorizer
-                .authorize(ctx, actions::ADMIN_POLICY, "", None)
-                .await
-            {
-                Ok(scope) => Ok(scope),
-                Err(DomainError::Forbidden) => {
-                    let scope = self
-                        .authorizer
-                        .authorize(ctx, actions::WRITE, "", None)
-                        .await?;
-                    if scope_target_id != Some(ctx.subject_id()) {
-                        return Err(DomainError::Forbidden);
-                    }
-                    Ok(scope)
-                }
-                Err(err) => Err(err),
-            },
+            RetentionScope::User => {
+                self.authorize_admin_or_owner(ctx, actions::WRITE, scope_target_id, false)
+                    .await
+            }
             RetentionScope::File => {
                 let target_id = scope_target_id.ok_or_else(|| DomainError::Validation {
                     field: "scope_target_id".to_owned(),

@@ -1514,6 +1514,142 @@ async fn multipart_complete_uses_reported_parts_not_empty_list() {
     );
 }
 
+/// CodeRabbit (Major): the report-part callback is `.public()` +
+/// token-authenticated, so a holder of the signed part token could otherwise
+/// report an arbitrary `size` in the JSON body. `complete_multipart_upload`
+/// sums stored part sizes into `version.size` unchecked, so a forged size
+/// would corrupt the final metadata. `MultipartService::report_part` must
+/// reject a `size` that does not match the authoritative
+/// `claims.multipart.size` minted into the token at initiate time, and must
+/// not persist a part row for the forged size.
+///
+/// @cpt-cf-file-storage-fr-multipart-upload
+#[tokio::test]
+async fn report_part_rejects_forged_size() {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::post;
+    use sea_orm::EntityTrait;
+    use toolkit_db::secure::SecureEntityExt;
+    use toolkit_security::AccessScope;
+    use tower::ServiceExt;
+
+    use file_storage::api::rest::handlers;
+    use file_storage::infra::signed_url::Verifier;
+    use file_storage::infra::storage::entity::multipart_upload_part;
+
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let verifier: Arc<Verifier> = Arc::new(issuer.verifier());
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let store = Store::new(Arc::clone(&db));
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        Arc::clone(&issuer),
+        Arc::clone(&authorizer),
+        cfg,
+        None,
+        None,
+    ));
+    let msvc = Arc::new(MultipartService::new(
+        Arc::new(store.clone()) as Arc<dyn MultipartStore>,
+        backends,
+        authorizer,
+        None,
+        Arc::clone(&issuer),
+        "http://sidecar.test".to_owned(),
+        3600,
+    ));
+
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+
+    // A small declared size plans exactly one part; its planned `size` is the
+    // authoritative value carried in the part's token (`claims.multipart.size`).
+    let declared_size: u64 = 100;
+    let plan = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            ticket.file_id,
+            "application/octet-stream",
+            declared_size,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.parts.len(),
+        1,
+        "small declared_size must plan one part"
+    );
+    let part = &plan.parts[0];
+    let planned_size = i64::try_from(part.size).unwrap();
+
+    let router = Router::new()
+        .route(
+            "/api/file-storage/v1/files/{file_id}/versions/{version_id}/multipart/{upload_id}/parts/{part_number}/report",
+            post(handlers::report_multipart_part),
+        )
+        .layer(axum::Extension(Arc::clone(&verifier)))
+        .layer(axum::Extension(Arc::clone(&msvc)));
+
+    let token_start =
+        part.upload_url.find("fs-token=").expect("fs-token in URL") + "fs-token=".len();
+    let token = &part.upload_url[token_start..];
+
+    // Forge a size different from the one baked into the token.
+    let forged_size = planned_size + 1;
+    let body = serde_json::json!({
+        "backend_etag": "forged-etag",
+        "hash_hex": hex::encode([7u8; 32]),
+        "size": forged_size,
+    });
+    let uri = format!(
+        "/api/file-storage/v1/files/{}/versions/{}/multipart/{}/parts/{}/report",
+        ticket.file_id, plan.version_id, plan.upload_id, part.part_number
+    );
+    let req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("x-fs-token", token)
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let resp = router.clone().oneshot(req).await.expect("router dispatch");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a forged part size must be rejected"
+    );
+
+    // No part row must have been persisted for the forged report.
+    let conn = db.conn().expect("conn");
+    let rows = multipart_upload_part::Entity::find()
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .all(&conn)
+        .await
+        .expect("query multipart_upload_parts directly");
+    assert!(
+        rows.is_empty(),
+        "a rejected forged-size report must not persist any part row"
+    );
+}
+
 // -- 11. Table-driven: multipart accept/reject tracks backend capability ----
 
 /// Table-driven per P2 0.2: a `local-fs`-only registry rejects initiate

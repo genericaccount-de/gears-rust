@@ -117,16 +117,26 @@ impl MultipartRepo {
 
     /// Force-set a session's `expires_at`, unconditionally.
     ///
-    /// Test-support only: production code never mutates `expires_at` after a
-    /// session is created. This exists so unit tests can deterministically
-    /// simulate "time passing" on an already-created (possibly
-    /// already-completed) session without a real sleep or concurrency, per
-    /// the unit-testing doctrine (P2 0.3 --
+    /// **Test-support only; do not call in production.** Production code
+    /// never mutates `expires_at` after a session is created — calling this
+    /// bypasses that invariant. This exists so unit tests can
+    /// deterministically simulate "time passing" on an already-created
+    /// (possibly already-completed) session without a real sleep or
+    /// concurrency, per the unit-testing doctrine (P2 0.3 --
     /// `sweep_after_complete_wins_does_not_delete_bound_version` in
     /// `cleanup_test.rs` backdates a session's `expires_at` *after* a
     /// successful `complete_multipart_upload`, which the P2 0.3 step-3
     /// defense-in-depth check would otherwise reject if the session were
     /// built with a past `expires_at` from the start).
+    ///
+    /// `#[doc(hidden)]` rather than a `test-support` Cargo feature: this
+    /// method is called from the external integration-test crate
+    /// `tests/cleanup_test.rs`, so `#[cfg(test)]` alone would not reach it,
+    /// and gating it behind a non-default feature would make the standard
+    /// `cargo test -p cf-gears-file-storage` command fail to compile that
+    /// test (or silently skip it via `required-features`) unless every
+    /// caller — including CI — also passed `--features test-support`.
+    #[doc(hidden)]
     pub async fn set_expires_at<C: DBRunner>(
         &self,
         conn: &C,

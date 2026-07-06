@@ -14,7 +14,7 @@ use crate::domain::error::DomainError;
 use crate::domain::etag;
 use crate::domain::policy::PolicyResolver;
 use crate::domain::service::{FileService, VersionRef};
-use crate::infra::content::{hash, mime};
+use crate::infra::content::mime;
 use crate::infra::external_clients::UsageDelta;
 use crate::infra::signed_url::{Claims, Op, UploadConstraints};
 use crate::infra::storage::Store;
@@ -170,7 +170,13 @@ impl FileService {
             ));
         }
         Store::verify_content_hash(&blob, &hash_value)?;
-        let actual_hash = hash::sha256(&blob);
+        // `verify_content_hash` already computed `sha256(blob)` internally and
+        // only returns `Ok` when it is byte-for-byte equal to `hash_value` —
+        // recomputing `hash::sha256(&blob)` here a second time would
+        // deterministically yield that exact same value again, so persist the
+        // already-verified `hash_value` instead of paying for a second
+        // full-blob hash pass (CodeRabbit nitpick).
+        let actual_hash = hash_value;
 
         // Declared MIME type is never trustworthy either: validate the
         // read-back blob's real bytes against `version_mime` (reusing the
@@ -196,11 +202,9 @@ impl FileService {
             serde_json::json!({ "version_id": version_id, "size": size }),
         );
 
-        // Persist the read-back-derived size/hash, not the caller's claim
-        // (even though they have just been proven equal) — this is what
-        // makes the positive test prove the read-back happened rather than
-        // merely re-asserting the caller's own input. `validated_mime` is
-        // persisted in place of the client's original declaration.
+        // Persist the read-back-derived size and the verified hash, not the
+        // caller's size claim. `validated_mime` is persisted in place of the
+        // client's original declaration.
         let ok = self
             .store
             .finalize_version(
@@ -640,7 +644,13 @@ impl FileService {
             ));
         }
         Store::verify_content_hash(&blob, &hash_value)?;
-        let actual_hash = hash::sha256(&blob);
+        // `verify_content_hash` already computed `sha256(blob)` internally and
+        // only returns `Ok` when it is byte-for-byte equal to `hash_value` —
+        // recomputing `hash::sha256(&blob)` here a second time would
+        // deterministically yield that exact same value again, so persist the
+        // already-verified `hash_value` instead of paying for a second
+        // full-blob hash pass (CodeRabbit nitpick).
+        let actual_hash = hash_value;
 
         // Declared MIME type is never trustworthy either: validate the
         // read-back blob's real bytes against `version_mime` (reusing the
@@ -670,9 +680,9 @@ impl FileService {
             serde_json::json!({ "version_id": version_id, "size": size }),
         );
 
-        // Persist the read-back-derived size/hash, not the caller's claim.
-        // `validated_mime` is persisted in place of the client's original
-        // declaration.
+        // Persist the read-back-derived size and the verified hash, not the
+        // caller's size claim. `validated_mime` is persisted in place of the
+        // client's original declaration.
         let ok = self
             .store
             .finalize_version(

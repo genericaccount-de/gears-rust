@@ -246,8 +246,11 @@ async fn finalize_matching_size_and_hash_succeeds() {
         .unwrap()
         .expect("version row must exist");
     assert_eq!(version.status, VersionStatus::Available);
-    // The assertion that proves read-back, not pass-through: compare against
-    // an independently recomputed hash, not merely the value passed in.
+    // `finalize_upload` persists the caller's `hash_value` only after
+    // `Store::verify_content_hash` has proven it byte-for-byte equal to
+    // `sha256` of the read-back blob, so this independently recomputed hash
+    // must match the persisted value regardless of which of the two
+    // (guaranteed-identical) values the implementation happens to persist.
     let independently_recomputed = hash::sha256(&known_bytes);
     assert_eq!(version.size, true_size);
     assert_eq!(version.hash_value, independently_recomputed);

@@ -455,7 +455,11 @@ impl MultipartService {
     /// `claims.op == Op::MultipartPart` has already been asserted there; this
     /// method re-validates the claims against the session so a valid token for
     /// a *different* (or no-longer-`in_progress`) session cannot poison
-    /// another upload's part list.
+    /// another upload's part list. It also rejects a caller-supplied `size`
+    /// that does not match `claims.multipart.size` (the authoritative
+    /// per-part size minted into the token at initiate time) so a holder of
+    /// the signed token cannot forge a part's size and corrupt the summed
+    /// `version.size` computed by `complete_multipart_upload`.
     ///
     /// @cpt-cf-file-storage-fr-multipart-upload
     pub async fn report_part(
@@ -490,13 +494,32 @@ impl MultipartService {
         let part_number = i32::try_from(claims.multipart.part_number)
             .map_err(|_| DomainError::validation("part_number", "part_number overflows i32"))?;
 
+        // Security: this callback is `.public()` + token-authenticated, so a
+        // holder of the signed part token could otherwise report an arbitrary
+        // `size` that `complete_multipart_upload` later sums into
+        // `version.size` unchecked. `claims.multipart.size` is the exact
+        // per-part size computed by `compute_plan` at initiate time (uniform
+        // for all parts except the last, which is legitimately smaller — see
+        // `compute_plan` in `multipart.rs`), so it is always the exact size
+        // this specific part must have; reject a mismatch rather than trust
+        // the caller-supplied value, and persist the authoritative claimed
+        // size instead of the (already-verified-equal) caller value.
+        let claimed_size = i64::try_from(claims.multipart.size)
+            .map_err(|_| DomainError::validation("size", "size overflows i64"))?;
+        if size != claimed_size {
+            return Err(DomainError::validation(
+                "size",
+                "reported part size does not match the planned size for this part",
+            ));
+        }
+
         self.store
             .upsert_multipart_part(
                 upload_id,
                 part_number,
                 &backend_etag,
                 hash_value,
-                size,
+                claimed_size,
                 OffsetDateTime::now_utc(),
             )
             .await
