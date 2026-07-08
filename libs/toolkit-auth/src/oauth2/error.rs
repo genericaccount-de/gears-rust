@@ -36,6 +36,17 @@ pub enum TokenError {
     /// freshness ratio.
     #[error("invalid token lifetime: {0}")]
     InvalidTokenLifetime(String),
+
+    /// A refresh-token grant was rejected by the authorization server
+    /// (e.g. `invalid_grant` after the server restarted or the token was
+    /// revoked). Distinct from [`TokenError::Http`] so callers can trigger a
+    /// full re-authorization rather than retrying.
+    #[error("refresh rejected: {0}")]
+    RefreshRejected(String),
+
+    /// Dynamic Client Registration (RFC 7591) failed.
+    #[error("client registration failed: {0}")]
+    RegistrationFailed(String),
 }
 
 #[cfg(test)]

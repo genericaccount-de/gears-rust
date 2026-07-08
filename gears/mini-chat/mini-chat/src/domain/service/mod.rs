@@ -13,21 +13,31 @@ use toolkit_macros::domain_model;
 use crate::config::{
     ContextConfig, EstimationBudgets, QuotaConfig, RagConfig, StreamingConfig, ThumbnailConfig,
 };
+use oagw_sdk::ServiceGatewayClientV1;
+
 use crate::domain::ports::MiniChatMetricsPort;
 use crate::domain::repos::{
-    AttachmentRepository, ChatRepository, MessageAttachmentRepository, MessageRepository,
-    ModelResolver, OutboxEnqueuer, PolicySnapshotProvider, QuotaUsageRepository,
-    ReactionRepository, ThreadSummaryRepository, TurnRepository, UserLimitsProvider,
-    VectorStoreRepository,
+    AttachmentRepository, ChatRepository, McpServerRepository, McpServerToolRepository,
+    MessageAttachmentRepository, MessageRepository, ModelResolver, OutboxEnqueuer,
+    PolicySnapshotProvider, QuotaUsageRepository, ReactionRepository, RoleMcpServerRepository,
+    ThreadSummaryRepository, TurnRepository, UserLimitsProvider, VectorStoreRepository,
 };
 use crate::domain::service::quota_settler::QuotaSettler;
 use crate::infra::llm::provider_resolver::ProviderResolver;
+use crate::infra::mcp::McpPool;
 
 mod attachment_service;
 mod chat_service;
 pub(crate) mod context_assembly;
 pub(crate) mod credit_arithmetic;
+mod effective_mcp_resolver;
 pub(crate) mod finalization_service;
+mod mcp_argument_validator;
+mod mcp_dlp;
+mod mcp_output_sanitizer;
+mod mcp_rate_limiter;
+mod mcp_schema_sanitizer;
+mod mcp_service;
 mod message_service;
 mod model_service;
 mod quota_service;
@@ -43,8 +53,18 @@ mod turn_service;
 
 pub(crate) use crate::domain::model::audit_envelope::AuditEnvelope;
 pub(crate) use attachment_service::AttachmentService;
+#[allow(unused_imports)]
+pub(crate) use effective_mcp_resolver::{
+    EffectiveMcpResolver, EffectiveResolution, McpResolutionDiagnostic, McpToolResolver,
+    McpToolRoute, McpToolRoutingMap,
+};
 pub(crate) use chat_service::ChatService;
 pub(crate) use finalization_service::FinalizationService;
+pub(crate) use mcp_dlp::DlpRedactor;
+pub(crate) use mcp_rate_limiter::McpRateLimiter;
+pub(crate) use mcp_service::{AssignServerToRoleInput, McpService, McpToolRefresher};
+#[allow(unused_imports)] // referenced by the mcp_refresh_worker test module
+pub(crate) use mcp_service::{HubSyncSummary, McpRefreshSummary};
 pub(crate) use message_service::MessageService;
 pub(crate) use model_service::ModelService;
 pub(crate) use quota_service::QuotaService;
@@ -94,6 +114,15 @@ pub(crate) mod resources {
         "gts.cf.core.ai_chat.user_quota.v1~cf.core.mini_chat.user_quota.v1~",
         &[pep_properties::OWNER_TENANT_ID, pep_properties::OWNER_ID],
     );
+
+    // MCP servers are `no_owner` (tenant-scoped or global). Global servers
+    // carry a NULL tenant; authorization for admin/read actions is evaluated
+    // against the caller's tenant.
+    // TODO: discuss with the team about resource type GTS identifier.
+    pub const MCP_SERVER: ResourceType = ResourceType::from_static(
+        "gts.cf.core.ai_chat.mcp_server.v1~cf.core.mini_chat.mcp_server.v1~",
+        &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+    );
 }
 
 #[allow(dead_code)]
@@ -114,6 +143,15 @@ pub(crate) mod actions {
     pub const DELETE_ATTACHMENT: &str = "delete_attachment";
     pub const SET_REACTION: &str = "set_reaction";
     pub const DELETE_REACTION: &str = "delete_reaction";
+    pub const READ_MCP_SERVER: &str = "read_mcp_server";
+    pub const LIST_MCP_SERVERS: &str = "list_mcp_servers";
+    pub const LIST_MCP_TOOLS: &str = "list_mcp_tools";
+    pub const REFRESH_MCP_TOOLS: &str = "refresh_mcp_tools";
+    pub const ASSIGN_MCP_SERVER_ROLE: &str = "assign_mcp_server_role";
+    pub const REVOKE_MCP_SERVER_ROLE: &str = "revoke_mcp_server_role";
+    pub const LIST_ROLE_MCP_SERVERS: &str = "list_role_mcp_servers";
+    pub const APPROVE_MCP_SERVER: &str = "approve_mcp_server";
+    pub const MANAGE_MCP_CONNECTION: &str = "manage_mcp_connection";
 }
 
 /// All repository instances passed to `AppServices::new` as a single bundle.
@@ -128,6 +166,9 @@ pub(crate) struct Repositories<
     AR: AttachmentRepository,
     VSR: VectorStoreRepository,
     MAR: MessageAttachmentRepository,
+    MSR: McpServerRepository,
+    MTR: McpServerToolRepository,
+    RMSR: RoleMcpServerRepository,
 > {
     pub(crate) chat: Arc<CR>,
     pub(crate) attachment: Arc<AR>,
@@ -138,6 +179,9 @@ pub(crate) struct Repositories<
     pub(crate) thread_summary: Arc<TSR>,
     pub(crate) vector_store: Arc<VSR>,
     pub(crate) message_attachment: Arc<MAR>,
+    pub(crate) mcp_server: Arc<MSR>,
+    pub(crate) mcp_tool: Arc<MTR>,
+    pub(crate) role_mcp_server: Arc<RMSR>,
 }
 
 /// DI container — aggregates all domain services.
@@ -157,6 +201,9 @@ pub(crate) struct AppServices<
     AR: AttachmentRepository + 'static,
     VSR: VectorStoreRepository + 'static,
     MAR: MessageAttachmentRepository + 'static,
+    MSR: McpServerRepository + 'static,
+    MTR: McpServerToolRepository + 'static,
+    RMSR: RoleMcpServerRepository + 'static,
 > {
     pub(crate) chats: ChatService<CR, AR, TSR>,
     pub(crate) messages: MessageService<MR, CR, RR>,
@@ -164,6 +211,7 @@ pub(crate) struct AppServices<
     pub(crate) turns: TurnService<TR, MR, CR, MAR>,
     pub(crate) reactions: ReactionService<RR, MR, CR>,
     pub(crate) attachments: AttachmentService<CR, AR, VSR>,
+    pub(crate) mcp: Arc<McpService<MSR, MTR, RMSR>>,
     pub(crate) models: ModelService,
     pub(crate) quota: Arc<QuotaService<QR>>,
     pub(crate) finalization: Arc<FinalizationService<TR, MR>>,
@@ -186,13 +234,19 @@ impl<
     AR: AttachmentRepository + 'static,
     VSR: VectorStoreRepository + 'static,
     MAR: MessageAttachmentRepository + 'static,
-> AppServices<TR, MR, QR, RR, CR, TSR, AR, VSR, MAR>
+    MSR: McpServerRepository + 'static,
+    MTR: McpServerToolRepository + 'static,
+    RMSR: RoleMcpServerRepository + 'static,
+> AppServices<TR, MR, QR, RR, CR, TSR, AR, VSR, MAR, MSR, MTR, RMSR>
 {
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub(crate) fn new(
-        repos: &Repositories<TR, MR, QR, RR, CR, TSR, AR, VSR, MAR>,
+        repos: &Repositories<TR, MR, QR, RR, CR, TSR, AR, VSR, MAR, MSR, MTR, RMSR>,
         db: Arc<DbProvider>,
         authz: Arc<dyn AuthZResolverClient>,
+        gateway: Arc<dyn ServiceGatewayClientV1>,
+        mcp_pool: Arc<McpPool>,
+        mcp_config: crate::config::McpConfig,
         model_resolver: &Arc<dyn ModelResolver>,
         provider_resolver: &Arc<ProviderResolver>,
         streaming_config: StreamingConfig,
@@ -250,6 +304,31 @@ impl<
 
         let upload_semaphore = Arc::new(Semaphore::new(rag_config.max_concurrent_uploads.into()));
 
+        // Effective MCP tool resolver shared by the stream hot path. Built
+        // unconditionally; `resolve` short-circuits to an empty set when
+        // `mcp.enabled` is false, so the chat path pays nothing when MCP is off.
+        let mcp_max_tools_per_chat = mcp_config.max_tools_per_chat;
+        let mcp_resolver: Option<Arc<dyn McpToolResolver>> =
+            Some(Arc::new(EffectiveMcpResolver::new(
+                Arc::clone(&db),
+                Arc::clone(&repos.mcp_server),
+                Arc::clone(&repos.mcp_tool),
+                Arc::clone(&gateway),
+                &mcp_config,
+            )));
+
+        // Stream-time MCP `tools/call` dispatch surface (shares the pool used
+        // by `McpService`). Wired only when MCP is enabled; the pool is moved
+        // into `McpService` below, so clone the dispatch handle first.
+        let mcp_dispatcher: Option<Arc<dyn crate::infra::mcp::McpDispatcher>> = if mcp_config.enabled
+        {
+            Some(Arc::clone(&mcp_pool) as Arc<dyn crate::infra::mcp::McpDispatcher>)
+        } else {
+            None
+        };
+        let mcp_max_calls_per_message = mcp_config.max_mcp_calls_per_message;
+        let mcp_max_tool_output_chars = mcp_config.max_tool_output_chars;
+
         Self {
             chats: ChatService::new(
                 Arc::clone(&db),
@@ -287,6 +366,13 @@ impl<
                 Arc::clone(&metrics),
                 knowledge_search_config,
                 knowledge_retriever,
+                mcp_resolver,
+                mcp_max_tools_per_chat,
+                mcp_dispatcher,
+                mcp_max_calls_per_message,
+                mcp_max_tool_output_chars,
+                mcp_config.max_mcp_calls_per_minute_per_tenant,
+                &mcp_config.dlp_redaction_patterns,
             ),
             turns,
             reactions: ReactionService::new(
@@ -312,6 +398,20 @@ impl<
                 Arc::clone(&metrics),
                 anthropic_files_client,
             ),
+            mcp: Arc::new(McpService::new(
+                Arc::clone(&db),
+                Arc::clone(&repos.mcp_server),
+                Arc::clone(&repos.mcp_tool),
+                Arc::clone(&repos.role_mcp_server),
+                enforcer.clone(),
+                gateway,
+                mcp_pool,
+                mcp_config.servers,
+                mcp_config.hub_url,
+                mcp_config.hub_auth,
+                mcp_config.call_timeout_secs,
+                Arc::clone(&metrics),
+            )),
             models: ModelService::new(
                 Arc::clone(&db),
                 enforcer.clone(),

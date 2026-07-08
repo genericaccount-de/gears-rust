@@ -77,6 +77,8 @@ pub enum ToolCallType {
     CodeInterpreter,
     /// Knowledge search (RAG) via the `search_knowledge` function tool.
     FileSearch,
+    /// MCP tool invocation via `tools/call` in the agentic loop.
+    Mcp,
 }
 
 /// Repository trait for turn persistence operations.

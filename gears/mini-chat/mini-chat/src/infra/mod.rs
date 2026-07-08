@@ -2,6 +2,7 @@ pub(crate) mod audit_gateway;
 pub mod db;
 pub(crate) mod leader;
 pub mod llm;
+pub mod mcp;
 pub(crate) mod metrics;
 pub(crate) mod model_policy;
 pub(crate) mod oagw_provisioning;

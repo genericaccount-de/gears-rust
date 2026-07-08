@@ -899,6 +899,9 @@ mod tests {
             response: None,
             attachments: vec![],
             tool_calls: None,
+            mcp_tool_calls: None,
+            mcp_effective_snapshot: None,
+            mcp_tool_audit_records: vec![],
         });
         serde_json::to_vec(&event).unwrap()
     }

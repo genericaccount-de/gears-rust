@@ -22,6 +22,12 @@ pub enum PluginError {
     Rejected(String),
     #[error("invalid plugin configuration: {0}")]
     InvalidConfig(String),
+    /// The caller has no valid per-user authorization for the upstream and must
+    /// complete an interactive OAuth authorization-code flow. The inner string
+    /// carries the protected-resource identifier (for a `WWW-Authenticate` hint
+    /// or a re-authorization prompt).
+    #[error("authorization required: {0}")]
+    AuthorizationRequired(String),
     #[error("plugin error: {0}")]
     Internal(String),
 }

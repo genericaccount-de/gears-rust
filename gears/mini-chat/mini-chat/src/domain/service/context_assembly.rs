@@ -79,6 +79,16 @@ pub struct ContextInput<'a> {
     pub token_budget: Option<TokenBudget>,
     /// Provider file IDs for image attachments on the current user message.
     pub image_file_ids: &'a [String],
+    /// Resolved, provider-safe MCP function tools to inject (already normalized
+    /// and ordered by the resolver). Empty when MCP is disabled, unsupported by
+    /// the model, or no tools are effective — the caller gates model support by
+    /// passing an empty slice.
+    pub mcp_tools: &'a [LlmTool],
+    /// Guard instruction appended when at least one MCP tool is injected.
+    pub mcp_guard: &'a str,
+    /// Total tool cap for the request (built-in tools take priority; MCP tools
+    /// fill the remaining slots).
+    pub max_tools_per_chat: usize,
 }
 
 /// Output of context assembly — ready to feed into `LlmRequestBuilder`.
@@ -210,18 +220,9 @@ pub fn estimate_item_tokens(text_bytes: u64, budgets: &EstimationBudgets) -> u64
 pub fn assemble_context(
     input: &ContextInput<'_>,
 ) -> Result<AssembledContext, ContextAssemblyError> {
-    // ── System instructions ──
-    let system_instructions = build_system_instructions(
-        input.system_prompt,
-        input.web_search_enabled,
-        input.web_search_guard,
-        input.file_search_enabled,
-        input.file_search_guard,
-        input.knowledge_search_enabled,
-        input.knowledge_search_guard,
-    );
-
     // ── Tools ──
+    // Built first so MCP-tool injection (below) can decide whether the MCP
+    // guard is appended to the system instructions.
     let mut tools = Vec::new();
     if input.file_search_enabled && !input.vector_store_ids.is_empty() {
         tools.push(LlmTool::FileSearch {
@@ -265,6 +266,29 @@ pub fn assemble_context(
             }),
         });
     }
+
+    // ── MCP tools ──
+    // Built-in tools take priority; MCP tools fill the remaining slots up to
+    // the per-chat cap. The caller passes an empty slice when MCP is disabled
+    // or unsupported by the model.
+    let mcp_slots = input.max_tools_per_chat.saturating_sub(tools.len());
+    let mcp_injected = mcp_slots > 0 && !input.mcp_tools.is_empty();
+    tools.extend(input.mcp_tools.iter().take(mcp_slots).cloned());
+
+    // ── System instructions ──
+    // Built after tools so the MCP guard is appended only when MCP tools were
+    // actually injected.
+    let system_instructions = build_system_instructions(
+        input.system_prompt,
+        input.web_search_enabled,
+        input.web_search_guard,
+        input.file_search_enabled,
+        input.file_search_guard,
+        input.knowledge_search_enabled,
+        input.knowledge_search_guard,
+        mcp_injected,
+        input.mcp_guard,
+    );
 
     // ── Truncation ──
     if let Some(ref budget) = input.token_budget {
@@ -380,6 +404,7 @@ pub fn assemble_context(
 
 /// Build system instructions from base prompt + conditional guard strings.
 /// Returns `None` if the result would be empty.
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn build_system_instructions(
     system_prompt: &str,
     web_search_enabled: bool,
@@ -388,6 +413,8 @@ fn build_system_instructions(
     file_search_guard: &str,
     knowledge_search_enabled: bool,
     knowledge_search_guard: &str,
+    mcp_enabled: bool,
+    mcp_guard: &str,
 ) -> Option<String> {
     let mut parts: Vec<&str> = Vec::new();
 
@@ -402,6 +429,9 @@ fn build_system_instructions(
     }
     if knowledge_search_enabled && !knowledge_search_guard.is_empty() {
         parts.push(knowledge_search_guard);
+    }
+    if mcp_enabled && !mcp_guard.is_empty() {
+        parts.push(mcp_guard);
     }
 
     if parts.is_empty() {
@@ -443,6 +473,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         })
         .unwrap();
         assert!(result.system_instructions.is_none());
@@ -471,6 +504,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         })
         .unwrap();
         let instructions = result.system_instructions.unwrap();
@@ -499,6 +535,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         })
         .unwrap();
         let instructions = result.system_instructions.unwrap();
@@ -527,6 +566,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         })
         .unwrap();
         let instructions = result.system_instructions.unwrap();
@@ -556,6 +598,9 @@ mod tests {
             knowledge_search_enabled: true,
             knowledge_search_guard: "Use search_knowledge for internal docs.",
             image_file_ids: &[],
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         })
         .unwrap();
         let instructions = result.system_instructions.unwrap();
@@ -595,6 +640,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "Use search_knowledge for internal docs.",
             image_file_ids: &[],
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         })
         .unwrap();
         let instructions = result.system_instructions.unwrap();
@@ -631,6 +679,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         })
         .unwrap();
         // First message should be the thread summary
@@ -672,6 +723,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         })
         .unwrap();
         assert_eq!(result.messages.len(), 3); // 2 recent + current
@@ -703,6 +757,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         })
         .unwrap();
         // system message skipped: 2 recent (user+assistant) + 1 current = 3
@@ -731,6 +788,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         })
         .unwrap();
         let last = result.messages.last().unwrap();
@@ -766,6 +826,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         })
         .unwrap();
         assert_eq!(result.tools.len(), 2);
@@ -802,6 +865,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         })
         .unwrap();
         assert!(result.tools.is_empty());
@@ -825,6 +891,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         })
         .unwrap();
         assert_eq!(result.tools.len(), 1);
@@ -943,6 +1012,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         })
         .unwrap();
 
@@ -985,6 +1057,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         })
         .unwrap();
 
@@ -1037,6 +1112,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         })
         .unwrap();
 
@@ -1066,6 +1144,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         });
 
         assert!(matches!(
@@ -1100,6 +1181,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         })
         .unwrap();
 
@@ -1142,6 +1226,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         })
         .unwrap();
         assert_eq!(result.tools.len(), 1);
@@ -1172,6 +1259,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         })
         .unwrap();
         assert!(result.tools.is_empty());
@@ -1216,6 +1306,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &images,
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         })
         .unwrap();
         assert_eq!(result.messages.len(), 1);
@@ -1246,6 +1339,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &images,
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         })
         .unwrap();
         let msg = &result.messages[0];
@@ -1274,6 +1370,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &[],
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         })
         .unwrap();
         let msg = &result.messages[0];
@@ -1302,6 +1401,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &images,
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         });
         assert!(result.is_ok());
     }
@@ -1327,6 +1429,9 @@ mod tests {
             knowledge_search_enabled: false,
             knowledge_search_guard: "",
             image_file_ids: &images,
+            mcp_tools: &[],
+            mcp_guard: "",
+            max_tools_per_chat: 20,
         });
         assert!(matches!(
             result,
@@ -1349,5 +1454,112 @@ mod tests {
         assert!(matches!(&msg.content[0], ContentPart::Text { text } if text == "look"));
         assert!(matches!(&msg.content[1], ContentPart::Image { file_id } if file_id == "f1"));
         assert!(matches!(&msg.content[2], ContentPart::Image { file_id } if file_id == "f2"));
+    }
+
+    // ── MCP tool injection ──────────────────────────────────────────────────
+
+    fn mcp_fn(name: &str) -> LlmTool {
+        LlmTool::Function {
+            name: name.to_owned(),
+            description: "mcp tool".to_owned(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    fn base_input(mcp_tools: &[LlmTool], max_tools_per_chat: usize) -> ContextInput<'_> {
+        ContextInput {
+            system_prompt: "Base.",
+            web_search_guard: "",
+            file_search_guard: "",
+            thread_summary: None,
+            recent_messages: &[],
+            user_message: "hello",
+            web_search_enabled: false,
+            file_search_enabled: false,
+            vector_store_ids: &[],
+            file_search_filters: None,
+            web_search_context_size: crate::domain::llm::WebSearchContextSize::Low,
+            file_search_max_num_results: 5,
+            code_interpreter_file_ids: vec![],
+            token_budget: None,
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
+            image_file_ids: &[],
+            mcp_tools,
+            mcp_guard: "Use MCP tools carefully.",
+            max_tools_per_chat,
+        }
+    }
+
+    #[test]
+    fn mcp_tools_injected_and_guard_appended() {
+        let mcp = vec![mcp_fn("mcp__aaaa0001__a"), mcp_fn("mcp__aaaa0001__b")];
+        let result = assemble_context(&base_input(&mcp, 20)).unwrap();
+        let names: Vec<_> = result
+            .tools
+            .iter()
+            .filter_map(|t| match t {
+                LlmTool::Function { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["mcp__aaaa0001__a", "mcp__aaaa0001__b"]);
+        assert!(
+            result
+                .system_instructions
+                .unwrap()
+                .contains("Use MCP tools carefully.")
+        );
+    }
+
+    #[test]
+    fn mcp_guard_omitted_when_no_mcp_tools() {
+        let result = assemble_context(&base_input(&[], 20)).unwrap();
+        assert!(result.tools.is_empty());
+        assert!(
+            !result
+                .system_instructions
+                .unwrap()
+                .contains("Use MCP tools carefully.")
+        );
+    }
+
+    #[test]
+    fn built_in_tools_take_priority_over_mcp_under_cap() {
+        // cap = 2, one built-in (web_search) → only 1 MCP slot remains.
+        let mcp = vec![mcp_fn("mcp__aaaa0001__a"), mcp_fn("mcp__aaaa0001__b")];
+        let mut input = base_input(&mcp, 2);
+        input.web_search_enabled = true;
+        let result = assemble_context(&input).unwrap();
+        assert_eq!(result.tools.len(), 2);
+        assert!(
+            result
+                .tools
+                .iter()
+                .any(|t| matches!(t, LlmTool::WebSearch { .. }))
+        );
+        let mcp_count = result
+            .tools
+            .iter()
+            .filter(|t| matches!(t, LlmTool::Function { name, .. } if name.starts_with("mcp__")))
+            .count();
+        assert_eq!(mcp_count, 1);
+    }
+
+    #[test]
+    fn mcp_tools_dropped_when_cap_filled_by_built_ins() {
+        let mcp = vec![mcp_fn("mcp__aaaa0001__a")];
+        let mut input = base_input(&mcp, 1);
+        input.web_search_enabled = true; // fills the single slot
+        let result = assemble_context(&input).unwrap();
+        assert_eq!(result.tools.len(), 1);
+        assert!(matches!(result.tools[0], LlmTool::WebSearch { .. }));
+        // Guard not appended because no MCP tool was actually injected.
+        assert!(
+            !result
+                .system_instructions
+                .unwrap()
+                .contains("Use MCP tools carefully.")
+        );
     }
 }

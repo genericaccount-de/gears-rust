@@ -46,6 +46,10 @@ pub struct DeltaData {
 pub struct ToolData {
     pub phase: ToolPhase,
     pub name: String,
+    /// Tool family for the client UI (e.g. `"mcp"`). Absent for provider-native
+    /// built-in tools (`web_search`, `code_interpreter`) that don't set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_type: Option<String>,
     pub details: serde_json::Value,
 }
 

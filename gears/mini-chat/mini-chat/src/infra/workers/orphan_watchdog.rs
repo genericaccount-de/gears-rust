@@ -385,6 +385,7 @@ mod tests {
             web_search_completed_count,
             code_interpreter_completed_count,
             file_search_completed_count,
+            mcp_completed_count: 0,
             deleted_at: None,
             replaced_by_request_id: None,
             started_at: time::OffsetDateTime::now_utc(),

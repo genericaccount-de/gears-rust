@@ -1,5 +1,6 @@
 mod attachments;
 mod chats;
+mod mcp;
 mod messages;
 mod models;
 mod quota;
@@ -45,6 +46,7 @@ pub(crate) fn register_routes(
     let router = models::register_model_routes(router, openapi, prefix);
     let router = reactions::register_reaction_routes(router, openapi, prefix);
     let router = quota::register_quota_routes(router, openapi, prefix);
+    let router = mcp::register_mcp_routes(router, openapi, prefix);
 
     router.layer(axum::Extension(services))
 }

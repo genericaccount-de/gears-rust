@@ -1082,6 +1082,56 @@ impl From<UpdateRouteRequest> for domain::UpdateRouteRequest {
 }
 
 // ---------------------------------------------------------------------------
+// Interactive OAuth authorization-code management
+// ---------------------------------------------------------------------------
+
+/// Request body to begin an interactive OAuth authorization for an upstream.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct BeginOAuthRequest {
+    /// Additional scopes to request (intersected with what the authorization
+    /// server advertises).
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Absolute redirect URI the authorization server will call back.
+    pub redirect_uri: String,
+    /// Human-readable client name used for dynamic client registration.
+    #[serde(default = "default_client_name")]
+    pub client_name: String,
+}
+
+fn default_client_name() -> String {
+    "cf-oagw".to_owned()
+}
+
+/// Response for a begun authorization: the browser URL and CSRF state.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct BeginOAuthResponse {
+    /// URL to open in the user's browser to obtain consent.
+    pub authorization_url: String,
+    /// Opaque CSRF state; echoed back on the callback.
+    pub state: String,
+}
+
+/// Request body to complete an authorization after the browser callback.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CompleteOAuthRequest {
+    /// The `state` returned by the begin call.
+    pub state: String,
+    /// The authorization `code` delivered to the redirect URI.
+    pub code: String,
+}
+
+/// Per-user connection status for an upstream's OAuth authorization.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct OAuthConnectionStatusResponse {
+    /// `true` if a usable token is stored for the caller.
+    pub connected: bool,
+    /// Access-token expiry (Unix seconds), when connected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix: Option<i64>,
+}
+
+// ---------------------------------------------------------------------------
 // API DTO marker traits (required by OperationBuilder typed methods)
 // ---------------------------------------------------------------------------
 
@@ -1089,9 +1139,13 @@ impl toolkit::api::api_dto::RequestApiDto for CreateUpstreamRequest {}
 impl toolkit::api::api_dto::RequestApiDto for UpdateUpstreamRequest {}
 impl toolkit::api::api_dto::RequestApiDto for CreateRouteRequest {}
 impl toolkit::api::api_dto::RequestApiDto for UpdateRouteRequest {}
+impl toolkit::api::api_dto::RequestApiDto for BeginOAuthRequest {}
+impl toolkit::api::api_dto::RequestApiDto for CompleteOAuthRequest {}
 
 impl toolkit::api::api_dto::ResponseApiDto for UpstreamResponse {}
 impl toolkit::api::api_dto::ResponseApiDto for RouteResponse {}
+impl toolkit::api::api_dto::ResponseApiDto for BeginOAuthResponse {}
+impl toolkit::api::api_dto::ResponseApiDto for OAuthConnectionStatusResponse {}
 
 // ---------------------------------------------------------------------------
 // Helpers

@@ -5,9 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::config::TokenCacheConfig;
+use crate::domain::error::DomainError;
 use crate::domain::services::{
     ControlPlaneService, ControlPlaneServiceImpl, DataPlaneService, EndpointSelector,
-    ServiceGatewayClientV1Facade,
+    OAuthBeginOutcome, OAuthConnectionStatus, OAuthEnrollmentService, ServiceGatewayClientV1Facade,
 };
 use crate::domain::ssrf::SsrfGuard;
 use crate::infra::proxy::DataPlaneServiceImpl;
@@ -29,6 +30,49 @@ use tenant_resolver_sdk::{
 };
 use toolkit::client_hub::ClientHub;
 use toolkit_security::SecurityContext;
+
+/// No-op OAuth enrollment service for CRUD/proxy tests that never exercise the
+/// interactive authorization endpoints.
+pub struct NoopOAuthEnrollment;
+
+#[async_trait]
+impl OAuthEnrollmentService for NoopOAuthEnrollment {
+    async fn begin(
+        &self,
+        _ctx: &SecurityContext,
+        _upstream_id: uuid::Uuid,
+        _scopes: Vec<String>,
+        _redirect_uri: String,
+        _client_name: String,
+    ) -> Result<OAuthBeginOutcome, DomainError> {
+        Err(DomainError::internal("oauth enrollment not configured in test"))
+    }
+
+    async fn complete(
+        &self,
+        _ctx: &SecurityContext,
+        _state: String,
+        _code: String,
+    ) -> Result<(), DomainError> {
+        Err(DomainError::internal("oauth enrollment not configured in test"))
+    }
+
+    async fn revoke(
+        &self,
+        _ctx: &SecurityContext,
+        _upstream_id: uuid::Uuid,
+    ) -> Result<(), DomainError> {
+        Err(DomainError::internal("oauth enrollment not configured in test"))
+    }
+
+    async fn status(
+        &self,
+        _ctx: &SecurityContext,
+        _upstream_id: uuid::Uuid,
+    ) -> Result<OAuthConnectionStatus, DomainError> {
+        Err(DomainError::internal("oauth enrollment not configured in test"))
+    }
+}
 
 /// Build an allow-all `PolicyEnforcer` for tests.
 pub fn allow_all_enforcer() -> PolicyEnforcer {
@@ -205,6 +249,24 @@ impl CredStoreClientV1 for MockCredStoreClient {
             is_inherited: false,
         }))
     }
+
+    async fn put(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &SecretRef,
+        _value: SecretValue,
+        _sharing: SharingMode,
+    ) -> Result<(), CredStoreError> {
+        Ok(())
+    }
+
+    async fn delete(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &SecretRef,
+    ) -> Result<(), CredStoreError> {
+        Ok(())
+    }
 }
 
 /// Mock `CredStoreClientV1` that always returns `CredStoreError::Internal`.
@@ -220,6 +282,24 @@ impl CredStoreClientV1 for FailingCredStoreClient {
         _ctx: &SecurityContext,
         _key: &SecretRef,
     ) -> Result<Option<GetSecretResponse>, CredStoreError> {
+        Err(CredStoreError::Internal("backend failure".into()))
+    }
+
+    async fn put(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &SecretRef,
+        _value: SecretValue,
+        _sharing: SharingMode,
+    ) -> Result<(), CredStoreError> {
+        Err(CredStoreError::Internal("backend failure".into()))
+    }
+
+    async fn delete(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &SecretRef,
+    ) -> Result<(), CredStoreError> {
         Err(CredStoreError::Internal("backend failure".into()))
     }
 }
@@ -764,13 +844,18 @@ pub fn build_test_app_state(
     let dp = dp_builder
         .with_backend_selector(backend_selector.clone())
         .build_and_register(hub, cp.clone());
-    let facade: Arc<dyn ServiceGatewayClientV1> =
-        Arc::new(ServiceGatewayClientV1Facade::new(cp.clone(), dp.clone()));
+    let oauth: Arc<dyn OAuthEnrollmentService> = Arc::new(NoopOAuthEnrollment);
+    let facade: Arc<dyn ServiceGatewayClientV1> = Arc::new(ServiceGatewayClientV1Facade::new(
+        cp.clone(),
+        dp.clone(),
+        oauth.clone(),
+    ));
     hub.register::<dyn ServiceGatewayClientV1>(facade.clone());
     TestAppState {
         state: crate::gear::AppState {
             cp,
             dp,
+            oauth,
             backend_selector,
             config: crate::config::RuntimeConfig {
                 max_body_size_bytes: 100 * 1024 * 1024, // 100 MB default for tests
@@ -794,7 +879,9 @@ pub fn build_test_gateway(
 ) -> Arc<dyn ServiceGatewayClientV1> {
     let cp = cp_builder.build_and_register(hub);
     let dp = dp_builder.build_and_register(hub, cp.clone());
-    let oagw: Arc<dyn ServiceGatewayClientV1> = Arc::new(ServiceGatewayClientV1Facade::new(cp, dp));
+    let oauth: Arc<dyn OAuthEnrollmentService> = Arc::new(NoopOAuthEnrollment);
+    let oagw: Arc<dyn ServiceGatewayClientV1> =
+        Arc::new(ServiceGatewayClientV1Facade::new(cp, dp, oauth));
     hub.register::<dyn ServiceGatewayClientV1>(oagw.clone());
     oagw
 }

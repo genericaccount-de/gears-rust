@@ -91,3 +91,45 @@ async fn get_trait_impl_returns_none_when_plugin_returns_none() {
     let resp = client.get(&test_ctx(), &key).await.unwrap();
     assert!(resp.is_none());
 }
+
+// ── CredStoreClientV1::put / delete ──────────────────────────────────────
+
+#[tokio::test]
+async fn put_trait_impl_delegates_to_plugin() {
+    let client = make_wired_client(MockPlugin::returns(None));
+    let key = SecretRef::new("tok").unwrap();
+    let result = client
+        .put(&test_ctx(), &key, SecretValue::from("v"), SharingMode::Private)
+        .await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn delete_trait_impl_delegates_to_plugin() {
+    let client = make_wired_client(MockPlugin::returns(None));
+    let key = SecretRef::new("tok").unwrap();
+    assert!(client.delete(&test_ctx(), &key).await.is_ok());
+}
+
+#[tokio::test]
+async fn put_trait_impl_maps_plugin_write_error() {
+    let client = make_wired_client(MockPlugin::write_errors_internal("boom"));
+    let key = SecretRef::new("tok").unwrap();
+    let err = client
+        .put(&test_ctx(), &key, SecretValue::from("v"), SharingMode::Private)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CredStoreError::Internal(_)));
+}
+
+#[tokio::test]
+async fn put_trait_impl_propagates_service_error_when_unwired() {
+    let client = make_client();
+    let key = SecretRef::new("tok").unwrap();
+    // Empty hub → TypesRegistryUnavailable → CredStoreError::Internal
+    let err = client
+        .put(&test_ctx(), &key, SecretValue::from("v"), SharingMode::Private)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CredStoreError::Internal(_)));
+}

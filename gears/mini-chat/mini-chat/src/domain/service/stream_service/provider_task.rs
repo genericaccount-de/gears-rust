@@ -18,9 +18,10 @@ use crate::domain::llm::ToolPhase;
 use crate::domain::ports::knowledge_retriever::{
     KnowledgeRetriever, RetrievalRequest, RetrievedChunk,
 };
+use crate::domain::ports::metric_labels;
 use crate::domain::ports::metric_labels::{stage, trigger};
 use crate::domain::repos::{MessageRepository, ToolCallType, TurnRepository};
-use crate::domain::stream_events::{DoneData, ErrorData, StreamEvent};
+use crate::domain::stream_events::{DoneData, ErrorData, StreamEvent, ToolData};
 use crate::infra::db::entity::chat_turn::TurnState;
 use crate::infra::llm::{
     ClientSseEvent, LlmMessage, LlmProvider, LlmProviderError, LlmRequestBuilder, LlmTool,
@@ -74,6 +75,27 @@ pub(super) struct ProviderTaskConfig {
     pub anthropic_file_ids: std::collections::HashMap<String, String>,
     /// Knowledge search parameters; `None` when the feature is disabled.
     pub knowledge_search: Option<KnowledgeSearchParams>,
+    /// Stream-time MCP dispatch parameters; `None` when MCP execution is off.
+    pub mcp: Option<McpDispatchParams>,
+    /// Resolved MCP tool set for this turn: injected tools plus the exposed-name
+    /// to origin routing map used to dispatch MCP tool calls. Empty when MCP is
+    /// disabled, unsupported by the model, or nothing is effective.
+    pub mcp_resolution: Arc<crate::domain::service::EffectiveResolution>,
+}
+
+/// Parameters for dispatching MCP `tools/call` invocations in the agentic loop.
+pub(super) struct McpDispatchParams {
+    /// The `tools/call` dispatcher (backed by the shared `McpPool`).
+    pub dispatcher: Arc<dyn crate::infra::mcp::McpDispatcher>,
+    /// Soft per-message MCP call limit; once reached, MCP tools are disabled
+    /// for the remainder of the turn (a one-time notice is injected).
+    pub max_calls_per_message: u32,
+    /// Max characters retained per sanitized tool output.
+    pub max_output_chars: usize,
+    /// Process-wide per-tenant MCP call rate limiter, shared across streams.
+    pub rate_limiter: Arc<crate::domain::service::McpRateLimiter>,
+    /// Operator-configured DLP redactor applied to tool output (shared).
+    pub redactor: Arc<crate::domain::service::DlpRedactor>,
 }
 
 /// All five terminal paths (provider done, incomplete, provider error,
@@ -109,6 +131,8 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
         provider_file_id_map,
         anthropic_file_ids,
         knowledge_search,
+        mcp,
+        mcp_resolution,
     } = config;
 
     let span = if let Some(ref fctx) = fin_ctx {
@@ -148,6 +172,27 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
         // raw_input_items grows with each search_knowledge call/output pair.
         let mut raw_input_items: Vec<serde_json::Value> = Vec::new();
         let mut knowledge_call_count: u32 = 0;
+        // Completed MCP `tools/call` invocations this message (soft-capped).
+        let mut mcp_call_count: u32 = 0;
+        // Per-call MCP audit records (hashed args/output) accumulated for the
+        // turn audit event. Never contains raw argument or output content.
+        let mut mcp_audit_records: Vec<mini_chat_sdk::McpToolAuditRecord> = Vec::new();
+        // Compliance snapshot of the MCP tools exposed to the model this turn.
+        // `Some` whenever any MCP tool was injected, even if none were called.
+        let mcp_effective_snapshot = mcp_resolution.effective_snapshot();
+
+        // Bundles the MCP audit telemetry for a `to_finalization_input` call.
+        // Defined as a local macro so every terminal path emits identical
+        // telemetry without repeating the (count, snapshot, records) triple.
+        macro_rules! mcp_turn_audit {
+            () => {
+                crate::domain::model::finalization::McpTurnAudit {
+                    calls: mcp_call_count,
+                    snapshot: mcp_effective_snapshot.clone(),
+                    records: mcp_audit_records.clone(),
+                }
+            };
+        }
 
         // Hard cap on agentic-loop iterations. Without it, a model that keeps
         // emitting `search_knowledge` after the soft per-message limit fires
@@ -158,12 +203,20 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
         // ignores the notice once. Iterations beyond that are forced into
         // a `Failed` terminal via `agentic_iterations_exceeded` below.
         //
-        // When knowledge_search is None the loop body always returns inside
+        // When no tool feature is active the loop body always returns inside
         // the first iteration (any ToolUse falls through to `unexpected_tool_use`),
-        // so the cap is effectively 1.
-        let max_agentic_iterations: u32 = knowledge_search
+        // so the cap is effectively 1. When MCP is active the budget also covers
+        // its soft per-message call limit so legitimate MCP loops are not
+        // truncated before the model can summarise.
+        let tool_call_budget: u32 = knowledge_search
             .as_ref()
-            .map_or(1, |ks| ks.max_calls.saturating_add(2));
+            .map_or(0, |ks| ks.max_calls)
+            .saturating_add(mcp.as_ref().map_or(0, |m| m.max_calls_per_message));
+        let max_agentic_iterations: u32 = if tool_call_budget == 0 {
+            1
+        } else {
+            tool_call_budget.saturating_add(2)
+        };
         let mut agentic_iteration: u32 = 0;
 
         'agentic: loop {
@@ -191,6 +244,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                         web_search_completed_count,
                         code_interpreter_completed_count,
                         knowledge_call_count,
+                        mcp_turn_audit!(),
                         first_token_time.map(|d| d.as_millis() as u64),
                         Some(elapsed.as_millis() as u64),
                     );
@@ -316,6 +370,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                         0,
                         0,
                         knowledge_call_count,
+                        mcp_turn_audit!(),
                         None,
                         None,
                     );
@@ -482,6 +537,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                                                     web_search_completed_count,
                                                     code_interpreter_completed_count,
                                                     knowledge_call_count,
+                                                    mcp_turn_audit!(),
                                                     None,
                                                     None,
                                                 );
@@ -584,6 +640,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                                                     web_search_completed_count,
                                                     code_interpreter_completed_count,
                                                     knowledge_call_count,
+                                                    mcp_turn_audit!(),
                                                     None,
                                                     None,
                                                 );
@@ -693,6 +750,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                                     web_search_completed_count,
                                     code_interpreter_completed_count,
                                     knowledge_call_count,
+                                    mcp_turn_audit!(),
                                     first_token_time.map(|d| d.as_millis() as u64),
                                     Some(mid_elapsed.as_millis() as u64),
                                 );
@@ -773,6 +831,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                     web_search_completed_count,
                     code_interpreter_completed_count,
                     knowledge_call_count,
+                    mcp_turn_audit!(),
                     first_token_time.map(|d| d.as_millis() as u64),
                     Some(elapsed.as_millis() as u64),
                 );
@@ -830,6 +889,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                         web_search_completed_count,
                         code_interpreter_completed_count,
                         knowledge_call_count,
+                        mcp_turn_audit!(),
                         first_token_time.map(|d| d.as_millis() as u64),
                         Some(elapsed.as_millis() as u64),
                     );
@@ -956,6 +1016,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                         web_search_completed_count,
                         code_interpreter_completed_count,
                         knowledge_call_count,
+                        mcp_turn_audit!(),
                         first_token_time.map(|d| d.as_millis() as u64),
                         Some(elapsed.as_millis() as u64),
                     );
@@ -1056,6 +1117,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                         web_search_completed_count,
                         code_interpreter_completed_count,
                         knowledge_call_count,
+                        mcp_turn_audit!(),
                         first_token_time.map(|d| d.as_millis() as u64),
                         Some(elapsed.as_millis() as u64),
                     );
@@ -1252,6 +1314,281 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                         continue 'agentic;
                 }
 
+                // MCP tool dispatch. A route in the resolution map identifies the
+                // call as an MCP `tools/call`; execution requires the dispatcher
+                // (`mcp`) to be wired. When present, every call is validated,
+                // dispatched, sanitized, and replayed as a `function_call_output`
+                // so the agentic loop continues — MCP failures never fail the turn.
+                if let Some(route) = mcp_resolution.routing_map.resolve(&name)
+                    && let Some(ref mcp) = mcp
+                {
+                    // Drop explicit-`null` optional arguments the model commonly
+                    // emits (e.g. `{"fields": null}`). Left in place they fail
+                    // pre-dispatch schema validation, get rejected, and the model
+                    // retries — looping until the tool-use budget is exhausted.
+                    let input =
+                        crate::domain::service::mcp_argument_validator::strip_null_object_members(
+                            input,
+                        );
+
+                    let raw_arguments =
+                        serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_owned());
+
+                    // Soft per-message call limit — graceful degradation: append
+                    // the call plus a limit notice so the model can summarise.
+                    if mcp_call_count >= mcp.max_calls_per_message {
+                        warn!(
+                            tool = %name,
+                            mcp_call_count,
+                            limit = mcp.max_calls_per_message,
+                            "MCP tool call per-message limit reached, injecting soft limit response"
+                        );
+                        raw_input_items.push(serde_json::json!({
+                            "type": "function_call",
+                            "call_id": tool_use_id,
+                            "name": name,
+                            "arguments": raw_arguments,
+                        }));
+                        raw_input_items.push(serde_json::json!({
+                            "type": "function_call_output",
+                            "call_id": tool_use_id,
+                            "output": "Tool call limit reached for this message. \
+                                       Please answer based on the information already gathered.",
+                        }));
+                        continue 'agentic;
+                    }
+
+                    // Per-tenant per-minute rate limit — a global ceiling across
+                    // all of the tenant's concurrent turns (the per-message cap
+                    // above is turn-scoped). On breach, degrade gracefully like
+                    // the per-message cap and record a `rate_limited` outcome so
+                    // ops can observe throttling. Never fails the turn.
+                    if !mcp.rate_limiter.try_acquire(ctx.subject_tenant_id()) {
+                        warn!(
+                            tool = %name,
+                            "MCP per-tenant rate limit reached, injecting soft limit response"
+                        );
+                        if let Some(ref fctx) = fin_ctx {
+                            fctx.metrics.record_mcp_call(
+                                &route.server_id.to_string(),
+                                &route.original_name,
+                                metric_labels::mcp_status::RATE_LIMITED,
+                            );
+                        }
+                        raw_input_items.push(serde_json::json!({
+                            "type": "function_call",
+                            "call_id": tool_use_id,
+                            "name": name,
+                            "arguments": raw_arguments,
+                        }));
+                        raw_input_items.push(serde_json::json!({
+                            "type": "function_call_output",
+                            "call_id": tool_use_id,
+                            "output": "Tool call rate limit reached for this tenant. \
+                                       Please answer based on the information already gathered.",
+                        }));
+                        continue 'agentic;
+                    }
+
+                    mcp_call_count += 1;
+
+                    // Append the model's function_call item to replay history.
+                    raw_input_items.push(serde_json::json!({
+                        "type": "function_call",
+                        "call_id": tool_use_id,
+                        "name": name,
+                        "arguments": raw_arguments,
+                    }));
+
+                    let server_id = route.server_id.to_string();
+                    let original_name = route.original_name.clone();
+                    let trust_level = route.trust_level;
+                    // Stable, non-reversible hash of the arguments for the audit
+                    // record — raw arguments are never persisted.
+                    let arguments_hash = format!(
+                        "{:016x}",
+                        crate::domain::service::mcp_schema_sanitizer::fnv1a_64(
+                            raw_arguments.as_bytes()
+                        )
+                    );
+
+                    // Pre-dispatch argument validation against the normalized
+                    // schema. On failure the call never reaches the server; the
+                    // violation is surfaced so the model can correct itself.
+                    let (output_text, status, output_hash, error_class, duration_ms) =
+                        if let Err(reason) =
+                            crate::domain::service::mcp_argument_validator::validate_arguments(
+                                &input,
+                                &route.input_schema,
+                            ) {
+                            warn!(
+                                tool = %name,
+                                server_id = %server_id,
+                                %reason,
+                                "MCP tool arguments failed schema validation; not dispatching"
+                            );
+                            (
+                                format!("Invalid arguments for tool `{original_name}`: {reason}"),
+                                metric_labels::mcp_status::INVALID_ARGS,
+                                None,
+                                None,
+                                0_u64,
+                            )
+                        } else {
+                            // Notify the client that a tool call is starting so
+                            // the UI can render MCP activity — parity with
+                            // provider-native tools (web_search/code_interpreter).
+                            let _ = tx
+                                .send(StreamEvent::Tool(ToolData {
+                                    phase: ToolPhase::Start,
+                                    name: name.clone(),
+                                    tool_type: Some("mcp".to_owned()),
+                                    details: serde_json::json!({}),
+                                }))
+                                .await;
+
+                            let call_start = std::time::Instant::now();
+                            let result = mcp
+                                .dispatcher
+                                .dispatch(&ctx, &server_id, &original_name, &input)
+                                .await;
+                            let elapsed = call_start.elapsed();
+                            let call_ms = elapsed.as_secs_f64() * 1000.0;
+                            let duration_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+                            if let Some(ref fctx) = fin_ctx {
+                                fctx.metrics.record_mcp_call_latency_ms(
+                                    &server_id,
+                                    &original_name,
+                                    call_ms,
+                                );
+                            }
+
+                            let _ = tx
+                                .send(StreamEvent::Tool(ToolData {
+                                    phase: ToolPhase::Done,
+                                    name: name.clone(),
+                                    tool_type: Some("mcp".to_owned()),
+                                    details: serde_json::json!({}),
+                                }))
+                                .await;
+
+                            match result {
+                                Ok(tool_result) => {
+                                    let output =
+                                        crate::domain::service::mcp_output_sanitizer::sanitize_redact_and_truncate(
+                                            &tool_result,
+                                            trust_level,
+                                            mcp.max_output_chars,
+                                            &mcp.redactor,
+                                        );
+                                    let status = if tool_result.is_error {
+                                        metric_labels::mcp_status::ERROR
+                                    } else {
+                                        metric_labels::mcp_status::OK
+                                    };
+                                    let output_hash = format!(
+                                        "{:016x}",
+                                        crate::domain::service::mcp_schema_sanitizer::fnv1a_64(
+                                            output.as_bytes()
+                                        )
+                                    );
+                                    if let Some(ref fctx) = fin_ctx {
+                                        fctx.metrics.record_mcp_call_output_chars(
+                                            output.chars().count() as f64,
+                                        );
+
+                                        // Persist increment to chat_turns so the
+                                        // orphan watchdog / audit can observe MCP
+                                        // activity if the pod dies mid-stream. Same
+                                        // pattern as web_search / file_search.
+                                        if let Ok(conn) = fctx.db.conn() {
+                                            if let Err(e) = fctx
+                                                .turn_repo
+                                                .increment_tool_calls(
+                                                    &conn,
+                                                    &fctx.scope,
+                                                    fctx.turn_id,
+                                                    ToolCallType::Mcp,
+                                                )
+                                                .await
+                                            {
+                                                warn!(
+                                                    turn_id = %fctx.turn_id,
+                                                    error = %e,
+                                                    "failed to persist mcp_completed_count"
+                                                );
+                                            }
+                                        } else {
+                                            warn!(
+                                                turn_id = %fctx.turn_id,
+                                                "failed to acquire DB conn for mcp_completed_count"
+                                            );
+                                        }
+                                    }
+                                    (output, status, Some(output_hash), None, duration_ms)
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        tool = %name,
+                                        server_id = %server_id,
+                                        error = %e,
+                                        class = e.class(),
+                                        "MCP tool dispatch failed"
+                                    );
+                                    let status = match &e {
+                                        crate::infra::mcp::McpError::Timeout { .. } => {
+                                            metric_labels::mcp_status::TIMEOUT
+                                        }
+                                        crate::infra::mcp::McpError::CircuitOpen
+                                        | crate::infra::mcp::McpError::ServerNotFound(_) => {
+                                            metric_labels::mcp_status::UNAVAILABLE
+                                        }
+                                        _ => metric_labels::mcp_status::ERROR,
+                                    };
+                                    // Bounded, non-leaky, class-specific error
+                                    // surfaced to the model so it can recover —
+                                    // a timeout nudges it to narrow the request
+                                    // rather than repeat the same expensive call.
+                                    (
+                                        e.model_facing_message(&original_name),
+                                        status,
+                                        None,
+                                        Some(e.class().to_owned()),
+                                        duration_ms,
+                                    )
+                                }
+                            }
+                        };
+
+                    // Single outcome counter with full labels (server, tool,
+                    // status), regardless of which branch produced the result.
+                    if let Some(ref fctx) = fin_ctx {
+                        fctx.metrics
+                            .record_mcp_call(&server_id, &original_name, status);
+                    }
+
+                    // Per-call audit record (hashed args/output; never raw).
+                    mcp_audit_records.push(mini_chat_sdk::McpToolAuditRecord {
+                        server_id: server_id.clone(),
+                        exposed_name: name.clone(),
+                        original_name: original_name.clone(),
+                        call_id: tool_use_id.clone(),
+                        duration_ms,
+                        status: status.to_owned(),
+                        error_class,
+                        arguments_hash,
+                        output_hash,
+                    });
+
+                    raw_input_items.push(serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": tool_use_id,
+                        "output": output_text,
+                    }));
+
+                    continue 'agentic;
+                }
+
                 // Unrecognised tool or feature disabled — treat as a provider failure.
                 warn!(tool = %name, "unexpected ToolUse outcome; finalizing as failed");
                 let code = "unexpected_tool_use".to_owned();
@@ -1268,6 +1605,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                         web_search_completed_count,
                         code_interpreter_completed_count,
                         knowledge_call_count,
+                        mcp_turn_audit!(),
                         first_token_time.map(|d| d.as_millis() as u64),
                         Some(elapsed.as_millis() as u64),
                     );

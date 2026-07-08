@@ -8,11 +8,13 @@ use crate::config::OrphanWatchdogConfig;
 use crate::domain::repos::{MessageRepository, TurnRepository};
 use crate::infra::leader::LeaderElector;
 use crate::infra::workers::WorkerHandles;
+use crate::infra::workers::mcp_refresh_worker::{McpRefreshConfig, McpRefreshDeps};
 use crate::infra::workers::orphan_watchdog::OrphanWatchdogDeps;
 
 /// Worker configs captured in `init()` and consumed by `start()`.
 pub struct WorkerConfigs {
     pub(crate) orphan_watchdog: OrphanWatchdogConfig,
+    pub(crate) mcp_refresh: McpRefreshConfig,
 }
 
 /// Default grace period for top-level worker shutdown before remaining tasks
@@ -40,6 +42,7 @@ pub fn spawn_workers<TR, MR>(
     parent_cancel: &CancellationToken,
     leader_elector: Option<&Arc<dyn LeaderElector>>,
     orphan_deps: Option<OrphanWatchdogDeps<TR, MR>>,
+    mcp_refresh_deps: Option<McpRefreshDeps>,
 ) -> anyhow::Result<(WorkerHandles, CancellationToken)>
 where
     TR: TurnRepository + 'static,
@@ -68,11 +71,31 @@ where
         );
     }
 
+    if configs.mcp_refresh.enabled {
+        let elector = Arc::clone(
+            leader_elector
+                .ok_or_else(|| anyhow::anyhow!("leader elector required for mcp_refresh"))?,
+        );
+        let deps = mcp_refresh_deps
+            .ok_or_else(|| anyhow::anyhow!("mcp refresh deps required when enabled"))?;
+        let cancel = worker_cancel.child_token();
+        handles.spawn(
+            "mcp_refresh",
+            cancel.clone(),
+            crate::infra::workers::mcp_refresh_worker::run(
+                elector,
+                configs.mcp_refresh,
+                deps,
+                cancel,
+            ),
+        );
+    }
+
     Ok((handles, worker_cancel))
 }
 
 fn leader_workers_enabled(configs: &WorkerConfigs) -> bool {
-    configs.orphan_watchdog.enabled
+    configs.orphan_watchdog.enabled || configs.mcp_refresh.enabled
 }
 
 /// Create the appropriate [`LeaderElector`] based on compile-time features
@@ -115,6 +138,10 @@ mod tests {
                 enabled: false,
                 ..Default::default()
             },
+            mcp_refresh: McpRefreshConfig {
+                enabled: false,
+                interval: Duration::from_mins(5),
+            },
         }
     }
 
@@ -128,7 +155,7 @@ mod tests {
         let (handles, worker_cancel) = spawn_workers::<
             crate::infra::db::repo::turn_repo::TurnRepository,
             crate::infra::db::repo::message_repo::MessageRepository,
-        >(&configs, &parent_cancel, elector.as_ref(), None)
+        >(&configs, &parent_cancel, elector.as_ref(), None, None)
         .unwrap();
         assert_eq!(handles.len(), 0);
 

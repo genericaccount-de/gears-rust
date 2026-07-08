@@ -57,6 +57,9 @@ pub struct MiniChatConfig {
     /// Knowledge search (RAG) feature configuration.
     #[serde(default)]
     pub knowledge_search: KnowledgeSearchConfig,
+    /// MCP (Model Context Protocol) server support.
+    #[serde(default)]
+    pub mcp: McpConfig,
 }
 
 /// Which file/vector-store implementation to use for RAG operations.
@@ -441,6 +444,7 @@ impl Default for MiniChatConfig {
             cleanup_worker: CleanupWorkerConfig::default(),
             thumbnail: ThumbnailConfig::default(),
             knowledge_search: KnowledgeSearchConfig::default(),
+            mcp: McpConfig::default(),
         }
     }
 }
@@ -723,6 +727,11 @@ pub struct ContextConfig {
     #[serde(default = "default_file_search_guard")]
     pub file_search_guard: String,
 
+    /// Soft-guideline instruction appended to system prompt when at least one
+    /// MCP tool is injected into the request.
+    #[serde(default = "default_mcp_guard")]
+    pub mcp_guard: String,
+
     /// Maximum number of recent messages to include in context. Range: 0–100.
     #[serde(default = "default_recent_messages_limit")]
     pub recent_messages_limit: u32,
@@ -733,6 +742,7 @@ impl Default for ContextConfig {
         Self {
             web_search_guard: default_web_search_guard(),
             file_search_guard: default_file_search_guard(),
+            mcp_guard: default_mcp_guard(),
             recent_messages_limit: default_recent_messages_limit(),
         }
     }
@@ -756,6 +766,10 @@ fn default_web_search_guard() -> String {
 
 fn default_file_search_guard() -> String {
     "Use file_search to find relevant information in the user's uploaded documents. Prefer file_search over general knowledge when documents are available.".to_owned()
+}
+
+fn default_mcp_guard() -> String {
+    "Additional tools may be provided by external MCP servers. Call them only when they are clearly relevant to the user's request, prefer built-in tools when they can accomplish the same task, and never expose raw tool output verbatim without validating it.".to_owned()
 }
 
 fn default_recent_messages_limit() -> u32 {
@@ -1042,6 +1056,230 @@ impl KnowledgeSearchConfig {
         }
         Ok(())
     }
+}
+
+/// MCP (Model Context Protocol) server support configuration.
+///
+/// Mirrors DESIGN.md §"MCP Configuration". All MCP traffic is routed through
+/// OAGW over HTTP Streamable; stdio is not supported.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpConfig {
+    /// Master switch for MCP support. Default: `false` (dark-launched).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Optional MCP hub base URL for periodic server discovery.
+    #[serde(default)]
+    pub hub_url: Option<String>,
+    /// Auth for the hub, if `hub_url` is set.
+    #[serde(default)]
+    pub hub_auth: Option<crate::infra::mcp::McpAuth>,
+    /// In-memory read-through tool cache TTL (seconds). Default: 30.
+    #[serde(default = "default_mcp_tool_cache_ttl_secs")]
+    pub tool_cache_ttl_secs: u64,
+    /// Background `tools/list` → DB upsert refresh interval (seconds). Default: 300.
+    #[serde(default = "default_mcp_background_refresh_interval_secs")]
+    pub background_refresh_interval_secs: u64,
+    /// Cap on total tools (built-in + MCP) injected per chat. Default: 150.
+    #[serde(default = "default_mcp_max_tools_per_chat")]
+    pub max_tools_per_chat: usize,
+    /// Max serialized tool schema bytes before rejection. Default: 16384.
+    #[serde(default = "default_mcp_max_tool_schema_bytes")]
+    pub max_tool_schema_bytes: usize,
+    /// Max characters kept per tool output after sanitization. Default: 8192.
+    #[serde(default = "default_mcp_max_tool_output_chars")]
+    pub max_tool_output_chars: usize,
+    /// Soft per-message MCP call limit. Default: 10.
+    #[serde(default = "default_mcp_max_calls_per_message")]
+    pub max_mcp_calls_per_message: u32,
+    /// Per-tenant MCP call ceiling per minute, shared across the tenant's
+    /// concurrent turns. `0` disables enforcement. Default: 0.
+    #[serde(default)]
+    pub max_mcp_calls_per_minute_per_tenant: u32,
+    /// DLP redaction regex patterns applied to MCP tool output before it
+    /// re-enters the conversation. Each match is replaced with `[REDACTED]`.
+    /// Empty (default) disables redaction. Patterns are validated at startup.
+    #[serde(default)]
+    pub dlp_redaction_patterns: Vec<String>,
+    /// Default per-call timeout (seconds); overridable per server. Default: 30.
+    #[serde(default = "default_mcp_call_timeout_secs")]
+    pub call_timeout_secs: u64,
+    /// HTTP transport safety policy (enforced by OAGW upstream config).
+    #[serde(default)]
+    pub http: McpHttpPolicy,
+    /// Config-defined MCP servers (`source='config'`).
+    #[serde(default)]
+    pub servers: Vec<McpServerConfig>,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hub_url: None,
+            hub_auth: None,
+            tool_cache_ttl_secs: default_mcp_tool_cache_ttl_secs(),
+            background_refresh_interval_secs: default_mcp_background_refresh_interval_secs(),
+            max_tools_per_chat: default_mcp_max_tools_per_chat(),
+            max_tool_schema_bytes: default_mcp_max_tool_schema_bytes(),
+            max_tool_output_chars: default_mcp_max_tool_output_chars(),
+            max_mcp_calls_per_message: default_mcp_max_calls_per_message(),
+            max_mcp_calls_per_minute_per_tenant: 0,
+            dlp_redaction_patterns: Vec::new(),
+            call_timeout_secs: default_mcp_call_timeout_secs(),
+            http: McpHttpPolicy::default(),
+            servers: Vec::new(),
+        }
+    }
+}
+
+impl McpConfig {
+    /// Validate MCP configuration invariants.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.tool_cache_ttl_secs == 0 {
+            return Err("mcp.tool_cache_ttl_secs must be > 0".to_owned());
+        }
+        if self.background_refresh_interval_secs == 0 {
+            return Err("mcp.background_refresh_interval_secs must be > 0".to_owned());
+        }
+        if self.max_tools_per_chat == 0 {
+            return Err("mcp.max_tools_per_chat must be > 0".to_owned());
+        }
+        if self.max_mcp_calls_per_message == 0 {
+            return Err("mcp.max_mcp_calls_per_message must be > 0".to_owned());
+        }
+        if self.call_timeout_secs == 0 {
+            return Err("mcp.call_timeout_secs must be > 0".to_owned());
+        }
+        if self.hub_url.is_some() && self.hub_auth.is_none() {
+            return Err("mcp.hub_auth must be set when mcp.hub_url is configured".to_owned());
+        }
+        for pattern in &self.dlp_redaction_patterns {
+            if let Err(e) = regex::Regex::new(pattern) {
+                return Err(format!(
+                    "mcp.dlp_redaction_patterns: invalid regex '{pattern}': {e}"
+                ));
+            }
+        }
+        for server in &self.servers {
+            server.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// A config-defined MCP server entry (`source='config'`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpServerConfig {
+    /// Stable external identifier (unique per tenant+source).
+    pub id: String,
+    /// HTTP Streamable endpoint URL (required).
+    pub url: String,
+    /// Human-readable name.
+    #[serde(default)]
+    pub name: String,
+    /// Server description.
+    #[serde(default)]
+    pub description: String,
+    /// Whether to auto-attach this server to all roles. Default: false.
+    #[serde(default)]
+    pub auto_attach: bool,
+    /// Deterministic ordering priority. Default: 100.
+    #[serde(default = "default_mcp_server_priority")]
+    pub priority: i32,
+    /// Per-server call timeout override (seconds).
+    #[serde(default)]
+    pub call_timeout_secs: Option<u64>,
+    /// Allowlist of tool names; `None` = allow all.
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
+    /// Denylist of tool names; applied after the allowlist.
+    #[serde(default)]
+    pub denied_tools: Option<Vec<String>>,
+    /// Authentication configuration (mapped to OAGW auth plugin).
+    #[serde(default)]
+    pub auth: crate::infra::mcp::McpAuth,
+}
+
+impl McpServerConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.id.trim().is_empty() {
+            return Err("mcp.servers[].id must not be empty".to_owned());
+        }
+        if self.url.trim().is_empty() {
+            return Err(format!("mcp.servers[{}].url must not be empty", self.id));
+        }
+        if let Some(secs) = self.call_timeout_secs
+            && secs == 0
+        {
+            return Err(format!(
+                "mcp.servers[{}].call_timeout_secs must be > 0 when set",
+                self.id
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// HTTP transport safety policy for MCP servers (enforced by OAGW).
+// Independent on/off safety toggles map naturally to booleans in TOML config;
+// grouping them into an enum would obscure the configuration surface.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpHttpPolicy {
+    #[serde(default = "default_true")]
+    pub require_https: bool,
+    #[serde(default = "default_true")]
+    pub deny_private_ip_ranges: bool,
+    #[serde(default)]
+    pub allow_redirects: bool,
+}
+
+impl Default for McpHttpPolicy {
+    fn default() -> Self {
+        Self {
+            require_https: true,
+            deny_private_ip_ranges: true,
+            allow_redirects: false,
+        }
+    }
+}
+
+fn default_mcp_tool_cache_ttl_secs() -> u64 {
+    30
+}
+
+fn default_mcp_background_refresh_interval_secs() -> u64 {
+    300
+}
+
+fn default_mcp_max_tools_per_chat() -> usize {
+    150
+}
+
+fn default_mcp_max_tool_schema_bytes() -> usize {
+    16384
+}
+
+fn default_mcp_max_tool_output_chars() -> usize {
+    8192
+}
+
+fn default_mcp_max_calls_per_message() -> u32 {
+    10
+}
+
+fn default_mcp_call_timeout_secs() -> u64 {
+    30
+}
+
+fn default_mcp_server_priority() -> i32 {
+    100
 }
 
 fn default_url_prefix() -> String {

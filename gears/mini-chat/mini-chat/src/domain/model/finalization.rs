@@ -1,4 +1,4 @@
-use mini_chat_sdk::RequesterType;
+use mini_chat_sdk::{McpEffectiveSnapshot, McpToolAuditRecord, RequesterType};
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
 use toolkit_security::AccessScope;
@@ -57,6 +57,15 @@ pub struct FinalizationInput {
     /// Number of completed knowledge-search (RAG) tool calls during this turn.
     pub file_search_calls: u32,
 
+    // ── MCP audit telemetry (not billed) ──
+    /// Number of completed MCP `tools/call` invocations during this turn.
+    pub mcp_calls: u32,
+    /// Effective MCP server/tool snapshot exposed for this turn (compliance).
+    /// `None` when MCP was not active.
+    pub mcp_effective_snapshot: Option<McpEffectiveSnapshot>,
+    /// Per-call MCP audit records (hashed arguments/output; never raw content).
+    pub mcp_tool_audit_records: Vec<McpToolAuditRecord>,
+
     /// Context window size of the effective model (tokens) — for summary trigger.
     pub context_window: u32,
     /// Estimated input tokens from context assembly (all messages + system prompt).
@@ -69,6 +78,19 @@ pub struct FinalizationInput {
     pub ttft_ms: Option<u64>,
     /// Total stream duration in milliseconds (captured in `stream_service`).
     pub total_ms: Option<u64>,
+}
+
+/// MCP audit telemetry collected by the provider task during the agentic loop,
+/// carried into [`FinalizationInput`] for the turn audit event. Not billed.
+#[domain_model]
+#[derive(Debug, Clone, Default)]
+pub struct McpTurnAudit {
+    /// Completed `tools/call` invocations this turn.
+    pub calls: u32,
+    /// Effective server/tool snapshot exposed to the model (compliance).
+    pub snapshot: Option<McpEffectiveSnapshot>,
+    /// Per-call audit records (hashed arguments/output).
+    pub records: Vec<McpToolAuditRecord>,
 }
 
 /// Result of `finalize_turn_cas()`.

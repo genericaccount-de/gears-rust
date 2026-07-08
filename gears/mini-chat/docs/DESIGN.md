@@ -578,6 +578,10 @@ Covers public API from PRD: `cpt-cf-mini-chat-interface-public-api`
 | `GET` | `/v1/admin/roles/{role}/mcp-servers` | List MCP servers assigned to a role (admin-only, paginated) | stable |
 | `GET` | `/v1/chats/{id}/mcp-tools/effective` | Explain effective MCP servers/tools and omissions for a chat | stable |
 | `POST` | `/v1/mcp-servers/{id}/tools:refresh` | Refresh tool metadata from MCP server (admin/operator) | stable |
+| `POST` | `/v1/mcp-servers/{id}/connection:authorize` | Begin interactive per-user OAuth connection; returns `authorization_url` + `state` | stable |
+| `POST` | `/v1/mcp-connections:complete` | Complete an interactive OAuth connection (exchange `state` + `code`) | stable |
+| `GET` | `/v1/mcp-servers/{id}/connection` | Get the caller's per-user OAuth connection status for a server | stable |
+| `DELETE` | `/v1/mcp-servers/{id}/connection` | Revoke the caller's per-user OAuth connection for a server | stable |
 
 **Create Chat** (`POST /v1/chats`):
 
@@ -1327,7 +1331,7 @@ MCP servers are third-party or internally hosted services accessed via HTTP Stre
 
 **Transport safety**: HTTPS enforced by OAGW upstream configuration, SSRF protection via OAGW's built-in `SsrfPolicy` (private IP/DNS-rebinding checks), redirect restrictions, request/response size limits, per-server timeout. MCP-specific headers (`Mcp-Protocol-Version`, `Mcp-Session-Id`, `X-OAGW-Target-Host`) are forwarded via OAGW header passthrough allowlist. Stdio transport is **not supported** — see MCP Servers Support (section 4) for rationale.
 
-**Auth**: Bearer token, API key, or OAuth 2.0 client credentials — resolved via OAGW's built-in auth plugins (`apikey`, `oauth2_client_cred`) from credstore using the calling user's `SecurityContext`. Mini-chat does not resolve secrets or manage tokens directly. See MCP Servers Support (section 4) for details.
+**Auth**: Bearer token, API key, OAuth 2.0 client credentials, or interactive OAuth 2.0 authorization code (per-user) — resolved via OAGW's built-in auth plugins (`apikey`, `oauth2_client_cred`, `oauth2_auth_code`) from credstore using the calling user's `SecurityContext`. Mini-chat does not resolve secrets or manage tokens directly; for the interactive authorization-code flow it only orchestrates enrollment (begin/complete/revoke/status) through OAGW, which owns dynamic client registration, PKCE, and the per-user token store. See MCP Servers Support (section 4) for details.
 
 #### PostgreSQL
 
@@ -3357,8 +3361,18 @@ Mini-chat does not resolve secrets or manage tokens directly. When creating the 
 | `Bearer { secret_ref }` | `apikey` (`gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1`) | `header: "authorization"`, `prefix: "Bearer "`, `secret_ref` |
 | `ApiKey { header, secret_ref }` | `apikey` (`gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1`) | `header`, `prefix: ""`, `secret_ref` |
 | `OAuth2 { client_id_ref, client_secret_ref, token_url, scopes }` | `oauth2_client_cred` (`gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred.v1`) | `token_endpoint`, `client_id_ref`, `client_secret_ref`, `scopes` |
+| `OAuth2AuthorizationCode { scopes }` | `oauth2_auth_code` (`gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_auth_code.v1`) | `scopes` (no secret refs — OAGW owns dynamic client registration, PKCE, and the per-user token store) |
 
 **Per-user credential resolution:** OAGW's auth plugins resolve secrets from credstore using the calling user's `SecurityContext` (containing `subject_tenant_id` and `subject_id`). This enables per-user credential isolation — each user's request to the same MCP server resolves the correct user-scoped secret from credstore. OAGW's `OAuth2ClientCredAuthPlugin` builds cache keys as `{tenant_id}:{user_id}:{auth_method}:{config_hash}`, so OAuth2 tokens are cached per user. The cache TTL is configurable with a 30-second safety margin before expiry (`TOKEN_EXPIRY_SAFETY_MARGIN`). If a token expires despite the safety margin, OAGW re-fetches on the next request; if re-fetch fails, mini-chat marks the server degraded and its tools are omitted. Secrets are never logged, returned via API, or included in audit payloads — enforced by OAGW's credential isolation principle (`cred://` URI references only).
+
+**Interactive per-user OAuth (authorization-code) enrollment:** For servers configured with `McpAuth::OAuth2AuthorizationCode { scopes }` (`auth_kind = oauth2_auth_code`), each user must complete a one-time browser consent before the server's tools become available to them. Unlike the client-credentials flow (machine-to-machine, no user interaction), the authorization-code flow requires an interactive redirect. Mini-chat exposes four thin endpoints that orchestrate this enrollment against OAGW's OAuth management API (`ServiceGatewayClientV1`); OAGW owns dynamic client registration, PKCE, the CSRF `state`, the token exchange, and the per-user token store keyed by `(tenant, user, upstream)`:
+
+1. **Begin** (`POST /v1/mcp-servers/{id}/connection:authorize`, action `manage_mcp_connection`) — validates the server is `oauth2_auth_code` and has a provisioned `oagw_upstream_id`, reads `scopes` from the server's stored `auth_config`, and calls OAGW `begin_oauth_authorization(upstream_id, scopes, redirect_uri, client_name)`. Returns `{ authorization_url, state }`. The client opens `authorization_url` in a browser/popup.
+2. **Complete** (`POST /v1/mcp-connections:complete`, action `manage_mcp_connection`) — after the authorization server redirects back to `redirect_uri` with `code` + `state`, the client posts them here; mini-chat calls OAGW `complete_oauth_authorization(state, code)`, which exchanges the code and persists the per-user token. Returns `204 No Content`. This endpoint is not server-scoped — `state` identifies the pending authorization.
+3. **Status** (`GET /v1/mcp-servers/{id}/connection`, action `read_mcp_server`) — calls OAGW `oauth_connection_status(upstream_id)`; returns `{ connected: bool, expires_at_unix: Option<i64> }`.
+4. **Revoke** (`DELETE /v1/mcp-servers/{id}/connection`, action `manage_mcp_connection`) — calls OAGW `revoke_oauth_authorization(upstream_id)`, deleting the user's stored token. Returns `204 No Content`.
+
+Mini-chat never sees the authorization code exchange, refresh tokens, or client secrets — it only relays `state`/`code` and reads a boolean status. Gateway failures surface as `mcp_server_unavailable` (502).
 
 **Concurrency and resilience:**
 - Per-server semaphores cap concurrent `tools/call` requests
@@ -3471,6 +3485,9 @@ Servers are tenant-scoped or globally registered. The `mcp_servers` table (secti
 6. Validate and normalize schemas to provider-supported JSON Schema subset
 7. Sort tools deterministically by server priority, role grant order, and tool name
 8. Enforce tool count/schema size caps and return diagnostics for omitted tools
+9. **Per-user interactive-OAuth gating** — for servers using `auth_kind = oauth2_auth_code`, drop their tools for any caller who has not completed a per-user connection (emitting a `ServerNotConnected { server_id }` diagnostic). This gate is applied per user on top of the tenant-level resolution (see below), because connection state is per user, not per tenant.
+
+**Per-user OAuth gating overlay:** The tenant-level resolution above is cached once per tenant; interactive-OAuth servers additionally require a per-user check. During tenant resolution the resolver records which resolved servers are `oauth2_auth_code` (with their `oagw_upstream_id` and contributed exposed tool names). On the per-user path, `EffectiveMcpResolver` checks the caller's live connection status via OAGW `oauth_connection_status(upstream_id)`, cached briefly per `(subject_id, upstream_id)` (30-second TTL) to spare the status endpoint on repeated turns. A transient gateway error fails closed for that turn (tools hidden) and is not cached. When no interactive-OAuth servers exist for a tenant, the resolver returns the shared tenant resolution unchanged (zero-cost fast path).
 
 **Effective resolution cache** — `moka::future::Cache<(String, u64), Arc<EffectiveResolution>>` keyed by `(tenant_id, roles_hash)` with a short TTL of 30 seconds. No explicit invalidation triggers are required — the short TTL ensures that changes (role-server assignments, server status, tool updates, policy changes) propagate within one TTL window without adding cache-invalidation complexity. Short-circuit for no-MCP users: returns empty result without DB queries.
 
@@ -3480,6 +3497,10 @@ Servers are tenant-scoped or globally registered. The `mcp_servers` table (secti
 - `McpServerAdminInfo` — admin/operator DTO (includes URL, auth type, health details)
 - `McpToolInfo` — tool name, description, input schema, enabled flag, trust level
 - `AssignMcpServerToRoleRequest` — `{ server_id: String }`
+- `McpServerInfo` additionally carries `requires_user_connection: bool` (`true` when `auth_kind = oauth2_auth_code`) so clients can surface a "Connect" affordance and query per-user status
+- `BeginMcpConnectionReq` — `{ redirect_uri: String }`; `BeginMcpConnectionResp` — `{ authorization_url: String, state: String }`
+- `CompleteMcpConnectionReq` — `{ state: String, code: String }`
+- `McpConnectionStatusDto` — `{ connected: bool, expires_at_unix: Option<i64> }`
 
 **Error codes**: `mcp_server_unavailable` (502), `mcp_server_not_found` (404), `mcp_assign_denied` (403).
 
@@ -3499,6 +3520,7 @@ Servers are tenant-scoped or globally registered. The `mcp_servers` table (secti
 | Tool outputs | Treated as untrusted data; capped, sanitized, optionally redacted |
 | HTTP transport | All MCP traffic routed through OAGW; SSRF protection, DNS rebinding checks, redirect restrictions, and size limits enforced by OAGW's built-in policies |
 | Secrets | Resolved from credstore via OAGW auth plugins using per-user `SecurityContext`; never logged, returned via API, or included in audit; OAGW credential isolation enforces `cred://` URI references only |
+| Interactive OAuth connections | Per-user authorization-code enrollment orchestrated through OAGW (dynamic client registration, PKCE, `state`, token store owned by OAGW); mini-chat relays only `state`/`code` and reads a boolean status; enrollment endpoints are PEP-authorized (`manage_mcp_connection` for begin/complete/revoke, `read_mcp_server` for status); tools of an unconnected interactive-OAuth server are hidden per user (`ServerNotConnected` diagnostic) |
 | OAGW upstream lifecycle | Each MCP server has a corresponding OAGW upstream + route created via `ServiceGatewayClientV1` SDK; upstream ID stored in `mcp_servers.oagw_upstream_id`; updates/deletes synchronized |
 
 **System prompt requirement**: When MCP tools are active, the system prompt MUST include:
@@ -3602,7 +3624,16 @@ general_config:
 - **Phase 1**: Domain model, config, REST API (DB tables incl. `oagw_upstream_id` column, SeaORM entities, `McpService` with OAGW upstream CRUD, `EffectiveMcpResolver`, admin endpoints, config-seeded server sync with OAGW upstream creation)
 - **Phase 2**: Tool discovery & injection (context assembly integration, routing map, `FeatureFlag::Mcp`, model guard, schema normalization)
 - **Phase 3**: Tool execution in agentic loop (`TerminalOutcome::ToolUse` extension, sequential dispatch, argument validation, rate limiting, SSE events, audit, metrics)
-- **Phase 4**: Production hardening & hub integration (hub sync, health checks, OAuth token rotation, DLP hooks, mTLS)
+- **Phase 4**: Production hardening & hub integration
+  - **Done**: leader-elected background tool-refresh worker (`background_refresh_interval_secs`, single-writer via leader election, per-server failure isolation); server health recording (`mcp_servers.health_status`/`last_error`, set from the refresh probe outcome); health-gated injection — `EffectiveMcpResolver` hides `unhealthy` servers (`ServerUnhealthy` diagnostic), keeps `unknown`/`degraded`/`healthy`; `mini_chat_mcp_role_server_assignments` gauge (refreshed from the worker cycle via `RoleMcpServerRepository::count_all`).
+  - **Done — interactive per-user OAuth (authorization-code) enrollment**: new `McpAuth::OAuth2AuthorizationCode { scopes }` variant mapped to the OAGW `oauth2_auth_code` plugin; `McpService::{begin,complete,revoke,oauth_connection_status}_oauth_connection` orchestrate enrollment through OAGW's OAuth management API; four REST endpoints (`connection:authorize`, `mcp-connections:complete`, `GET`/`DELETE .../connection`); `EffectiveMcpResolver` gates interactive-OAuth server tools per user by live OAGW status (`ServerNotConnected` diagnostic, 30s per-user status cache); `McpServerInfo.requires_user_connection` flag; `auth_kind` CHECK constraint extended to include `oauth2_auth_code`.
+  - **Deferred — OAGW-owned** (no mini-chat work): OAuth token rotation/refresh (OAGW caches/refreshes per-user tokens for both `oauth2_client_cred` and `oauth2_auth_code`); mTLS (OAGW upstream config).
+  - **Done — hub sync (MCP registry protocol)**: the hub is queried over the MCP protocol like any endpoint (`servers/list`, cursor-paginated) via `McpClient::list_registry_servers` / `McpPool::list_registry_servers` (`RegistryServer`/`ListServersResult`). `oagw_upstream::ensure` provisions idempotently by scanning `list_upstreams` for the deterministic alias (update else create), since SDK `create_upstream` is **not** idempotent and has no get-by-alias. `McpService::sync_hub_servers` ensures the hub's own upstream (`HUB_SERVER_ID`), discovers advertised servers, upserts them as `source='hub'`, `enabled=false` (pending approval), and retires servers no longer advertised; wired into the background refresh worker cycle. Admin approval endpoint `POST /v1/admin/mcp-servers/{id}/approve` (`approve_mcp_server` action) provisions the per-server upstream, enables the row, and registers it in the pool. **Note**: the registry wire contract (name/description/url) is provisional; hub-discovered servers are provisioned without auth for now (extend when the hub schema and auth model firm up).
+  - **Deferred — blocked on open questions**: DLP redaction provider (open question #6).
+- **Phase 5**: Abuse controls & compliance
+  - **Done — per-tenant rate limit**: `McpRateLimiter` (fixed 1-minute window, per-tenant, process-wide `Arc` on `StreamService`, shared across all of a tenant's concurrent turns; `0` disables). Config `mcp.max_mcp_calls_per_minute_per_tenant` (default `0`). Enforced in the agentic dispatch loop after the per-message soft cap: on breach the call degrades gracefully (function-call + notice injected, turn never fails) and a `record_mcp_call(..., "rate_limited")` metric is emitted. Resolves open question #7.
+  - **Done — DLP redaction**: `DlpRedactor` (`mcp_dlp.rs`) applies operator-configured regex patterns (`mcp.dlp_redaction_patterns`, validated at startup; empty = disabled) to tool output, replacing each match with `[REDACTED]`. Applied in `mcp_output_sanitizer::sanitize_redact_and_truncate` **before** truncation so a sensitive match is never split across the cap. Held as a process-wide `Arc` on `StreamService`, threaded via `McpDispatchParams`. Policy is operator-driven (no built-in PII heuristics ⇒ no false-positive surprises). Resolves open question #6.
+  - **Deferred — MCP image content forwarding (open question #4)**: blocked by provider tool-output format. OpenAI Responses `function_call_output.output` is a plain string (no image parts), and Anthropic `tool_result` image blocks require an uploaded Anthropic `file_id` that transient MCP outputs don't have. Images remain collapsed to `[image content omitted]` by the sanitizer until a provider path for tool-result images exists.
 
 #### MCP Risks & Mitigations
 
@@ -3617,17 +3648,17 @@ general_config:
 | Auth credential leakage | Credstore-resolved secrets via OAGW auth plugins, redaction in logs/audit/API; OAGW credential isolation (`cred://` URIs only) |
 | SSRF / DNS rebinding | All MCP traffic routed through OAGW; HTTPS enforced by OAGW upstream config, OAGW `SsrfPolicy` blocks private IPs/DNS rebinding |
 | Prompt injection in tool output | System prompt guard, output treated as untrusted data |
-| OAuth 2.0 token expiry | OAGW caches OAuth2 tokens per user with 30s safety margin; re-fetches on expiry; server marked degraded if refresh fails |
+| OAuth 2.0 token expiry | OAGW caches OAuth2 tokens per user with 30s safety margin; re-fetches (client-credentials) or refreshes (authorization-code) on expiry; for interactive authorization-code, if the refresh token is invalid the server's tools are hidden for that user (`ServerNotConnected`) until they re-connect via the enrollment endpoints |
 
 #### MCP Open Questions
 
 1. Hub authentication method (bearer, mTLS, API key?)
 2. Hub discovery API format (MCP protocol or custom REST?)
 3. ~~Per-user credential passthrough to MCP servers vs service account~~ **Resolved**: per-user credentials are forwarded via OAGW; service accounts are not used. OAGW's auth plugins resolve credentials from credstore using the calling user's `SecurityContext` (`subject_tenant_id`, `subject_id`), and OAGW caches OAuth2 tokens per `(tenant_id, user_id, auth_method, config_hash)`. Mini-chat does not manage secrets or tokens directly
-4. MCP image content handling (`ContentPart::Image` forwarding?)
-5. Health monitoring cadence and degraded-health tool hiding
-6. DLP/redaction provider for tool outputs
-7. Per-tenant MCP call rate limit (`max_mcp_calls_per_minute_per_tenant`)
+4. MCP image content handling (`ContentPart::Image` forwarding?) — **Blocked**: no provider path for tool-result images. OpenAI Responses `function_call_output.output` is a plain string; Anthropic `tool_result` image blocks need an uploaded Anthropic `file_id` unavailable for transient MCP output. Images stay collapsed to `[image content omitted]`
+5. ~~Health monitoring cadence and degraded-health tool hiding~~ **Resolved**: health is probed and recorded each background refresh cycle (`background_refresh_interval_secs`) from the `tools/list` outcome — success ⇒ `healthy` (clears `last_error`), failure ⇒ `unhealthy` (bounded `last_error`). The `EffectiveMcpResolver` gates injection by hiding only `unhealthy` servers (emitting a `ServerUnhealthy` diagnostic); `unknown` (never probed / worker disabled), `degraded`, and `healthy` servers remain eligible, so a server is never dropped without a positive down signal
+6. ~~DLP/redaction provider for tool outputs~~ **Resolved (Phase 5)**: `DlpRedactor` applies operator-configured regex patterns (`mcp.dlp_redaction_patterns`, validated at startup; empty = disabled) to tool output before truncation, replacing matches with `[REDACTED]`. Operator-driven policy (no built-in PII heuristics)
+7. ~~Per-tenant MCP call rate limit (`max_mcp_calls_per_minute_per_tenant`)~~ **Resolved (Phase 5)**: `McpRateLimiter` enforces a per-tenant fixed 1-minute-window ceiling across all of a tenant's concurrent turns, configured via `mcp.max_mcp_calls_per_minute_per_tenant` (`0` disables). On breach the MCP call degrades gracefully (notice injected, turn never fails) and emits a `rate_limited` outcome metric
 
 #### MCP File Change Summary
 
@@ -3645,7 +3676,10 @@ general_config:
 | `domain/service/mcp_output_sanitizer.rs` | **New** | Tool result size cap, redaction |
 | `domain/service/mcp_argument_validator.rs` | **New** | Pre-dispatch argument validation (`jsonschema` crate) |
 | `domain/repos/` | Modify | Add `McpServerRepository`, `RoleMcpServerRepository` traits |
-| `api/mcp_routes.rs` | **New** | REST handlers for MCP server endpoints |
+| `api/mcp_routes.rs` | **New** | REST handlers for MCP server endpoints (incl. interactive OAuth connection: `connection:authorize`, `mcp-connections:complete`, `GET`/`DELETE .../connection`) |
+| `domain/service/mcp_service.rs` | Modify | Add interactive OAuth connection methods (`begin`/`complete`/`revoke`/`oauth_connection_status`) delegating to OAGW `ServiceGatewayClientV1` |
+| `domain/service/effective_mcp_resolver.rs` | Modify | Per-user interactive-OAuth gating via live OAGW status + per-user status cache; `ServerNotConnected` diagnostic |
+| `infra/db/migrations/` | Modify | Extend `mcp_servers.auth_kind` CHECK constraint to include `oauth2_auth_code` |
 | `mini-chat-sdk/src/models.rs` | Modify | `McpServerInfo`, `McpServerAdminInfo`, `McpToolInfo` DTOs |
 | `domain/service/context_assembly.rs` | Modify | Accept and inject `mcp_tools` parameter |
 | `domain/service/stream_service/mod.rs` | Modify | Load MCP servers, resolve tools, pass to provider task |

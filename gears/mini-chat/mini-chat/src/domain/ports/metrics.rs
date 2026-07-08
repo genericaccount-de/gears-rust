@@ -219,6 +219,28 @@ pub trait MiniChatMetricsPort: Send + Sync {
 
     /// `{prefix}_knowledge_search_chunks` — histogram (chunks returned per call)
     fn record_knowledge_search_chunks(&self, count: f64);
+
+    // ── P1: MCP tool execution ─────────────────────────────────────────
+
+    /// `{prefix}_mcp_tool_calls_total` — counter
+    /// Labels: `server_id`, `tool_name`, `status`
+    /// (`status`: `ok`, `error`, `timeout`, `invalid_args`, `unavailable`).
+    fn record_mcp_call(&self, server_id: &str, tool_name: &str, status: &str);
+
+    /// `{prefix}_mcp_tool_call_duration_ms` — histogram (dispatch latency per
+    /// `tools/call`). Labels: `server_id`, `tool_name`.
+    fn record_mcp_call_latency_ms(&self, server_id: &str, tool_name: &str, ms: f64);
+
+    /// `{prefix}_mcp_call_output_chars` — histogram (sanitized output size)
+    fn record_mcp_call_output_chars(&self, count: f64);
+
+    /// `{prefix}_mcp_tool_discovery_duration_ms` — histogram (latency per
+    /// `tools/list`). Label: `server_id`.
+    fn record_mcp_tool_discovery_ms(&self, server_id: &str, ms: f64);
+
+    /// `{prefix}_mcp_role_server_assignments` — gauge (current number of
+    /// role→server assignments).
+    fn set_mcp_role_server_assignments(&self, count: u64);
 }
 
 /// No-op implementation for use in tests or when metrics are disabled.
@@ -273,4 +295,9 @@ impl MiniChatMetricsPort for NoopMetrics {
     fn record_knowledge_search(&self, _: &str) {}
     fn record_knowledge_search_latency_ms(&self, _: f64) {}
     fn record_knowledge_search_chunks(&self, _: f64) {}
+    fn record_mcp_call(&self, _: &str, _: &str, _: &str) {}
+    fn record_mcp_call_latency_ms(&self, _: &str, _: &str, _: f64) {}
+    fn record_mcp_call_output_chars(&self, _: f64) {}
+    fn record_mcp_tool_discovery_ms(&self, _: &str, _: f64) {}
+    fn set_mcp_role_server_assignments(&self, _: u64) {}
 }

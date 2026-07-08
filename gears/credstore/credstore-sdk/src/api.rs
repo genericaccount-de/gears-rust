@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use toolkit_security::SecurityContext;
 
 use crate::error::CredStoreError;
-use crate::models::{GetSecretResponse, SecretRef};
+use crate::models::{GetSecretResponse, SecretRef, SecretValue, SharingMode};
 
 /// Consumer-facing API trait for credential storage operations.
 ///
@@ -25,4 +25,33 @@ pub trait CredStoreClientV1: Send + Sync {
         ctx: &SecurityContext,
         key: &SecretRef,
     ) -> Result<Option<GetSecretResponse>, CredStoreError>;
+
+    /// Stores a secret, creating it or overwriting an existing value.
+    ///
+    /// The owning tenant and (for [`SharingMode::Private`]) the owner are
+    /// derived from `ctx`. Backends that only support a static, read-only
+    /// catalog return [`CredStoreError::Internal`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for infrastructure failures or unsupported backends.
+    async fn put(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+        value: SecretValue,
+        sharing: SharingMode,
+    ) -> Result<(), CredStoreError>;
+
+    /// Deletes a secret. Idempotent: succeeds whether or not the secret
+    /// existed (anti-enumeration, consistent with `get`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for infrastructure failures or unsupported backends.
+    async fn delete(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+    ) -> Result<(), CredStoreError>;
 }

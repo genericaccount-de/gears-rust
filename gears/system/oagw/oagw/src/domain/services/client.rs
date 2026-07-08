@@ -8,7 +8,7 @@ use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use super::{ControlPlaneService, DataPlaneService};
+use super::{ControlPlaneService, DataPlaneService, OAuthEnrollmentService};
 use crate::domain::model;
 
 /// Facade that implements the public `ServiceGatewayClientV1` trait by
@@ -17,11 +17,16 @@ use crate::domain::model;
 pub(crate) struct ServiceGatewayClientV1Facade {
     cp: Arc<dyn ControlPlaneService>,
     dp: Arc<dyn DataPlaneService>,
+    oauth: Arc<dyn OAuthEnrollmentService>,
 }
 
 impl ServiceGatewayClientV1Facade {
-    pub(crate) fn new(cp: Arc<dyn ControlPlaneService>, dp: Arc<dyn DataPlaneService>) -> Self {
-        Self { cp, dp }
+    pub(crate) fn new(
+        cp: Arc<dyn ControlPlaneService>,
+        dp: Arc<dyn DataPlaneService>,
+        oauth: Arc<dyn OAuthEnrollmentService>,
+    ) -> Self {
+        Self { cp, dp, oauth }
     }
 }
 
@@ -175,6 +180,64 @@ impl ServiceGatewayClientV1 for ServiceGatewayClientV1Facade {
         self.dp
             .proxy_request(ctx, req)
             .await
+            .map_err(CanonicalError::from)
+    }
+
+    async fn begin_oauth_authorization(
+        &self,
+        ctx: SecurityContext,
+        req: oagw_sdk::BeginOAuthAuthorizationRequest,
+    ) -> Result<oagw_sdk::BeginOAuthAuthorizationResponse, CanonicalError> {
+        self.oauth
+            .begin(
+                &ctx,
+                req.upstream_id,
+                req.scopes,
+                req.redirect_uri,
+                req.client_name,
+            )
+            .await
+            .map(|o| oagw_sdk::BeginOAuthAuthorizationResponse {
+                authorization_url: o.authorization_url,
+                state: o.state,
+            })
+            .map_err(CanonicalError::from)
+    }
+
+    async fn complete_oauth_authorization(
+        &self,
+        ctx: SecurityContext,
+        req: oagw_sdk::CompleteOAuthAuthorizationRequest,
+    ) -> Result<(), CanonicalError> {
+        self.oauth
+            .complete(&ctx, req.state, req.code)
+            .await
+            .map_err(CanonicalError::from)
+    }
+
+    async fn revoke_oauth_authorization(
+        &self,
+        ctx: SecurityContext,
+        upstream_id: Uuid,
+    ) -> Result<(), CanonicalError> {
+        self.oauth
+            .revoke(&ctx, upstream_id)
+            .await
+            .map_err(CanonicalError::from)
+    }
+
+    async fn oauth_connection_status(
+        &self,
+        ctx: SecurityContext,
+        upstream_id: Uuid,
+    ) -> Result<oagw_sdk::OAuthConnectionStatus, CanonicalError> {
+        self.oauth
+            .status(&ctx, upstream_id)
+            .await
+            .map(|s| oagw_sdk::OAuthConnectionStatus {
+                connected: s.connected,
+                expires_at_unix: s.expires_at_unix,
+            })
             .map_err(CanonicalError::from)
     }
 }

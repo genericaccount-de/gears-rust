@@ -202,6 +202,24 @@ mod tests {
                     is_inherited: false,
                 }))
             }
+
+            async fn put(
+                &self,
+                _ctx: &SecurityContext,
+                _key: &SecretRef,
+                _value: SecretValue,
+                _sharing: SharingMode,
+            ) -> Result<(), CredStoreError> {
+                Ok(())
+            }
+
+            async fn delete(
+                &self,
+                _ctx: &SecurityContext,
+                _key: &SecretRef,
+            ) -> Result<(), CredStoreError> {
+                Ok(())
+            }
         }
 
         let plugin = ApiKeyAuthPlugin::new(Arc::new(Utf8ErrorCredStore));

@@ -74,6 +74,23 @@ pub struct StreamService<
     metrics: Arc<dyn MiniChatMetricsPort>,
     knowledge_search_config: crate::config::KnowledgeSearchConfig,
     knowledge_retriever: Option<Arc<dyn crate::domain::ports::KnowledgeRetriever>>,
+    /// Effective MCP tool resolver; `None` disables MCP injection entirely.
+    mcp_resolver: Option<Arc<dyn super::McpToolResolver>>,
+    /// Cap on total tools (built-in + MCP) injected per chat; MCP tools fill the
+    /// slots remaining after built-in tools.
+    mcp_max_tools_per_chat: usize,
+    /// Stream-time MCP `tools/call` dispatcher; `None` disables MCP execution
+    /// (tools may still be injected, but calls fall through to unsupported).
+    mcp_dispatcher: Option<Arc<dyn crate::infra::mcp::McpDispatcher>>,
+    /// Soft per-message MCP call limit (`mcp.max_mcp_calls_per_message`).
+    mcp_max_calls_per_message: u32,
+    /// Max characters kept per sanitized MCP tool output (`mcp.max_tool_output_chars`).
+    mcp_max_tool_output_chars: usize,
+    /// Process-wide per-tenant MCP call rate limiter, shared across all streams
+    /// (`mcp.max_mcp_calls_per_minute_per_tenant`).
+    mcp_rate_limiter: Arc<super::McpRateLimiter>,
+    /// Process-wide DLP redactor for MCP tool output (`mcp.dlp_redaction_patterns`).
+    mcp_dlp_redactor: Arc<super::DlpRedactor>,
 }
 
 impl<
@@ -109,6 +126,13 @@ impl<
         metrics: Arc<dyn MiniChatMetricsPort>,
         knowledge_search_config: crate::config::KnowledgeSearchConfig,
         knowledge_retriever: Option<Arc<dyn crate::domain::ports::KnowledgeRetriever>>,
+        mcp_resolver: Option<Arc<dyn super::McpToolResolver>>,
+        mcp_max_tools_per_chat: usize,
+        mcp_dispatcher: Option<Arc<dyn crate::infra::mcp::McpDispatcher>>,
+        mcp_max_calls_per_message: u32,
+        mcp_max_tool_output_chars: usize,
+        mcp_max_calls_per_minute_per_tenant: u32,
+        mcp_dlp_redaction_patterns: &[String],
     ) -> Self {
         Self {
             db,
@@ -129,6 +153,15 @@ impl<
             metrics,
             knowledge_search_config,
             knowledge_retriever,
+            mcp_resolver,
+            mcp_max_tools_per_chat,
+            mcp_dispatcher,
+            mcp_max_calls_per_message,
+            mcp_max_tool_output_chars,
+            mcp_rate_limiter: Arc::new(super::McpRateLimiter::new(
+                mcp_max_calls_per_minute_per_tenant,
+            )),
+            mcp_dlp_redactor: Arc::new(super::DlpRedactor::new(mcp_dlp_redaction_patterns)),
         }
     }
 
@@ -624,6 +657,13 @@ impl<
         let knowledge_search_enabled = self.knowledge_search_config.enabled
             && self.knowledge_retriever.is_some()
             && !file_search_enabled;
+
+        // ── MCP tools ──
+        // Resolve the tenant's effective MCP tool set (gated on model support),
+        // inject it into the request, and carry the routing map to the provider
+        // task for Phase 3 dispatch.
+        let mcp_resolution = self.resolve_mcp_tools(&ctx, pf.tool_support.mcp).await;
+
         let (assembled, summary_info) = self
             .gather_context(
                 tenant_id,
@@ -641,6 +681,9 @@ impl<
                 ci_file_ids,
                 token_budget,
                 &image_file_ids,
+                &mcp_resolution.tools,
+                &self.context_config.mcp_guard,
+                self.mcp_max_tools_per_chat,
             )
             .await?;
 
@@ -686,6 +729,8 @@ impl<
                 provider_file_id_map,
                 anthropic_file_ids,
                 knowledge_search: self.build_knowledge_search_params(&tenant_id_str),
+                mcp: self.build_mcp_dispatch(&mcp_resolution),
+                mcp_resolution,
             },
             cancel,
             tx,
@@ -910,6 +955,61 @@ impl<
         Ok(turn_id)
     }
 
+    /// Resolve the effective MCP tools for this turn.
+    ///
+    /// Returns an empty resolution — with no DB access — when MCP is disabled,
+    /// the resolver is not wired, or the resolved model does not advertise MCP
+    /// tool support. Resolution errors degrade gracefully: they are logged and
+    /// the turn proceeds without MCP tools rather than failing.
+    async fn resolve_mcp_tools(
+        &self,
+        ctx: &SecurityContext,
+        mcp_supported: bool,
+    ) -> Arc<super::EffectiveResolution> {
+        let Some(resolver) = self.mcp_resolver.as_ref() else {
+            return Arc::new(super::EffectiveResolution::default());
+        };
+        if !mcp_supported {
+            return Arc::new(super::EffectiveResolution::default());
+        }
+        match resolver.resolve(ctx).await {
+            Ok(resolution) => {
+                if !resolution.diagnostics.is_empty() {
+                    warn!(
+                        diagnostics = resolution.diagnostics.len(),
+                        "MCP tool resolution produced diagnostics"
+                    );
+                }
+                resolution
+            }
+            Err(e) => {
+                warn!(error = %e, "MCP tool resolution failed; proceeding without MCP tools");
+                Arc::new(super::EffectiveResolution::default())
+            }
+        }
+    }
+
+    /// Build the stream-time MCP dispatch parameters for the provider task.
+    ///
+    /// Returns `None` — disabling MCP execution for the turn — when no
+    /// dispatcher is wired or when nothing was injected (no routes to call).
+    fn build_mcp_dispatch(
+        &self,
+        resolution: &Arc<super::EffectiveResolution>,
+    ) -> Option<provider_task::McpDispatchParams> {
+        let dispatcher = self.mcp_dispatcher.as_ref()?;
+        if resolution.tools.is_empty() {
+            return None;
+        }
+        Some(provider_task::McpDispatchParams {
+            dispatcher: Arc::clone(dispatcher),
+            max_calls_per_message: self.mcp_max_calls_per_message,
+            max_output_chars: self.mcp_max_tool_output_chars,
+            rate_limiter: Arc::clone(&self.mcp_rate_limiter),
+            redactor: Arc::clone(&self.mcp_dlp_redactor),
+        })
+    }
+
     /// Shared context assembly: thread summary lookup, recent-message fetch
     /// (bounded by snapshot boundary), and `assemble_context` call.
     #[allow(clippy::too_many_arguments)]
@@ -930,6 +1030,9 @@ impl<
         code_interpreter_file_ids: Vec<String>,
         token_budget: Option<super::context_assembly::TokenBudget>,
         image_file_ids: &[String],
+        mcp_tools: &[crate::domain::llm::LlmTool],
+        mcp_guard: &str,
+        mcp_max_tools_per_chat: usize,
     ) -> Result<
         (
             super::context_assembly::AssembledContext,
@@ -1021,6 +1124,12 @@ impl<
                 code_interpreter_file_ids,
                 token_budget,
                 image_file_ids,
+                // MCP tools are resolved by the caller (gated on model support
+                // and the tenant's effective set) and injected after built-in
+                // tools, filling the slots remaining under the per-chat cap.
+                mcp_tools,
+                mcp_guard,
+                max_tools_per_chat: mcp_max_tools_per_chat,
             })
             .map_err(|e| StreamError::ContextBudgetExceeded {
                 required_tokens: match &e {
@@ -1364,6 +1473,10 @@ impl<
         let knowledge_search_enabled = self.knowledge_search_config.enabled
             && self.knowledge_retriever.is_some()
             && !file_search_enabled;
+
+        // ── MCP tools ── (see `run_stream`)
+        let mcp_resolution = self.resolve_mcp_tools(&ctx, pf.tool_support.mcp).await;
+
         let (assembled, summary_info) = self
             .gather_context(
                 tenant_id,
@@ -1381,6 +1494,9 @@ impl<
                 ci_file_ids,
                 token_budget,
                 &[], // retry/edit: no new image attachments
+                &mcp_resolution.tools,
+                &self.context_config.mcp_guard,
+                self.mcp_max_tools_per_chat,
             )
             .await?;
 
@@ -1420,6 +1536,8 @@ impl<
                 provider_file_id_map,
                 anthropic_file_ids,
                 knowledge_search: self.build_knowledge_search_params(&tenant_id_str),
+                mcp: self.build_mcp_dispatch(&mcp_resolution),
+                mcp_resolution,
             },
             cancel,
             tx,
@@ -1848,6 +1966,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                mcp: None,
+                mcp_resolution: Arc::new(crate::domain::service::EffectiveResolution::default()),
             },
             cancel,
             tx,
@@ -1913,6 +2033,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                mcp: None,
+                mcp_resolution: Arc::new(crate::domain::service::EffectiveResolution::default()),
             },
             cancel,
             tx,
@@ -1971,6 +2093,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                mcp: None,
+                mcp_resolution: Arc::new(crate::domain::service::EffectiveResolution::default()),
             },
             cancel,
             tx,
@@ -2078,6 +2202,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                mcp: None,
+                mcp_resolution: Arc::new(crate::domain::service::EffectiveResolution::default()),
             },
             cancel.clone(),
             tx,
@@ -2255,6 +2381,13 @@ mod tests {
             metrics,
             crate::config::KnowledgeSearchConfig::default(),
             None,
+            None,
+            20,
+            None,
+            10,
+            8192,
+            0,
+            &[],
         )
     }
 
@@ -2998,6 +3131,13 @@ mod tests {
             metrics,
             crate::config::KnowledgeSearchConfig::default(),
             None,
+            None,
+            20,
+            None,
+            10,
+            8192,
+            0,
+            &[],
         )
     }
 
@@ -3431,6 +3571,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                mcp: None,
+                mcp_resolution: Arc::new(crate::domain::service::EffectiveResolution::default()),
             },
             cancel,
             tx,
@@ -3611,6 +3753,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                mcp: None,
+                mcp_resolution: Arc::new(crate::domain::service::EffectiveResolution::default()),
             },
             cancel,
             tx,
@@ -3790,6 +3934,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                mcp: None,
+                mcp_resolution: Arc::new(crate::domain::service::EffectiveResolution::default()),
             },
             cancel,
             tx,
@@ -3951,6 +4097,13 @@ mod tests {
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
             crate::config::KnowledgeSearchConfig::default(),
             None,
+            None,
+            20,
+            None,
+            10,
+            8192,
+            0,
+            &[],
         )
     }
 
@@ -4561,6 +4714,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                mcp: None,
+                mcp_resolution: Arc::new(crate::domain::service::EffectiveResolution::default()),
             },
             cancel,
             tx,
@@ -4620,6 +4775,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                mcp: None,
+                mcp_resolution: Arc::new(crate::domain::service::EffectiveResolution::default()),
             },
             cancel,
             tx,
@@ -4689,6 +4846,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                mcp: None,
+                mcp_resolution: Arc::new(crate::domain::service::EffectiveResolution::default()),
             },
             cancel,
             tx,
@@ -4745,6 +4904,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                mcp: None,
+                mcp_resolution: Arc::new(crate::domain::service::EffectiveResolution::default()),
             },
             cancel,
             tx,
@@ -4803,6 +4964,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                mcp: None,
+                mcp_resolution: Arc::new(crate::domain::service::EffectiveResolution::default()),
             },
             cancel,
             tx,
@@ -4872,6 +5035,8 @@ mod tests {
                 provider_file_id_map: std::collections::HashMap::new(),
                 anthropic_file_ids: std::collections::HashMap::new(),
                 knowledge_search: None,
+                mcp: None,
+                mcp_resolution: Arc::new(crate::domain::service::EffectiveResolution::default()),
             },
             cancel,
             tx,
@@ -5489,6 +5654,7 @@ mod tests {
             web_search_completed_count: Set(0),
             code_interpreter_completed_count: Set(0),
             file_search_completed_count: Set(0),
+            mcp_completed_count: Set(0),
             deleted_at: Set(None),
             replaced_by_request_id: Set(None),
             started_at: Set(now),
@@ -5614,6 +5780,13 @@ mod tests {
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
             crate::config::KnowledgeSearchConfig::default(),
             None,
+            None,
+            20,
+            None,
+            10,
+            8192,
+            0,
+            &[],
         )
     }
 
@@ -5938,6 +6111,11 @@ mod tests {
         fn record_knowledge_search(&self, _: &str) {}
         fn record_knowledge_search_latency_ms(&self, _: f64) {}
         fn record_knowledge_search_chunks(&self, _: f64) {}
+        fn record_mcp_call(&self, _: &str, _: &str, _: &str) {}
+        fn record_mcp_call_latency_ms(&self, _: &str, _: &str, _: f64) {}
+        fn record_mcp_call_output_chars(&self, _: f64) {}
+        fn record_mcp_tool_discovery_ms(&self, _: &str, _: f64) {}
+        fn set_mcp_role_server_assignments(&self, _: u64) {}
     }
 
     // ── Metric emission tests ────────────────────────────────────────────

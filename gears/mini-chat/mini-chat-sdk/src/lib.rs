@@ -5,9 +5,10 @@ pub mod models;
 pub mod plugin_api;
 pub use audit_models::{
     AttachmentKind, AttachmentMetadata, AuditUsageTokens, LatencyMs, LicenseDecision,
-    PolicyDecisions, QuotaDecision, QuotaScope, RequesterType, ToolCalls, TurnAuditEvent,
-    TurnAuditEventType, TurnDeleteAuditEvent, TurnDeleteAuditEventType, TurnEditAuditEvent,
-    TurnMutationAuditEvent, TurnMutationAuditEventType, TurnRetryAuditEvent,
+    McpEffectiveServer, McpEffectiveSnapshot, McpToolAuditRecord, PolicyDecisions, QuotaDecision,
+    QuotaScope, RequesterType, ToolCalls, TurnAuditEvent, TurnAuditEventType, TurnDeleteAuditEvent,
+    TurnDeleteAuditEventType, TurnEditAuditEvent, TurnMutationAuditEvent,
+    TurnMutationAuditEventType, TurnRetryAuditEvent,
 };
 pub use error::{MiniChatAuditPluginError, MiniChatModelPolicyPluginError, PublishError};
 pub use gts::{MiniChatAuditPluginSpecV1, MiniChatModelPolicyPluginSpecV1};

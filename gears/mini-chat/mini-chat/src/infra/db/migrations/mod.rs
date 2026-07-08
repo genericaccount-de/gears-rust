@@ -7,6 +7,9 @@ mod m20260330_000002_add_web_search_enabled_to_turns;
 mod m20260402_000003_add_tool_counts_to_turns;
 mod m20260417_000004_add_secondary_upload_fields;
 mod m20260512_000005_add_file_search_count;
+mod m20260520_000006_add_mcp_tables;
+mod m20260523_000007_add_mcp_count;
+mod m20260715_000008_widen_mcp_auth_kind;
 
 pub struct Migrator;
 
@@ -21,6 +24,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260402_000003_add_tool_counts_to_turns::Migration),
             Box::new(m20260417_000004_add_secondary_upload_fields::Migration),
             Box::new(m20260512_000005_add_file_search_count::Migration),
+            Box::new(m20260520_000006_add_mcp_tables::Migration),
+            Box::new(m20260523_000007_add_mcp_count::Migration),
+            Box::new(m20260715_000008_widen_mcp_auth_kind::Migration),
         ]
     }
 }

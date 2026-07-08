@@ -51,6 +51,7 @@ impl From<ClientSseEvent> for StreamEvent {
             } => StreamEvent::Tool(ToolData {
                 phase,
                 name: name.to_owned(),
+                tool_type: None,
                 details,
             }),
             ClientSseEvent::Citations { items } => StreamEvent::Citations(CitationsData { items }),

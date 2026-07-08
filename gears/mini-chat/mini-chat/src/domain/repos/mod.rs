@@ -1,5 +1,7 @@
 mod attachment_repo;
 mod chat_repo;
+mod mcp_server_repo;
+mod mcp_server_tool_repo;
 mod message_attachment_repo;
 mod message_repo;
 pub(crate) mod model_resolver;
@@ -7,6 +9,7 @@ mod outbox_enqueuer;
 mod policy_snapshot_provider;
 mod quota_usage_repo;
 mod reaction_repo;
+mod role_mcp_server_repo;
 pub(crate) mod thread_summary_repo;
 mod turn_repo;
 mod user_limits_provider;
@@ -17,6 +20,10 @@ pub(crate) use attachment_repo::{
     SetSecondaryUploadParams, SetUploadedParams,
 };
 pub(crate) use chat_repo::ChatRepository;
+pub(crate) use mcp_server_repo::{
+    CreateMcpServerParams, McpServerRepository, Patch, UpdateMcpServerParams,
+};
+pub(crate) use mcp_server_tool_repo::{McpServerToolRepository, UpsertMcpToolParams};
 pub(crate) use message_attachment_repo::{
     InsertMessageAttachmentParams, MessageAttachmentRepository,
 };
@@ -31,6 +38,7 @@ pub(crate) use outbox_enqueuer::{
 pub(crate) use policy_snapshot_provider::PolicySnapshotProvider;
 pub(crate) use quota_usage_repo::{IncrementReserveParams, QuotaUsageRepository, SettleParams};
 pub(crate) use reaction_repo::{ReactionRepository, UpsertReactionParams};
+pub(crate) use role_mcp_server_repo::{AttachRoleMcpServerParams, RoleMcpServerRepository};
 pub(crate) use thread_summary_repo::{
     SummaryFrontier, ThreadSummaryModel, ThreadSummaryRepository,
 };

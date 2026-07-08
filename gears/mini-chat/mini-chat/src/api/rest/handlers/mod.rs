@@ -1,5 +1,6 @@
 pub mod attachments;
 pub mod chats;
+pub mod mcp;
 pub mod messages;
 pub mod models;
 pub mod quota;
