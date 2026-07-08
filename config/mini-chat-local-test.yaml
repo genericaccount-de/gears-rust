@@ -1,0 +1,702 @@
+# CyberChat — Passport (OIDC) auth stand configuration.
+#
+# Derived from config/quickstart.yaml. Differences:
+#   * authentication is ENABLED (api-gateway.auth_disabled: false)
+#   * the passport-auth-bff module provides the login flow + self-validating
+#     AuthN plugin + permissive AuthZ plugin (all vendor "acronis")
+#   * single-tenant tenant resolver + static credstore (both vendor "acronis",
+#     which is the default — so resolver vendors need no explicit config)
+#   * data persists as SQLite under /data (a mounted Docker volume)
+
+server:
+  home_dir: "~/.cf-gears"
+
+database:
+  servers:
+    sqlite_mini_chat:
+      engine: "sqlite"
+      params:
+        WAL: "true"
+        synchronous: "NORMAL"
+        busy_timeout: "5000"
+      pool:
+        max_conns: 5
+        acquire_timeout: "30s"
+
+logging:
+  default:
+    console_level: info
+    file: "logs/cyberchat.log"
+    file_level: info
+  api_gateway:
+    console_level: debug
+    file: "logs/api.log"
+    file_level: debug
+
+gears:
+  # Required config block (types-registry uses ctx.config()).
+  types-registry:
+    config: {}
+
+  api-gateway:
+    config:
+      # Bind on all interfaces so the nginx front-door container can reach it.
+      bind_addr: "0.0.0.0:8087"
+      enable_docs: true
+      cors_enabled: false
+      openapi:
+        title: "CyberChat API (Passport stand)"
+        version: "0.1.0"
+        description: "CyberChat Server with Acronis Passport authentication"
+      defaults:
+        body_limit_bytes: 64000000
+      metrics:
+        prefix: "cyberchat"
+      # Authentication is ON — the passport-auth-bff AuthN plugin validates the
+      # internal CF token (delivered by the browser as a cookie, converted to a
+      # Bearer header by the nginx front door).
+      auth_disabled: true
+      require_auth_by_default: false
+
+  file-parser:
+    config:
+      allowed_local_base_dir: "/tmp"
+
+  oagw:
+    config:
+      proxy_timeout_secs: 30
+      allow_http_upstream: true
+      # All MCP traffic is proxied through OAGW, so the MCP server's resolved IP
+      # must pass this SSRF policy. Corporate hosts (e.g. mcp.corp.acronis.com)
+      # typically resolve to private addresses — allow the standard RFC1918
+      # ranges so the upstream is not rejected. (Public IPs are allowed by
+      # default; only private ranges need to be listed here.)
+      ssrf_policy:
+        allow_cidrs: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
+  gear-orchestrator:
+    config: {}
+
+  tenant-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  simple-user-settings:
+    database:
+      server: "sqlite_mini_chat"
+      file: "settings.db"
+    config:
+      max_field_length: 100
+
+  resource-group:
+    database:
+      server: "sqlite_mini_chat"
+      file: "resource_group.db"
+    config: {}      
+
+  authn-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  authz-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  static-authn-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      mode: accept_all
+      s2s_credentials:
+        - client_id: "mini-chat"
+          client_secret: "mini-chat-dev-secret"
+
+  static-authz-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+
+  grpc-hub:
+    config:
+      listen_addr: "uds:///tmp/cyberchat-grpc"
+
+  mini-chat:
+    database:
+      server: "sqlite_mini_chat"
+      file: "mini_chat.db"
+    config:
+      # S2S identity. In this stand the authn-resolver routes client-credentials
+      # exchange to passport-auth-bff, which mints a service SecurityContext.
+      client_credentials:
+        client_id: "mini-chat"
+        client_secret: "mini-chat-dev-secret"
+      # vLLM-compatible upstream.
+      # Override host at runtime via docker-compose env (APP__ prefix):
+      #   VLLM_HOST=my-llm.example.com make stand-up
+      providers:
+        vllm:
+          kind: openai_chat_completions
+          storage_kind: openai
+          host: "${VLLM_HOST}"
+          use_http: false
+          api_path: "/v1/chat/completions"
+          supports_file_search_filters: false
+          auth_plugin_type: "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"
+          auth_config:
+            header: "Authorization"
+            prefix: "Bearer "
+            secret_ref: "vllm-key"
+      metrics:
+        prefix: "cyberchat"
+
+      # ── MCP (Model Context Protocol) servers ────────────────────────────
+      # Unlike the `rest` connectors above, MCP traffic is routed through OAGW:
+      # at startup mini-chat auto-creates an OAGW upstream (alias `mcp-<id>`)
+      # for each server below and a catch-all route. Tools are discovered
+      # asynchronously by the background refresh worker (see
+      # `background_refresh_interval_secs`) — they do NOT appear on the first
+      # chat turn. To surface them immediately, call
+      #   POST {prefix}/v1/mcp-servers/{id}/tools:refresh
+      # A server's tools are injected into a chat only when `auto_attach: true`
+      # AND the selected model advertises `tool_support.mcp: true` (below).
+      mcp:
+        enabled: true
+        # Short interval so discovered tools show up quickly during testing.
+        background_refresh_interval_secs: 30
+        servers:
+          - id: "acronis-jira-mcp"
+            url: "https://mcp.corp.acronis.com:501/mcp/"
+            name: "Acronis Jira MCP"
+            description: "Corporate Jira MCP server."
+            # Required for tool injection — the resolver only considers
+            # auto-attach servers. For interactive OAuth servers, a user's
+            # tools are additionally gated on that user having connected.
+            auto_attach: true
+            # Interactive per-user OAuth2 authorization-code flow. OAGW owns
+            # dynamic client registration, PKCE, and the per-user token store
+            # (credstore); mini-chat drives only the browser consent legs via
+            # the MCP OAuth endpoints. No secret refs are configured here.
+            auth:
+              type: oauth2_authorization_code
+              scopes: []
+
+  # Static credential store — holds the vLLM API key so mini-chat can reach
+  # the upstream. Override at runtime via docker-compose env (APP__ prefix):
+  #   VLLM_API_KEY=sk-... make stand-up
+  static-credstore-plugin:
+    config:
+      secrets:
+        - key: "vllm-key"
+          value: "${VLLM_API_KEY}"
+
+  # Model catalog — wires models to the vllm provider above.
+  # provider_model_id must match the model name served by your vLLM instance.
+  # Add more entries to expose additional models.
+  static-mini-chat-model-policy-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      model_catalog:
+        - id: "gpt-oss-120b"
+          provider_model_id: "h200/gpt-oss-120b"
+          display_name: "GPT-OSS 120B"
+          description: "120B open-source model on H200 GPU"
+          provider_id: "vllm"
+          provider_display_name: "Local vLLM"
+          icon: ""
+          tier: Standard
+          enabled: true
+          system_prompt: "You are a helpful, concise assistant."
+          thread_summary_prompt: ""
+          multimodal_capabilities: ["VISION_INPUT"]
+          context_window: 32768
+          max_output_tokens: 4096
+          max_input_tokens: 28672
+          input_tokens_credit_multiplier_micro: 1000000
+          output_tokens_credit_multiplier_micro: 1000000
+          multiplier_display: "1x"
+          estimation_budgets:
+            bytes_per_token_conservative: 4
+            fixed_overhead_tokens: 100
+            safety_margin_pct: 10
+            image_token_budget: 1000
+            tool_surcharge_tokens: 500
+            web_search_surcharge_tokens: 500
+            code_interpreter_surcharge_tokens: 1000
+            minimal_generation_floor: 50
+          max_num_results: 5
+          web_search_context_size: low
+          max_tool_calls: 10
+          general_config:
+            type: ""
+            available_from: "1970-01-01T00:00:00Z"
+            max_file_size_mb: 25
+            api_params:
+              temperature: 0.7
+              top_p: 1.0
+              frequency_penalty: 0.0
+              presence_penalty: 0.0
+              stop: []
+            features:
+              streaming: true
+              structured_output: false
+            tool_support:
+              web_search: false
+              file_search: false
+              image_generation: false
+              code_interpreter: false
+              mcp: true
+            supported_endpoints:
+              chat_completions: true
+              responses: false
+              embeddings: false
+              image_generation: false
+              audio_speech_generation: false
+              audio_transcription: false
+              audio_translation: false
+          preference:
+            is_default: true
+            sort_order: 0
+
+        - id: "qwen3-next-80b"
+          provider_model_id: "h200/Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
+          display_name: "Qwen3-Next 80B"
+          description: "Qwen3 Next 80B MoE (FP8) on H200 GPU"
+          provider_id: "vllm"
+          provider_display_name: "Local vLLM"
+          icon: ""
+          tier: Standard
+          enabled: true
+          system_prompt: "You are a helpful, concise assistant."
+          thread_summary_prompt: ""
+          multimodal_capabilities: ["VISION_INPUT"]
+          context_window: 32768
+          max_output_tokens: 4096
+          max_input_tokens: 28672
+          input_tokens_credit_multiplier_micro: 1000000
+          output_tokens_credit_multiplier_micro: 1000000
+          multiplier_display: "1x"
+          estimation_budgets:
+            bytes_per_token_conservative: 4
+            fixed_overhead_tokens: 100
+            safety_margin_pct: 10
+            image_token_budget: 1000
+            tool_surcharge_tokens: 500
+            web_search_surcharge_tokens: 500
+            code_interpreter_surcharge_tokens: 1000
+            minimal_generation_floor: 50
+          max_num_results: 5
+          web_search_context_size: low
+          max_tool_calls: 10
+          general_config:
+            type: ""
+            available_from: "1970-01-01T00:00:00Z"
+            max_file_size_mb: 25
+            api_params:
+              temperature: 0.7
+              top_p: 1.0
+              frequency_penalty: 0.0
+              presence_penalty: 0.0
+              stop: []
+            features:
+              streaming: true
+              structured_output: false
+            tool_support:
+              web_search: false
+              file_search: false
+              image_generation: false
+              code_interpreter: false
+              mcp: true
+            supported_endpoints:
+              chat_completions: true
+              responses: false
+              embeddings: false
+              image_generation: false
+              audio_speech_generation: false
+              audio_transcription: false
+              audio_translation: false
+          preference:
+            is_default: false
+            sort_order: 1
+
+        - id: "qwen3-5-35b"
+          provider_model_id: "mac/qwen/qwen3.5-35b-a3b-8bit"
+          display_name: "Qwen3.5 35B (Mac)"
+          description: "Qwen3.5 35B MoE 8-bit on Apple Silicon"
+          provider_id: "vllm"
+          provider_display_name: "Local vLLM"
+          icon: ""
+          tier: Standard
+          enabled: true
+          system_prompt: "You are a helpful, concise assistant."
+          thread_summary_prompt: ""
+          multimodal_capabilities: ["VISION_INPUT"]
+          context_window: 32768
+          max_output_tokens: 4096
+          max_input_tokens: 28672
+          input_tokens_credit_multiplier_micro: 1000000
+          output_tokens_credit_multiplier_micro: 1000000
+          multiplier_display: "1x"
+          estimation_budgets:
+            bytes_per_token_conservative: 4
+            fixed_overhead_tokens: 100
+            safety_margin_pct: 10
+            image_token_budget: 1000
+            tool_surcharge_tokens: 500
+            web_search_surcharge_tokens: 500
+            code_interpreter_surcharge_tokens: 1000
+            minimal_generation_floor: 50
+          max_num_results: 5
+          web_search_context_size: low
+          max_tool_calls: 10
+          general_config:
+            type: ""
+            available_from: "1970-01-01T00:00:00Z"
+            max_file_size_mb: 25
+            api_params:
+              temperature: 0.7
+              top_p: 1.0
+              frequency_penalty: 0.0
+              presence_penalty: 0.0
+              stop: []
+            features:
+              streaming: true
+              structured_output: false
+            tool_support:
+              web_search: false
+              file_search: false
+              image_generation: false
+              code_interpreter: false
+              mcp: true
+            supported_endpoints:
+              chat_completions: true
+              responses: false
+              embeddings: false
+              image_generation: false
+              audio_speech_generation: false
+              audio_transcription: false
+              audio_translation: false
+          preference:
+            is_default: false
+            sort_order: 2
+
+        - id: "qwen3-coder-next"
+          provider_model_id: "mac/qwen/qwen3-coder-next"
+          display_name: "Qwen3 Coder Next (Mac)"
+          description: "Qwen3 Coder Next on Apple Silicon"
+          provider_id: "vllm"
+          provider_display_name: "Local vLLM"
+          icon: ""
+          tier: Standard
+          enabled: true
+          system_prompt: "You are a helpful coding assistant."
+          thread_summary_prompt: ""
+          multimodal_capabilities: ["VISION_INPUT"]
+          context_window: 32768
+          max_output_tokens: 4096
+          max_input_tokens: 28672
+          input_tokens_credit_multiplier_micro: 1000000
+          output_tokens_credit_multiplier_micro: 1000000
+          multiplier_display: "1x"
+          estimation_budgets:
+            bytes_per_token_conservative: 4
+            fixed_overhead_tokens: 100
+            safety_margin_pct: 10
+            image_token_budget: 1000
+            tool_surcharge_tokens: 500
+            web_search_surcharge_tokens: 500
+            code_interpreter_surcharge_tokens: 1000
+            minimal_generation_floor: 50
+          max_num_results: 5
+          web_search_context_size: low
+          max_tool_calls: 10
+          general_config:
+            type: ""
+            available_from: "1970-01-01T00:00:00Z"
+            max_file_size_mb: 25
+            api_params:
+              temperature: 0.7
+              top_p: 1.0
+              frequency_penalty: 0.0
+              presence_penalty: 0.0
+              stop: []
+            features:
+              streaming: true
+              structured_output: false
+            tool_support:
+              web_search: false
+              file_search: false
+              image_generation: false
+              code_interpreter: false
+              mcp: true
+            supported_endpoints:
+              chat_completions: true
+              responses: false
+              embeddings: false
+              image_generation: false
+              audio_speech_generation: false
+              audio_transcription: false
+              audio_translation: false
+          preference:
+            is_default: false
+            sort_order: 3
+
+        - id: "qwen3-6-35b"
+          provider_model_id: "mac/qwen/qwen3.6-35b-a3b"
+          display_name: "Qwen3.6 35B (Mac)"
+          description: "Qwen3.6 35B MoE on Apple Silicon"
+          provider_id: "vllm"
+          provider_display_name: "Local vLLM"
+          icon: ""
+          tier: Standard
+          enabled: true
+          system_prompt: "You are a helpful, concise assistant."
+          thread_summary_prompt: ""
+          multimodal_capabilities: ["VISION_INPUT"]
+          context_window: 32768
+          max_output_tokens: 4096
+          max_input_tokens: 28672
+          input_tokens_credit_multiplier_micro: 1000000
+          output_tokens_credit_multiplier_micro: 1000000
+          multiplier_display: "1x"
+          estimation_budgets:
+            bytes_per_token_conservative: 4
+            fixed_overhead_tokens: 100
+            safety_margin_pct: 10
+            image_token_budget: 1000
+            tool_surcharge_tokens: 500
+            web_search_surcharge_tokens: 500
+            code_interpreter_surcharge_tokens: 1000
+            minimal_generation_floor: 50
+          max_num_results: 5
+          web_search_context_size: low
+          max_tool_calls: 10
+          general_config:
+            type: ""
+            available_from: "1970-01-01T00:00:00Z"
+            max_file_size_mb: 25
+            api_params:
+              temperature: 0.7
+              top_p: 1.0
+              frequency_penalty: 0.0
+              presence_penalty: 0.0
+              stop: []
+            features:
+              streaming: true
+              structured_output: false
+            tool_support:
+              web_search: false
+              file_search: false
+              image_generation: false
+              code_interpreter: false
+              mcp: true
+            supported_endpoints:
+              chat_completions: true
+              responses: false
+              embeddings: false
+              image_generation: false
+              audio_speech_generation: false
+              audio_transcription: false
+              audio_translation: false
+          preference:
+            is_default: false
+            sort_order: 4
+
+        - id: "gemma-4-31b"
+          provider_model_id: "mac/google/gemma-4-31b"
+          display_name: "Gemma 4 31B (Mac)"
+          description: "Google Gemma 4 31B on Apple Silicon"
+          provider_id: "vllm"
+          provider_display_name: "Local vLLM"
+          icon: ""
+          tier: Standard
+          enabled: true
+          system_prompt: "You are a helpful, concise assistant."
+          thread_summary_prompt: ""
+          multimodal_capabilities: ["VISION_INPUT"]
+          context_window: 32768
+          max_output_tokens: 4096
+          max_input_tokens: 28672
+          input_tokens_credit_multiplier_micro: 1000000
+          output_tokens_credit_multiplier_micro: 1000000
+          multiplier_display: "1x"
+          estimation_budgets:
+            bytes_per_token_conservative: 4
+            fixed_overhead_tokens: 100
+            safety_margin_pct: 10
+            image_token_budget: 1000
+            tool_surcharge_tokens: 500
+            web_search_surcharge_tokens: 500
+            code_interpreter_surcharge_tokens: 1000
+            minimal_generation_floor: 50
+          max_num_results: 5
+          web_search_context_size: low
+          max_tool_calls: 10
+          general_config:
+            type: ""
+            available_from: "1970-01-01T00:00:00Z"
+            max_file_size_mb: 25
+            api_params:
+              temperature: 0.7
+              top_p: 1.0
+              frequency_penalty: 0.0
+              presence_penalty: 0.0
+              stop: []
+            features:
+              streaming: true
+              structured_output: false
+            tool_support:
+              web_search: false
+              file_search: false
+              image_generation: false
+              code_interpreter: false
+              mcp: true
+            supported_endpoints:
+              chat_completions: true
+              responses: false
+              embeddings: false
+              image_generation: false
+              audio_speech_generation: false
+              audio_transcription: false
+              audio_translation: false
+          preference:
+            is_default: false
+            sort_order: 5
+
+        - id: "qwen3-6-27b"
+          provider_model_id: "mac/qwen/qwen3.6-27b"
+          display_name: "Qwen3.6 27B (Mac)"
+          description: "Qwen3.6 27B on Apple Silicon"
+          provider_id: "vllm"
+          provider_display_name: "Local vLLM"
+          icon: ""
+          tier: Standard
+          enabled: true
+          system_prompt: "You are a helpful, concise assistant."
+          thread_summary_prompt: ""
+          multimodal_capabilities: ["VISION_INPUT"]
+          context_window: 32768
+          max_output_tokens: 4096
+          max_input_tokens: 28672
+          input_tokens_credit_multiplier_micro: 1000000
+          output_tokens_credit_multiplier_micro: 1000000
+          multiplier_display: "1x"
+          estimation_budgets:
+            bytes_per_token_conservative: 4
+            fixed_overhead_tokens: 100
+            safety_margin_pct: 10
+            image_token_budget: 1000
+            tool_surcharge_tokens: 500
+            web_search_surcharge_tokens: 500
+            code_interpreter_surcharge_tokens: 1000
+            minimal_generation_floor: 50
+          max_num_results: 5
+          web_search_context_size: low
+          max_tool_calls: 10
+          general_config:
+            type: ""
+            available_from: "1970-01-01T00:00:00Z"
+            max_file_size_mb: 25
+            api_params:
+              temperature: 0.7
+              top_p: 1.0
+              frequency_penalty: 0.0
+              presence_penalty: 0.0
+              stop: []
+            features:
+              streaming: true
+              structured_output: false
+            tool_support:
+              web_search: false
+              file_search: false
+              image_generation: false
+              code_interpreter: false
+              mcp: true
+            supported_endpoints:
+              chat_completions: true
+              responses: false
+              embeddings: false
+              image_generation: false
+              audio_speech_generation: false
+              audio_transcription: false
+              audio_translation: false
+          preference:
+            is_default: false
+            sort_order: 6
+
+  # Tenant / AuthN / AuthZ / CredStore resolvers all default to vendor
+  # "acronis", which matches the single-tenant, passport-auth-bff and
+  # static-credstore plugins — no explicit vendor config is required.
+
+  passport-auth-bff:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+
+      # Internal CF token issuer. `issuer` is the public origin root of the
+      # stand (served via nginx), so the discovery + JWKS documents are
+      # self-consistent for a future swap to the generic oidc-authn-plugin.
+      issuer: "http://cyberchat.adc.corp.acronis.com"
+      audience: "mini-chat"
+      token_ttl_secs: 86400
+      kid: "passport-bff-dev"
+      # DEV-ONLY RSA key. Replace for any real deployment.
+      signing_key_pem: |
+        -----BEGIN PRIVATE KEY-----
+        MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDYgOc1/QcpscNt
+        Urluj2Ubf8HcUZ3P6K/DJKeS5dw+SMMKIhHf4znewXBt6CW/ptHrW33e0RnmFciI
+        ep/9jpxjXU/v2q7pRqHv53mzU1eLYVrD3SRe76SQ0ueiEIZxBXOI0pR3aDJD+2CS
+        ozYsXyipxsAC4SX4Y5EvKHQvwVRpSwhCUpPw0+H9mbI5RsHeqeDrCJpUojCs/HwV
+        l5eqn2RuVxzBdTRWCmpprT8xf6+n4TNLus9tFaSVttyaOoYa468NiCNbpPcD3kt4
+        DHzI8pQufEE+HRaNnQhwxsIG0w/ugiNe8f3/VHdXO3vvInm13pGD0SU02+1/bCyT
+        Qv8Z3+xvAgMBAAECggEARS8n824ocE/wacpyHBzxi9CPFAb2vZ4XMG5RqFUQxMx+
+        mwnZGWjksMSy10REb9JwqVuixOWf95EFdGtvHdkJK42Bgl2o4D2keOPI1Z+vzYfu
+        N8G+oiHFPkxPHdBXDd3WliXosKGY0nWNXj6OjK5Z8arj5+enuRCkL+QnAK2wejab
+        wXOxiqydCyUxsy/O+9hlMd69j+LStFdie4bS3tp+Dp43jxoRO5YXYdDnDOnnKJm1
+        XAYzcGS1VDm81BgvFAT2hv96F+dk7YQEEtmhuC9lm2txyRr2LIBXhY3Lj9p6VEG/
+        BfOPQHdFdTqooDV4FGu2rvWzCjUfl5P3R1fGfYNXFQKBgQD4CMMzgvfbw32gN9gF
+        Guw06pYQbVCMUPn33Fm8Its27Ehl6Lz9boJu3SGgquOrdojjLe7+wnbqQ6F9V0v9
+        wQY6BK5v0FeEO/rWvbkfS0AiMol8bHaGyPKoV0Bh08t65cdOfZFj6y9z37haEwuz
+        IE2L3oqU8zPf3voT50hm2jfvAwKBgQDfdOhvL1/3iWjbYNQBKv3wVJLK2p6gmTns
+        duIcqdkt+jDqKKaClkyRibfabOcuN/jTemqP1FtdczQViObH0LY9/ymxmIwd0cKQ
+        /DEedFBR72sLON9q+X9Ks/VX5b/U28ste7Wz1yDjjmTfqAzrcNeYghJ1fLbm01Iw
+        AOdyrMHLJQKBgQDG4g/TkCK6nuhuvhiDD3FzhN7LUTwTJyMoshFqH/Dy+0eaH6La
+        +++ugbXjJOPlquhccYp/0OKVOaGV5ZfTYyFhCDvvAHoMWCPsaLi19Rr50NgZYscv
+        kJWykjPXvYIdi33i3CDmo8CrAyrJXxg0i6RikRFCGjjwO9T+fKe7gSL0jQKBgC/Y
+        56BPI5xsduBqplqtqvxYD6qSD19SD/4bIqWClPdsWCb7l1Pk/PY45/5ETWgvIf+e
+        eczcasfi0CdATjJA9ZTm2zWk9XO5I5FJ/vaHb19sBZ68idJtJB2J1SICFwZsHeBa
+        WfjtOqSfK+hcIpATdIa6a1tu3fclDrcqqmR6q3BlAoGBAIFC831OvmJmToqNpje1
+        XhDLyYiYtuJbyfD7pRSwfPXkr9PVq6ufVHZTBfiHx+C86bMasUM+F+MXU6Eils5D
+        k8fmgtr4suT2Qx1GHOgXksqoJEgE7WL9kewD4BhPJFQPRElaf6DDsgp1wrckQsYK
+        fAVPTkWfOzis9f5G0g7DYyjG
+        -----END PRIVATE KEY-----
+
+      # Single-tenant: every logged-in user is mapped to this tenant.
+      default_tenant_id: "00000000-0000-0000-0000-000000000001"
+      # Scopes granted to every authenticated user (single-tenant dev stand).
+      default_scopes: ["*"]
+      group_scopes: {}
+
+      # Service-to-service credentials for internal gears (mini-chat S2S).
+      s2s_credentials:
+        - client_id: "mini-chat"
+          client_secret: "mini-chat-s2s-secret"
+
+      cookie_name: "cf_session"
+      cookie_secure: false
+      post_login_redirect: "/"
+
+      oidc:
+        # Reached identically by the browser (via /etc/hosts) and the backend
+        # (via the docker network alias) — see deploy/passport-stand/README.md.
+        issuer_url: "http://auth.local:8080/default"
+        client_id: "cyberchat"
+        client_secret: "secret"
+        redirect_uri: "http://cyberchat.adc.corp.acronis.com/auth/callback"
+        scopes: ["openid", "profile", "email"]
+
+opentelemetry:
+  tracing:
+    enabled: false
+  metrics:
+    enabled: false

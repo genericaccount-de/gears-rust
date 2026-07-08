@@ -33,14 +33,20 @@ pub(crate) type AppServices = GenericAppServices<
     AttachmentRepository,
     VectorStoreRepository,
     MessageAttachmentRepository,
+    McpServerRepository,
+    McpServerToolRepository,
+    RoleMcpServerRepository,
 >;
 use crate::infra::audit_gateway::AuditGateway;
 use crate::infra::db::repo::attachment_repo::AttachmentRepository;
 use crate::infra::db::repo::chat_repo::ChatRepository;
+use crate::infra::db::repo::mcp_server_repo::McpServerRepository;
+use crate::infra::db::repo::mcp_server_tool_repo::McpServerToolRepository;
 use crate::infra::db::repo::message_attachment_repo::MessageAttachmentRepository;
 use crate::infra::db::repo::message_repo::MessageRepository;
 use crate::infra::db::repo::quota_usage_repo::QuotaUsageRepository;
 use crate::infra::db::repo::reaction_repo::ReactionRepository;
+use crate::infra::db::repo::role_mcp_server_repo::RoleMcpServerRepository;
 use crate::infra::db::repo::thread_summary_repo::ThreadSummaryRepository;
 use crate::infra::db::repo::turn_repo::TurnRepository;
 use crate::infra::db::repo::vector_store_repo::VectorStoreRepository;
@@ -49,6 +55,10 @@ use crate::infra::model_policy::ModelPolicyGateway;
 
 /// Default URL prefix for all mini-chat REST routes.
 pub const DEFAULT_URL_PREFIX: &str = "/mini-chat";
+
+/// Upper bound on a single MCP response body / SSE buffer (2 MiB). Not
+/// currently configurable; guards the pool against oversized upstream payloads.
+const MCP_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 /// The mini-chat gear: multi-tenant AI chat with SSE streaming.
 #[toolkit::gear(
@@ -69,6 +79,8 @@ pub struct MiniChatGear {
     worker_handles: Mutex<Option<WorkerHandles>>,
     /// Deferred outbox pipeline params — built in `init()`, started in `start()`.
     outbox_deferred: OnceLock<OutboxDeferred>,
+    /// Whether MCP config-seeded provisioning should run in `start()`.
+    mcp_sync_enabled: OnceLock<bool>,
 }
 
 /// State needed to register OAGW upstreams in `start()` (after GTS is ready).
@@ -112,6 +124,7 @@ impl Default for MiniChatGear {
             worker_cancel: Mutex::new(None),
             worker_handles: Mutex::new(None),
             outbox_deferred: OnceLock::new(),
+            mcp_sync_enabled: OnceLock::new(),
         }
     }
 }
@@ -166,6 +179,9 @@ impl Gear for MiniChatGear {
         cfg.knowledge_search
             .validate()
             .map_err(|e| anyhow::anyhow!("knowledge_search config: {e}"))?;
+        cfg.mcp
+            .validate()
+            .map_err(|e| anyhow::anyhow!("mcp config: {e}"))?;
 
         let vendor = cfg.vendor.trim().to_owned();
         if vendor.is_empty() {
@@ -238,6 +254,20 @@ impl Gear for MiniChatGear {
 
         let provider_resolver = Arc::new(ProviderResolver::new(&gateway, cfg.providers));
 
+        // MCP connection pool (shared by McpService + stream-time dispatch).
+        // Constructed unconditionally (empty until config sync in start());
+        // provisioning is gated on `mcp.enabled`.
+        let mcp_enabled = cfg.mcp.enabled;
+        // Captured before `cfg.mcp` is moved into the services below; consumed
+        // when building the refresh worker config.
+        let mcp_refresh_interval_secs = cfg.mcp.background_refresh_interval_secs;
+        let mcp_pool = Arc::new(crate::infra::mcp::McpPool::new(
+            Arc::clone(&gateway),
+            Duration::from_secs(cfg.mcp.tool_cache_ttl_secs),
+            MCP_MAX_RESPONSE_BYTES,
+            crate::infra::mcp::BreakerConfig::default(),
+        ));
+
         let repos = Repositories {
             chat: Arc::new(ChatRepository::new(toolkit_db::odata::LimitCfg {
                 default: 20,
@@ -254,6 +284,9 @@ impl Gear for MiniChatGear {
             thread_summary: Arc::new(ThreadSummaryRepository),
             vector_store: Arc::new(VectorStoreRepository),
             message_attachment: Arc::new(MessageAttachmentRepository),
+            mcp_server: Arc::new(McpServerRepository),
+            mcp_tool: Arc::new(McpServerToolRepository),
+            role_mcp_server: Arc::new(RoleMcpServerRepository),
         };
 
         let rag_client = Arc::new(
@@ -417,6 +450,9 @@ impl Gear for MiniChatGear {
             &repos,
             db,
             authz,
+            Arc::clone(&gateway),
+            Arc::clone(&mcp_pool),
+            cfg.mcp,
             &(model_policy_gw.clone() as Arc<dyn crate::domain::repos::ModelResolver>),
             &provider_resolver,
             cfg.streaming,
@@ -441,9 +477,19 @@ impl Gear for MiniChatGear {
             .set(services)
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
+        // Capture whether MCP provisioning should run in start() (after GTS/OAGW
+        // are ready).
+        self.mcp_sync_enabled
+            .set(mcp_enabled)
+            .map_err(|_| anyhow::anyhow!("{} mcp_sync_enabled already set", Self::MODULE_NAME))?;
+
         self.worker_configs
             .set(WorkerConfigs {
                 orphan_watchdog: cfg.orphan_watchdog,
+                mcp_refresh: crate::infra::workers::mcp_refresh_worker::McpRefreshConfig {
+                    enabled: mcp_enabled,
+                    interval: Duration::from_secs(mcp_refresh_interval_secs),
+                },
             })
             .map_err(|_| anyhow::anyhow!("{} worker_configs already set", Self::MODULE_NAME))?;
 
@@ -511,6 +557,18 @@ impl RunnableCapability for MiniChatGear {
                 &mut providers,
             )
             .await?;
+
+            // Config-seeded MCP server provisioning (OAGW upstreams + pool),
+            // using the same system SecurityContext. Gated on `mcp.enabled`.
+            if self.mcp_sync_enabled.get().copied().unwrap_or(false)
+                && let Some(services) = self.service.get()
+            {
+                if let Err(e) = services.mcp.sync_config_servers(&ctx).await {
+                    tracing::warn!(error = %e, "MCP config server sync failed");
+                } else {
+                    info!("MCP config servers synced");
+                }
+            }
         }
 
         // Start the outbox pipeline now that OAGW upstreams are registered.
@@ -624,8 +682,39 @@ impl RunnableCapability for MiniChatGear {
             None
         };
 
-        let (handles, worker_cancel) =
-            background_workers::spawn_workers(wc, &cancel, leader_elector.as_ref(), orphan_deps)?;
+        // MCP background tool-refresh worker deps (leader-elected). Shares the
+        // same `McpService` (and its pool) as the request path; re-exchanges a
+        // service context each cycle via the deferred OAGW credentials.
+        let mcp_refresh_deps = if wc.mcp_refresh.enabled {
+            let services = self.service.get().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} not initialized - init() must run before start()",
+                    Self::MODULE_NAME
+                )
+            })?;
+            let deferred = self.oagw_deferred.get().ok_or_else(|| {
+                anyhow::anyhow!("{} oagw_deferred not set", Self::MODULE_NAME)
+            })?;
+            Some(crate::infra::workers::mcp_refresh_worker::McpRefreshDeps {
+                refresher: Arc::clone(&services.mcp)
+                    as Arc<dyn crate::domain::service::McpToolRefresher>,
+                ctx_provider: Arc::new(ClientCredentialsContextProvider {
+                    authn: Arc::clone(&deferred.authn),
+                    creds: deferred.client_credentials.clone(),
+                })
+                    as Arc<dyn crate::infra::workers::mcp_refresh_worker::SystemContextProvider>,
+            })
+        } else {
+            None
+        };
+
+        let (handles, worker_cancel) = background_workers::spawn_workers(
+            wc,
+            &cancel,
+            leader_elector.as_ref(),
+            orphan_deps,
+            mcp_refresh_deps,
+        )?;
         self.store_worker_runtime(handles, worker_cancel).await?;
 
         Ok(())
@@ -667,6 +756,12 @@ impl RunnableCapability for MiniChatGear {
                     info!("Outbox pipeline stop cancelled by framework deadline");
                 }
             }
+        }
+
+        // Drop all MCP clients and clear the tool cache.
+        if let Some(services) = self.service.get() {
+            services.mcp.pool().shutdown();
+            info!("MCP pool shut down");
         }
         Ok(())
     }
@@ -736,6 +831,23 @@ impl MiniChatGear {
             anyhow::bail!("{} {msg}", Self::MODULE_NAME);
         }
         Ok(())
+    }
+}
+
+/// Supplies a fresh service `SecurityContext` for the MCP refresh worker by
+/// re-exchanging OAGW client credentials each cycle (avoids token expiry over
+/// the worker's lifetime).
+struct ClientCredentialsContextProvider {
+    authn: Arc<dyn AuthNResolverClient>,
+    creds: crate::config::ClientCredentialsConfig,
+}
+
+#[async_trait]
+impl crate::infra::workers::mcp_refresh_worker::SystemContextProvider
+    for ClientCredentialsContextProvider
+{
+    async fn system_context(&self) -> anyhow::Result<toolkit_security::SecurityContext> {
+        exchange_client_credentials(&self.authn, &self.creds).await
     }
 }
 

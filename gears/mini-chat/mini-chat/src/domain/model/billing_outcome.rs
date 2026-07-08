@@ -100,11 +100,17 @@ pub fn derive_billing_outcome(input: &BillingDerivationInput) -> BillingDerivati
             },
 
             // Post-provider errors — depends on usage availability.
+            // `unexpected_tool_use` and `agentic_iterations_exceeded` are
+            // model-driven terminals raised after the provider responded (the
+            // model requested an unknown tool, or looped past the tool-use
+            // budget), so they bill like other post-provider failures.
             Some(
                 "provider_error"
                 | "provider_timeout"
                 | "rate_limited"
-                | "web_search_calls_exceeded",
+                | "web_search_calls_exceeded"
+                | "unexpected_tool_use"
+                | "agentic_iterations_exceeded",
             ) => {
                 if input.has_usage {
                     BillingDerivation {
@@ -228,6 +234,27 @@ mod tests {
         let r = derive_billing_outcome(&input(TurnState::Failed, Some("rate_limited"), true));
         assert_eq!(r.outcome, BillingOutcome::Failed);
         assert_eq!(r.settlement_method, SettlementMethod::Actual);
+    }
+
+    #[test]
+    fn unexpected_tool_use_is_known_post_provider_error() {
+        let with = derive_billing_outcome(&input(TurnState::Failed, Some("unexpected_tool_use"), true));
+        assert_eq!(with.outcome, BillingOutcome::Failed);
+        assert_eq!(with.settlement_method, SettlementMethod::Actual);
+        assert!(!with.unknown_error_code, "must not trigger CRITICAL log");
+
+        let without =
+            derive_billing_outcome(&input(TurnState::Failed, Some("unexpected_tool_use"), false));
+        assert_eq!(without.settlement_method, SettlementMethod::Estimated);
+        assert!(!without.unknown_error_code);
+    }
+
+    #[test]
+    fn agentic_iterations_exceeded_is_known_post_provider_error() {
+        let r =
+            derive_billing_outcome(&input(TurnState::Failed, Some("agentic_iterations_exceeded"), true));
+        assert_eq!(r.outcome, BillingOutcome::Failed);
+        assert!(!r.unknown_error_code);
     }
 
     // ── Failed: unknown error code ──

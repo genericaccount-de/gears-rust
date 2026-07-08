@@ -95,6 +95,58 @@ pub(crate) trait ControlPlaneService: Send + Sync {
     ) -> Result<(Upstream, Route), DomainError>;
 }
 
+/// Outcome of beginning an interactive OAuth authorization.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub(crate) struct OAuthBeginOutcome {
+    pub authorization_url: String,
+    pub state: String,
+}
+
+/// Per-user OAuth connection status for an upstream.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub(crate) struct OAuthConnectionStatus {
+    pub connected: bool,
+    pub expires_at_unix: Option<i64>,
+}
+
+/// Internal service trait for interactive per-user OAuth authorization-code
+/// enrollment (out-of-band browser flow). Implemented in the infra layer
+/// against credstore (token store) and an HTTP client (discovery / DCR /
+/// token exchange).
+#[async_trait]
+pub(crate) trait OAuthEnrollmentService: Send + Sync {
+    /// Discover metadata, register a client, generate PKCE, persist pending
+    /// state, and return the browser authorization URL + CSRF state.
+    async fn begin(
+        &self,
+        ctx: &SecurityContext,
+        upstream_id: Uuid,
+        scopes: Vec<String>,
+        redirect_uri: String,
+        client_name: String,
+    ) -> Result<OAuthBeginOutcome, DomainError>;
+
+    /// Exchange the authorization code and persist the per-user token record.
+    async fn complete(
+        &self,
+        ctx: &SecurityContext,
+        state: String,
+        code: String,
+    ) -> Result<(), DomainError>;
+
+    /// Delete the caller's stored token for an upstream.
+    async fn revoke(&self, ctx: &SecurityContext, upstream_id: Uuid) -> Result<(), DomainError>;
+
+    /// Report whether the caller has a stored token for an upstream.
+    async fn status(
+        &self,
+        ctx: &SecurityContext,
+        upstream_id: Uuid,
+    ) -> Result<OAuthConnectionStatus, DomainError>;
+}
+
 /// Internal Data Plane service trait — proxy orchestration and plugin execution.
 #[async_trait]
 pub(crate) trait DataPlaneService: Send + Sync {

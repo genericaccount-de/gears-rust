@@ -1320,6 +1320,11 @@ impl crate::domain::ports::MiniChatMetricsPort for TestMetrics {
     fn record_knowledge_search(&self, _: &str) {}
     fn record_knowledge_search_latency_ms(&self, _: f64) {}
     fn record_knowledge_search_chunks(&self, _: f64) {}
+    fn record_mcp_call(&self, _: &str, _: &str, _: &str) {}
+    fn record_mcp_call_latency_ms(&self, _: &str, _: &str, _: f64) {}
+    fn record_mcp_call_output_chars(&self, _: f64) {}
+    fn record_mcp_tool_discovery_ms(&self, _: &str, _: f64) {}
+    fn set_mcp_role_server_assignments(&self, _: u64) {}
 }
 
 // ── Mock User Limits Provider ──

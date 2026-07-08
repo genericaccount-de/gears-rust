@@ -8,6 +8,7 @@
 //!   processed by the outbox pipeline (decoupled strategy, parallel across replicas).
 
 pub mod cleanup_worker;
+pub mod mcp_refresh_worker;
 pub mod orphan_watchdog;
 pub mod thread_summary_worker;
 

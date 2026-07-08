@@ -37,6 +37,10 @@ pub struct MiniChatAttachmentError;
 #[resource_error(gts_id!("cf.core.mini_chat.model.v1~"))]
 pub struct MiniChatModelError;
 
+/// Errors attributable to an MCP server as a resource.
+#[resource_error("gts.cf.core.mini_chat.mcp_server.v1~")]
+pub struct MiniChatMcpServerError;
+
 // ---------------------------------------------------------------------------
 // DomainError → CanonicalError
 // ---------------------------------------------------------------------------
@@ -73,6 +77,9 @@ impl From<DomainError> for CanonicalError {
                         .with_resource(resource)
                         .create(),
                     "attachment" => MiniChatAttachmentError::not_found(detail)
+                        .with_resource(resource)
+                        .create(),
+                    "mcp_server" => MiniChatMcpServerError::not_found(detail)
                         .with_resource(resource)
                         .create(),
                     _ => MiniChatChatError::not_found(detail)

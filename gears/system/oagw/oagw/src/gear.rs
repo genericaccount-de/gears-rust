@@ -22,7 +22,7 @@ use crate::api::rest::routes;
 use crate::domain::ports::OagwMetricsPort;
 use crate::domain::services::{
     ControlPlaneService, ControlPlaneServiceImpl, DataPlaneService, EndpointSelector,
-    ServiceGatewayClientV1Facade,
+    OAuthEnrollmentService, ServiceGatewayClientV1Facade,
 };
 use crate::infra::metrics::OagwMetricsMeter;
 use crate::infra::proxy::DataPlaneServiceImpl;
@@ -33,6 +33,7 @@ use crate::infra::storage::{InMemoryRouteRepo, InMemoryUpstreamRepo};
 pub struct AppState {
     pub(crate) cp: Arc<dyn ControlPlaneService>,
     pub(crate) dp: Arc<dyn DataPlaneService>,
+    pub(crate) oauth: Arc<dyn OAuthEnrollmentService>,
     pub(crate) backend_selector: Arc<dyn EndpointSelector>,
     pub(crate) config: crate::config::RuntimeConfig,
 }
@@ -140,7 +141,7 @@ impl Gear for OutboundApiGatewayGear {
         let dp: Arc<dyn DataPlaneService> = Arc::new(
             DataPlaneServiceImpl::new(
                 cp.clone(),
-                credstore,
+                credstore.clone(),
                 policy_enforcer,
                 token_http_config,
                 token_cache_config,
@@ -157,9 +158,17 @@ impl Gear for OutboundApiGatewayGear {
             .with_streaming_idle_timeout(Duration::from_secs(cfg.streaming_idle_timeout_secs)),
         );
 
+        // -- Interactive OAuth enrollment service --
+        let oauth: Arc<dyn OAuthEnrollmentService> = Arc::new(
+            crate::infra::oauth::OAuthEnrollmentServiceImpl::new(cp.clone(), credstore),
+        );
+
         // -- Facade (for external SDK consumers) --
-        let oagw: Arc<dyn ServiceGatewayClientV1> =
-            Arc::new(ServiceGatewayClientV1Facade::new(cp.clone(), dp.clone()));
+        let oagw: Arc<dyn ServiceGatewayClientV1> = Arc::new(ServiceGatewayClientV1Facade::new(
+            cp.clone(),
+            dp.clone(),
+            oauth.clone(),
+        ));
 
         ctx.client_hub()
             .register::<dyn ServiceGatewayClientV1>(oagw.clone());
@@ -202,6 +211,7 @@ impl Gear for OutboundApiGatewayGear {
         let app_state = AppState {
             cp,
             dp,
+            oauth,
             backend_selector,
             config: (&cfg).into(),
         };

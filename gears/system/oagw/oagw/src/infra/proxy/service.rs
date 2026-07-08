@@ -1255,6 +1255,17 @@ async fn execute_auth_plugin(
                     instance: instance_uri.to_string(),
                 }
             }
+            crate::domain::plugin::PluginError::AuthorizationRequired(_) => {
+                // The caller must complete an interactive OAuth flow. Surfaced
+                // as an authentication failure requiring user action; mini-chat
+                // gates unconnected servers out of tool resolution so this is a
+                // safety net rather than the primary signal.
+                DomainError::AuthenticationFailed {
+                    reason: reason::auth::PLUGIN_FAILED,
+                    detail: e.to_string(),
+                    instance: instance_uri.to_string(),
+                }
+            }
             crate::domain::plugin::PluginError::Internal(_) => DomainError::AuthenticationFailed {
                 reason: reason::auth::PLUGIN_INTERNAL,
                 detail: e.to_string(),
@@ -1771,6 +1782,12 @@ fn build_proxy_response(
 
 /// Normalize a URL path: collapse consecutive slashes and resolve `.`/`..` segments.
 /// Segments that would escape above the root are discarded.
+///
+/// A meaningful trailing slash is preserved: some upstreams mount an endpoint
+/// at `/path/` and issue a 307 redirect when it is requested at `/path`
+/// (e.g. MCP Streamable HTTP servers). The trailing slash is only re-added when
+/// there is at least one path segment, so root (`/`) and the empty path are
+/// unaffected.
 fn normalize_path(path: &str) -> String {
     let mut segments: Vec<&str> = Vec::new();
     for seg in path.split('/') {
@@ -1787,6 +1804,9 @@ fn normalize_path(path: &str) -> String {
         result.push('/');
     }
     result.push_str(&segments.join("/"));
+    if path.ends_with('/') && !segments.is_empty() && !result.ends_with('/') {
+        result.push('/');
+    }
     result
 }
 
@@ -1821,6 +1841,25 @@ mod tests {
     #[test]
     fn normalize_preserves_clean_path() {
         assert_eq!(normalize_path("/alias/v1/chat"), "/alias/v1/chat");
+    }
+
+    #[test]
+    fn normalize_preserves_trailing_slash() {
+        // Meaningful for upstreams that mount at `/path/` and 307-redirect
+        // `/path` (e.g. MCP Streamable HTTP endpoints).
+        assert_eq!(normalize_path("/mcp/"), "/mcp/");
+        assert_eq!(normalize_path("/alias/v1/chat/"), "/alias/v1/chat/");
+    }
+
+    #[test]
+    fn normalize_trailing_slash_with_double_slashes() {
+        assert_eq!(normalize_path("/alias//v1//chat/"), "/alias/v1/chat/");
+    }
+
+    #[test]
+    fn normalize_root_stays_single_slash() {
+        assert_eq!(normalize_path("/"), "/");
+        assert_eq!(normalize_path(""), "");
     }
 
     // -----------------------------------------------------------------------
@@ -1921,6 +1960,24 @@ mod tests {
                 _key: &SecretRef,
             ) -> Result<Option<GetSecretResponse>, CredStoreError> {
                 Ok(None)
+            }
+
+            async fn put(
+                &self,
+                _ctx: &SecurityContext,
+                _key: &SecretRef,
+                _value: credstore_sdk::SecretValue,
+                _sharing: credstore_sdk::SharingMode,
+            ) -> Result<(), CredStoreError> {
+                Ok(())
+            }
+
+            async fn delete(
+                &self,
+                _ctx: &SecurityContext,
+                _key: &SecretRef,
+            ) -> Result<(), CredStoreError> {
+                Ok(())
             }
         }
 

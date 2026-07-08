@@ -9,13 +9,15 @@ use credstore_sdk::CredStoreClientV1;
 
 use super::apikey_auth::ApiKeyAuthPlugin;
 use super::noop_auth::NoopAuthPlugin;
+use super::oauth2_auth_code_auth::OAuth2AuthCodeAuthPlugin;
 use super::oauth2_client_cred_auth::OAuth2ClientCredAuthPlugin;
 use super::request_id_transform::RequestIdTransformPlugin;
 use super::required_headers_guard::RequiredHeadersGuardPlugin;
 use crate::domain::gts_helpers::{
     APIKEY_AUTH_PLUGIN_ID, GUARD_PLUGIN_SCHEMA, NOOP_AUTH_PLUGIN_ID,
-    OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID, OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID,
-    REQUEST_ID_TRANSFORM_PLUGIN_ID, REQUIRED_HEADERS_GUARD_PLUGIN_ID, TRANSFORM_PLUGIN_SCHEMA,
+    OAUTH2_AUTH_CODE_AUTH_PLUGIN_ID, OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID,
+    OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID, REQUEST_ID_TRANSFORM_PLUGIN_ID,
+    REQUIRED_HEADERS_GUARD_PLUGIN_ID, TRANSFORM_PLUGIN_SCHEMA,
 };
 
 /// Registry that resolves auth plugin GTS identifiers to plugin implementations.
@@ -63,6 +65,17 @@ impl AuthPluginRegistry {
             OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID.to_string(),
             Arc::new(basic_plugin),
         );
+
+        let mut auth_code_plugin = OAuth2AuthCodeAuthPlugin::new(credstore.clone());
+        if let Some(ref cfg) = token_http_config {
+            auth_code_plugin =
+                OAuth2AuthCodeAuthPlugin::with_http_config(credstore.clone(), cfg.clone());
+        }
+        plugins.insert(
+            OAUTH2_AUTH_CODE_AUTH_PLUGIN_ID.to_string(),
+            Arc::new(auth_code_plugin),
+        );
+
         Self { plugins }
     }
 
@@ -199,6 +212,12 @@ mod tests {
                 .resolve(OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn resolves_oauth2_auth_code_plugin() {
+        let registry = make_registry();
+        assert!(registry.resolve(OAUTH2_AUTH_CODE_AUTH_PLUGIN_ID).is_ok());
     }
 
     #[test]

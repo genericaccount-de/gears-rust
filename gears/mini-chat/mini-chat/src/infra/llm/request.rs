@@ -69,6 +69,7 @@ pub enum FeatureFlag {
     FileSearch,
     WebSearch,
     CodeInterpreter,
+    Mcp,
 }
 
 impl FeatureFlag {
@@ -77,6 +78,7 @@ impl FeatureFlag {
             Self::FileSearch => "file_search",
             Self::WebSearch => "web_search",
             Self::CodeInterpreter => "code_interpreter",
+            Self::Mcp => "mcp",
         }
     }
 }

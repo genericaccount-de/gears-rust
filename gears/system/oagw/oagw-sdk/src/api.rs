@@ -4,10 +4,22 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::body::Body;
+use crate::oauth::{
+    BeginOAuthAuthorizationRequest, BeginOAuthAuthorizationResponse,
+    CompleteOAuthAuthorizationRequest, OAuthConnectionStatus,
+};
 use crate::{
     CreateRouteRequest, CreateUpstreamRequest, ListQuery, Route, UpdateRouteRequest,
     UpdateUpstreamRequest, Upstream,
 };
+
+/// Error returned by the default (unimplemented) OAuth management methods.
+fn oauth_unimplemented() -> CanonicalError {
+    CanonicalError::internal(
+        "OAuth authorization management is not implemented by this ServiceGatewayClientV1",
+    )
+    .create()
+}
 
 // ---------------------------------------------------------------------------
 // Proxy types
@@ -154,4 +166,50 @@ pub trait ServiceGatewayClientV1: Send + Sync {
         ctx: SecurityContext,
         req: http::Request<Body>,
     ) -> Result<http::Response<Body>, CanonicalError>;
+
+    // -- Interactive OAuth authorization management --
+    //
+    // Default implementations return an `unimplemented` canonical error so
+    // that transport shims and test doubles need not implement them; the
+    // in-process gateway facade overrides all four.
+
+    /// Begin an interactive OAuth authorization-code flow for an upstream on
+    /// behalf of the calling user (discovery + dynamic client registration +
+    /// PKCE), returning the browser authorization URL and CSRF state.
+    async fn begin_oauth_authorization(
+        &self,
+        _ctx: SecurityContext,
+        _req: BeginOAuthAuthorizationRequest,
+    ) -> Result<BeginOAuthAuthorizationResponse, CanonicalError> {
+        Err(oauth_unimplemented())
+    }
+
+    /// Complete an authorization after the browser callback: exchange the code
+    /// and persist the per-user token in the gateway's token store.
+    async fn complete_oauth_authorization(
+        &self,
+        _ctx: SecurityContext,
+        _req: CompleteOAuthAuthorizationRequest,
+    ) -> Result<(), CanonicalError> {
+        Err(oauth_unimplemented())
+    }
+
+    /// Revoke the calling user's stored authorization for an upstream.
+    async fn revoke_oauth_authorization(
+        &self,
+        _ctx: SecurityContext,
+        _upstream_id: Uuid,
+    ) -> Result<(), CanonicalError> {
+        Err(oauth_unimplemented())
+    }
+
+    /// Report whether the calling user has a usable authorization for an
+    /// upstream.
+    async fn oauth_connection_status(
+        &self,
+        _ctx: SecurityContext,
+        _upstream_id: Uuid,
+    ) -> Result<OAuthConnectionStatus, CanonicalError> {
+        Err(oauth_unimplemented())
+    }
 }

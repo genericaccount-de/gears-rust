@@ -244,3 +244,71 @@ fn additional_params_are_merged() {
     assert_eq!(body["temperature"], 0.5);
     assert_eq!(body["top_p"], 0.9);
 }
+
+// ── function_call → ToolUse through the <think> wrapper ──────────────
+
+#[test]
+fn function_call_in_completed_surfaces_as_tool_use_through_think() {
+    use crate::infra::llm::TerminalOutcome;
+
+    let mut think = ThinkState::new();
+
+    // The model first streams chain-of-thought inside a <think> block; the
+    // vLLM wrapper must emit it as a "reasoning" delta and not swallow the
+    // subsequent function_call.
+    let reasoning = translate_with_think(
+        &ProviderEvent::ResponseOutputTextDelta {
+            delta: "<think>deciding which tool</think>".to_string(),
+        },
+        "",
+        &mut think,
+    );
+    assert!(
+        reasoning.iter().any(|r| matches!(
+            r,
+            Ok(TranslatedEvent::Sse(ClientSseEvent::Delta { r#type: "reasoning", .. }))
+        )),
+        "think block should surface as a reasoning delta"
+    );
+
+    // The completion embeds the tool call as a function_call output item.
+    let response: ResponseObject = serde_json::from_value(serde_json::json!({
+        "id": "resp_1",
+        "output": [{
+            "type": "function_call",
+            "call_id": "call_abc",
+            "name": "mcp__dd096056__jira_get_issue",
+            "arguments": "{\"issue_key\":\"REAL-643\",\"fields\":\"*all\"}"
+        }],
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    }))
+    .expect("valid ResponseObject");
+
+    let events = translate_with_think(
+        &ProviderEvent::ResponseCompleted { response },
+        "<think>deciding which tool</think>",
+        &mut think,
+    );
+
+    let terminal = events
+        .into_iter()
+        .find_map(|r| match r {
+            Ok(TranslatedEvent::Terminal(t)) => Some(t),
+            _ => None,
+        })
+        .expect("terminal event present");
+
+    match terminal {
+        TerminalOutcome::ToolUse {
+            tool_use_id,
+            name,
+            input,
+        } => {
+            assert_eq!(tool_use_id, "call_abc");
+            assert_eq!(name, "mcp__dd096056__jira_get_issue");
+            assert_eq!(input["issue_key"], "REAL-643");
+            assert_eq!(input["fields"], "*all");
+        }
+        other => panic!("expected ToolUse terminal, got {other:?}"),
+    }
+}

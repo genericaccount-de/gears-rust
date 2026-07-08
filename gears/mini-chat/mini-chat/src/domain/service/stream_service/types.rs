@@ -62,6 +62,11 @@ pub(super) fn determine_features(tools: &[LlmTool]) -> Vec<FeatureFlag> {
     {
         flags.push(FeatureFlag::CodeInterpreter);
     }
+    if tools.iter().any(|t| {
+        matches!(t, LlmTool::Function { name, .. } if name.starts_with(super::super::mcp_schema_sanitizer::MCP_TOOL_PREFIX))
+    }) {
+        flags.push(FeatureFlag::Mcp);
+    }
     flags
 }
 
@@ -245,6 +250,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
         web_search_calls: u32,
         code_interpreter_calls: u32,
         file_search_calls: u32,
+        mcp: crate::domain::model::finalization::McpTurnAudit,
         ttft_ms: Option<u64>,
         total_ms: Option<u64>,
     ) -> crate::domain::model::finalization::FinalizationInput {
@@ -277,6 +283,9 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
             web_search_calls,
             code_interpreter_calls,
             file_search_calls,
+            mcp_calls: mcp.calls,
+            mcp_effective_snapshot: mcp.snapshot,
+            mcp_tool_audit_records: mcp.records,
             context_window: self.context_window,
             assembled_context_tokens: self.assembled_context_tokens,
             messages_truncated: self.messages_truncated,

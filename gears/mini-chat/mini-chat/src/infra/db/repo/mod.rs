@@ -1,9 +1,12 @@
 pub mod attachment_repo;
 pub mod chat_repo;
+pub mod mcp_server_repo;
+pub mod mcp_server_tool_repo;
 pub mod message_attachment_repo;
 pub mod message_repo;
 pub mod quota_usage_repo;
 pub mod reaction_repo;
+pub mod role_mcp_server_repo;
 pub mod thread_summary_repo;
 pub mod turn_repo;
 pub mod vector_store_repo;

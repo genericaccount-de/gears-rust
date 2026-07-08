@@ -35,7 +35,6 @@ enum ChatCompletionEvent {
     },
     /// Tool call delta (streamed incrementally).
     ToolCallDelta {
-        index: usize,
         id: Option<String>,
         name: Option<String>,
         arguments: Option<String>,
@@ -60,7 +59,6 @@ enum ChatCompletionEvent {
 /// A single tool-call delta extracted from the chunk.
 #[derive(Debug)]
 struct ToolCallPiece {
-    index: usize,
     id: Option<String>,
     name: Option<String>,
     arguments: Option<String>,
@@ -120,7 +118,6 @@ struct ChatDelta {
 
 #[derive(Deserialize)]
 struct ChatDeltaToolCall {
-    index: usize,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -190,7 +187,6 @@ impl FromServerEvent for ChatCompletionEvent {
             // Return the first delta as this event; additional deltas in the
             // same chunk are accumulated in `translate_chat_event`.
             return Ok(ChatCompletionEvent::ToolCallDelta {
-                index: tc.index,
                 id: tc.id.clone(),
                 name: tc.function.as_ref().and_then(|f| f.name.clone()),
                 arguments: tc.function.as_ref().and_then(|f| f.arguments.clone()),
@@ -198,7 +194,6 @@ impl FromServerEvent for ChatCompletionEvent {
                     .iter()
                     .skip(1)
                     .map(|tc| ToolCallPiece {
-                        index: tc.index,
                         id: tc.id.clone(),
                         name: tc.function.as_ref().and_then(|f| f.name.clone()),
                         arguments: tc.function.as_ref().and_then(|f| f.arguments.clone()),
@@ -230,6 +225,7 @@ impl FromServerEvent for ChatCompletionEvent {
 // Scan state + translation
 // ════════════════════════════════════════════════════════════════════════════
 
+#[derive(Default)]
 struct AccumulatedToolCall {
     id: String,
     name: String,
@@ -292,6 +288,12 @@ impl ChatCompletionsState {
                 usage: mapped_usage,
                 partial_content: self.accumulated_text.clone(),
             }),
+            // The model requested one or more function tools. Surface the first
+            // accumulated call as a `ToolUse` terminal so the agentic loop can
+            // dispatch it (MCP / knowledge search). Without this the tool call
+            // is streamed to the UI but never executed and the turn completes
+            // with empty content.
+            "tool_calls" => self.make_tool_use_terminal(mapped_usage),
             _ => TranslatedEvent::Terminal(TerminalOutcome::Completed {
                 usage: mapped_usage,
                 response_id: self.response_id.clone(),
@@ -301,40 +303,105 @@ impl ChatCompletionsState {
             }),
         }
     }
+
+    /// Build the `ToolUse` terminal from the first accumulated tool call.
+    ///
+    /// Chat Completions streams tool-call arguments as string deltas; the
+    /// concatenated buffer is parsed as JSON here. Malformed arguments fail the
+    /// turn (mirroring the Responses adapter) rather than silently coercing to
+    /// `{}`, which would dispatch the tool with wrong inputs. When
+    /// `finish_reason` is `tool_calls` but nothing was accumulated, fall back to
+    /// a normal completion.
+    fn make_tool_use_terminal(&self, usage: Usage) -> TranslatedEvent {
+        let Some(tc) = self.tool_calls.first() else {
+            return TranslatedEvent::Terminal(TerminalOutcome::Completed {
+                usage,
+                response_id: self.response_id.clone(),
+                content: self.accumulated_text.clone(),
+                citations: vec![],
+                raw_response: serde_json::Value::Null,
+            });
+        };
+        let input: serde_json::Value = if tc.arguments.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            match serde_json::from_str(&tc.arguments) {
+                Ok(v) => v,
+                Err(e) => {
+                    return TranslatedEvent::Terminal(TerminalOutcome::Failed {
+                        error: LlmProviderError::InvalidResponse {
+                            detail: format!("function_call arguments were not valid JSON: {e}"),
+                        },
+                        usage: Some(usage),
+                        partial_content: self.accumulated_text.clone(),
+                    });
+                }
+            }
+        };
+        TranslatedEvent::Terminal(TerminalOutcome::ToolUse {
+            tool_use_id: tc.id.clone(),
+            name: tc.name.clone(),
+            input,
+        })
+    }
 }
 
 /// Accumulate a single tool-call delta into state, returning a `Start` event
-/// on the first delta for an index or `Skip` for continuations.
+/// on the first delta for a call `id` or `Skip` for continuations.
 fn accumulate_tool_call(
     state: &mut ChatCompletionsState,
-    index: usize,
     id: Option<&String>,
     name: Option<&String>,
     arguments: Option<&String>,
 ) -> Vec<TranslatedEvent> {
-    while state.tool_calls.len() <= index {
-        state.tool_calls.push(AccumulatedToolCall {
-            id: String::new(),
-            name: String::new(),
-            arguments: String::new(),
-        });
-    }
-    let tc = &mut state.tool_calls[index];
-    if let Some(id) = id {
-        tc.id.clone_from(id);
-    }
+    // Tool-call fragments are keyed by their `id`, not the provider's `index`.
+    // Per the OpenAI streaming contract only the first fragment of a call
+    // carries `id`/`name`; later fragments are pure `arguments` continuations.
+    // Some OpenAI-compatible servers (vLLM / gpt-oss) report an unstable or
+    // incrementing `index` across fragments. Trusting that index would pad the
+    // slot vector with phantom empty tool calls (whose empty name later fails
+    // routing) and split one call's arguments across slots. Instead:
+    //   - a fragment with an `id` locates the existing slot for that id or
+    //     starts a new one (each parallel call has a distinct id);
+    //   - a fragment without an `id` is a continuation appended to the most
+    //     recent call.
+    let (target, is_new) = match id {
+        Some(id) => {
+            if let Some(pos) = state.tool_calls.iter().position(|t| &t.id == id) {
+                (pos, false)
+            } else {
+                state.tool_calls.push(AccumulatedToolCall {
+                    id: id.clone(),
+                    ..AccumulatedToolCall::default()
+                });
+                (state.tool_calls.len() - 1, true)
+            }
+        }
+        None => {
+            if let Some(last) = state.tool_calls.len().checked_sub(1) {
+                (last, false)
+            } else {
+                // Continuation before any announced call — start one at slot 0.
+                state.tool_calls.push(AccumulatedToolCall::default());
+                (0, false)
+            }
+        }
+    };
+
+    let tc = &mut state.tool_calls[target];
     if let Some(name) = name {
         tc.name.clone_from(name);
     }
     if let Some(args) = arguments {
         tc.arguments.push_str(args);
     }
-    if id.is_some() {
+
+    if is_new {
         vec![TranslatedEvent::Sse(ClientSseEvent::Tool {
             phase: ToolPhase::Start,
             name: "function_call",
             details: serde_json::json!({
-                "index": index,
+                "index": target,
                 "call_id": tc.id,
                 "name": tc.name,
             }),
@@ -363,23 +430,16 @@ fn translate_chat_event(
         }
 
         ChatCompletionEvent::ToolCallDelta {
-            index,
             id,
             name,
             arguments,
             extra,
         } => {
-            let mut events = accumulate_tool_call(
-                state,
-                *index,
-                id.as_ref(),
-                name.as_ref(),
-                arguments.as_ref(),
-            );
+            let mut events =
+                accumulate_tool_call(state, id.as_ref(), name.as_ref(), arguments.as_ref());
             for piece in extra {
                 events.extend(accumulate_tool_call(
                     state,
-                    piece.index,
                     piece.id.as_ref(),
                     piece.name.as_ref(),
                     piece.arguments.as_ref(),
@@ -500,6 +560,58 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
             "content": content
         }));
     }
+
+    // Append agentic-loop replay items (`function_call` / `function_call_output`).
+    // Chat Completions represents a prior tool call as an assistant message
+    // carrying `tool_calls`, and its result as a matching `role: "tool"`
+    // message. This differs from the Responses API, which carries these items
+    // verbatim in `input`. Without this translation the model never sees prior
+    // tool results and re-requests the same call every iteration until the
+    // agentic cap trips (`agentic_iterations_exceeded`).
+    for item in &request.raw_input_items {
+        match item.get("type").and_then(serde_json::Value::as_str) {
+            Some("function_call") => {
+                let call_id = item
+                    .get("call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let name = item
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let arguments = item
+                    .get("arguments")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("{}");
+                messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": serde_json::Value::Null,
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": { "name": name, "arguments": arguments }
+                    }]
+                }));
+            }
+            Some("function_call_output") => {
+                let call_id = item
+                    .get("call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let output = item
+                    .get("output")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                messages.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": output
+                }));
+            }
+            _ => {}
+        }
+    }
+
     body["messages"] = serde_json::Value::Array(messages);
 
     if let Some(max_tokens) = request.max_output_tokens {
@@ -1194,13 +1306,11 @@ mod tests {
         let result = ChatCompletionEvent::from_server_event(event).unwrap();
         match result {
             ChatCompletionEvent::ToolCallDelta {
-                index,
                 id,
                 name,
                 arguments,
                 ..
             } => {
-                assert_eq!(index, 0);
                 assert_eq!(id.as_deref(), Some("call_abc"));
                 assert_eq!(name.as_deref(), Some("get_weather"));
                 assert_eq!(arguments.as_deref(), Some(""));
@@ -1212,7 +1322,6 @@ mod tests {
     #[test]
     fn translate_tool_call_start_emitted_on_first_delta() {
         let event = ChatCompletionEvent::ToolCallDelta {
-            index: 0,
             id: Some("call_abc".into()),
             name: Some("get_weather".into()),
             arguments: Some(String::new()),
@@ -1241,7 +1350,6 @@ mod tests {
 
         // First delta: Start event
         let first = ChatCompletionEvent::ToolCallDelta {
-            index: 0,
             id: Some("call_abc".into()),
             name: Some("get_weather".into()),
             arguments: Some("{\"lo".into()),
@@ -1251,7 +1359,6 @@ mod tests {
 
         // Subsequent delta: Skip (arguments accumulated)
         let cont = ChatCompletionEvent::ToolCallDelta {
-            index: 0,
             id: None,
             name: None,
             arguments: Some("cation\":\"SF\"}".into()),
@@ -1297,6 +1404,217 @@ mod tests {
         }
     }
 
+    #[test]
+    fn tool_calls_finish_produces_tool_use_terminal() {
+        let mut state = ChatCompletionsState::new();
+        state.tool_calls.push(AccumulatedToolCall {
+            id: "call_abc".into(),
+            name: "mcp__dd096056__jira_get_issue".into(),
+            arguments: r#"{"issue_key":"REAL-643","fields":"*all"}"#.into(),
+        });
+
+        // Combined finish + usage chunk with finish_reason "tool_calls".
+        let event = ChatCompletionEvent::Done {
+            usage: ChatUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            },
+            finish_reason: "tool_calls".into(),
+        };
+        let events = translate_chat_event(&event, &mut state);
+
+        // Last event must be the ToolUse terminal so the agentic loop dispatches.
+        let terminal = events
+            .iter()
+            .find_map(|e| match e {
+                TranslatedEvent::Terminal(t) => Some(t),
+                _ => None,
+            })
+            .expect("terminal event present");
+        match terminal {
+            TerminalOutcome::ToolUse {
+                tool_use_id,
+                name,
+                input,
+            } => {
+                assert_eq!(tool_use_id, "call_abc");
+                assert_eq!(name, "mcp__dd096056__jira_get_issue");
+                assert_eq!(input["issue_key"], "REAL-643");
+                assert_eq!(input["fields"], "*all");
+            }
+            other => panic!("expected ToolUse terminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_calls_with_empty_arguments_defaults_to_empty_object() {
+        let mut state = ChatCompletionsState::new();
+        state.tool_calls.push(AccumulatedToolCall {
+            id: "call_1".into(),
+            name: "list_things".into(),
+            arguments: String::new(),
+        });
+        let zero = ChatUsage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        };
+        match state.make_terminal(&zero, "tool_calls") {
+            TranslatedEvent::Terminal(TerminalOutcome::ToolUse { input, name, .. }) => {
+                assert_eq!(name, "list_things");
+                assert_eq!(input, serde_json::json!({}));
+            }
+            other => panic!("expected ToolUse terminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_calls_with_malformed_arguments_fails_turn() {
+        let mut state = ChatCompletionsState::new();
+        state.tool_calls.push(AccumulatedToolCall {
+            id: "call_1".into(),
+            name: "list_things".into(),
+            arguments: "{not json".into(),
+        });
+        let zero = ChatUsage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        };
+        match state.make_terminal(&zero, "tool_calls") {
+            TranslatedEvent::Terminal(TerminalOutcome::Failed { .. }) => {}
+            other => panic!("expected Failed terminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_call_argument_continuation_is_appended_to_last_call() {
+        let mut state = ChatCompletionsState::new();
+
+        // First fragment: id + name + partial args.
+        let first = ChatCompletionEvent::ToolCallDelta {
+            id: Some("chatcmpl-tool-96".into()),
+            name: Some("mcp__dd096056__jira_get_issue".into()),
+            arguments: Some("{\n ".into()),
+            extra: vec![],
+        };
+        let _ = translate_chat_event(&first, &mut state);
+
+        // Continuation fragment: no id/name. It must be appended to the first
+        // call rather than opening a second slot that would truncate the JSON.
+        let cont = ChatCompletionEvent::ToolCallDelta {
+            id: None,
+            name: None,
+            arguments: Some(" \"issue_key\": \"REAL-643\",\n  \"fields\": \"*all\"\n}".into()),
+            extra: vec![],
+        };
+        let _ = translate_chat_event(&cont, &mut state);
+
+        assert_eq!(
+            state.tool_calls.len(),
+            1,
+            "continuation must not create a second tool-call slot"
+        );
+
+        let zero = ChatUsage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        };
+        match state.make_terminal(&zero, "tool_calls") {
+            TranslatedEvent::Terminal(TerminalOutcome::ToolUse { name, input, .. }) => {
+                assert_eq!(name, "mcp__dd096056__jira_get_issue");
+                assert_eq!(input["issue_key"], "REAL-643");
+                assert_eq!(input["fields"], "*all");
+            }
+            other => panic!("expected ToolUse terminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_tool_call_fragment_creates_no_phantom_slot() {
+        let mut state = ChatCompletionsState::new();
+
+        // A single id-bearing fragment must produce exactly one named slot.
+        // Keying accumulation by id (not the provider's `index`) prevents the
+        // phantom empty slot 0 whose empty name previously read out via
+        // `make_tool_use_terminal` and failed routing as `unexpected_tool_use`.
+        let ev = ChatCompletionEvent::ToolCallDelta {
+            id: Some("call_x".into()),
+            name: Some("mcp__dd096056__jira_get_issue".into()),
+            arguments: Some("{\"issue_key\":\"REAL-643\"}".into()),
+            extra: vec![],
+        };
+        let _ = translate_chat_event(&ev, &mut state);
+
+        assert_eq!(
+            state.tool_calls.len(),
+            1,
+            "a single call must not create phantom slots"
+        );
+
+        let zero = ChatUsage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        };
+        match state.make_terminal(&zero, "tool_calls") {
+            TranslatedEvent::Terminal(TerminalOutcome::ToolUse {
+                tool_use_id,
+                name,
+                input,
+            }) => {
+                assert_eq!(tool_use_id, "call_x");
+                assert_eq!(name, "mcp__dd096056__jira_get_issue");
+                assert_eq!(input["issue_key"], "REAL-643");
+            }
+            other => panic!("expected ToolUse terminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_call_with_echoed_id_across_fragments_is_not_duplicated() {
+        let mut state = ChatCompletionsState::new();
+
+        // Some servers echo the same `id` on every fragment. Each must map to
+        // the same slot rather than opening a new one.
+        for (i, frag) in ["{\"issue", "_key\":\"", "REAL-643\"}"].iter().enumerate() {
+            let ev = ChatCompletionEvent::ToolCallDelta {
+                id: Some("call_y".into()),
+                name: if i == 0 {
+                    Some("mcp__dd096056__jira_get_issue".into())
+                } else {
+                    None
+                },
+                arguments: Some((*frag).into()),
+                extra: vec![],
+            };
+            let _ = translate_chat_event(&ev, &mut state);
+        }
+
+        assert_eq!(state.tool_calls.len(), 1, "echoed id must reuse one slot");
+
+        let zero = ChatUsage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        };
+        match state.make_terminal(&zero, "tool_calls") {
+            TranslatedEvent::Terminal(TerminalOutcome::ToolUse { name, input, .. }) => {
+                assert_eq!(name, "mcp__dd096056__jira_get_issue");
+                assert_eq!(input["issue_key"], "REAL-643");
+            }
+            other => panic!("expected ToolUse terminal, got {other:?}"),
+        }
+    }
+
     // ── Request serialization tests ───────────────────────────────────────
 
     #[test]
@@ -1336,6 +1654,62 @@ mod tests {
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[1]["role"], "assistant");
         assert_eq!(messages[2]["role"], "user");
+    }
+
+    #[test]
+    fn raw_input_items_become_assistant_tool_call_and_tool_message() {
+        // The agentic loop replays a prior tool call as a `function_call` item
+        // and its result as a `function_call_output` item. On Chat Completions
+        // these must surface as an assistant message carrying `tool_calls` and
+        // a matching `role: "tool"` message, or the model never sees the result
+        // and loops until `agentic_iterations_exceeded`.
+        let request = llm_request("gpt-4o")
+            .message(LlmMessage::user("Find the assignee of REAL-643"))
+            .raw_input_items(vec![
+                serde_json::json!({
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "jira_get_issue",
+                    "arguments": r#"{"issue_key":"REAL-643"}"#,
+                }),
+                serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": "{\"assignee\":\"jane.doe\"}",
+                }),
+            ])
+            .build_streaming();
+
+        let body = build_request_body(&request, true);
+        let messages = body["messages"].as_array().unwrap();
+        // user, assistant(tool_calls), tool
+        assert_eq!(messages.len(), 3);
+
+        let assistant = &messages[1];
+        assert_eq!(assistant["role"], "assistant");
+        assert!(assistant["content"].is_null());
+        let tool_call = &assistant["tool_calls"][0];
+        assert_eq!(tool_call["id"], "call-1");
+        assert_eq!(tool_call["type"], "function");
+        assert_eq!(tool_call["function"]["name"], "jira_get_issue");
+        assert_eq!(tool_call["function"]["arguments"], r#"{"issue_key":"REAL-643"}"#);
+
+        let tool_msg = &messages[2];
+        assert_eq!(tool_msg["role"], "tool");
+        assert_eq!(tool_msg["tool_call_id"], "call-1");
+        assert_eq!(tool_msg["content"], "{\"assignee\":\"jane.doe\"}");
+    }
+
+    #[test]
+    fn empty_raw_input_items_leave_messages_unchanged() {
+        let request = llm_request("gpt-4o")
+            .message(LlmMessage::user("Hi"))
+            .build_streaming();
+
+        let body = build_request_body(&request, true);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
     }
 
     #[test]

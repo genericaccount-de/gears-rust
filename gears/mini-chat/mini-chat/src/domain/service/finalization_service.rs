@@ -6,7 +6,7 @@ use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use mini_chat_sdk::{
-    AuditUsageTokens, LatencyMs, PolicyDecisions, QuotaDecision, TurnAuditEvent,
+    AuditUsageTokens, LatencyMs, PolicyDecisions, QuotaDecision, ToolCalls, TurnAuditEvent,
     TurnAuditEventType, UsageEvent, UsageTokens,
 };
 
@@ -764,6 +764,11 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                         response: None,
                         attachments: Vec::new(),
                         tool_calls: None,
+                        // Orphan finalization has no access to the in-memory MCP
+                        // audit state (the owning pod died); omit MCP telemetry.
+                        mcp_tool_calls: None,
+                        mcp_effective_snapshot: None,
+                        mcp_tool_audit_records: Vec::new(),
                     });
                     outbox_enqueuer
                         .enqueue_audit_event(tx, audit_event)
@@ -841,7 +846,29 @@ fn build_turn_audit_envelope(input: &FinalizationInput, trace_id: Option<String>
         prompt: None,
         response: None,
         attachments: Vec::new(),
-        tool_calls: None,
+        tool_calls: build_tool_calls(input),
+        // MCP audit telemetry. The snapshot is present whenever MCP tools were
+        // exposed for the turn (even if none were called), so `mcp_tool_calls`
+        // tracks the snapshot's presence for accurate compliance reporting.
+        mcp_tool_calls: input
+            .mcp_effective_snapshot
+            .as_ref()
+            .map(|_| input.mcp_calls),
+        mcp_effective_snapshot: input.mcp_effective_snapshot.clone(),
+        mcp_tool_audit_records: input.mcp_tool_audit_records.clone(),
+    })
+}
+
+/// Assemble the [`ToolCalls`] summary for a turn, or `None` when no tool of any
+/// kind was invoked (keeps the audit event compact).
+fn build_tool_calls(input: &FinalizationInput) -> Option<ToolCalls> {
+    if input.web_search_calls == 0 && input.file_search_calls == 0 && input.mcp_calls == 0 {
+        return None;
+    }
+    Some(ToolCalls {
+        file_search_calls: (input.file_search_calls > 0).then(|| u64::from(input.file_search_calls)),
+        web_search_calls: (input.web_search_calls > 0).then(|| u64::from(input.web_search_calls)),
+        mcp_calls: (input.mcp_calls > 0).then(|| u64::from(input.mcp_calls)),
     })
 }
 
@@ -1197,9 +1224,12 @@ mod tests {
                 (PeriodType::Daily, today),
                 (PeriodType::Monthly, month_start),
             ],
-            web_search_calls: 3,
+            web_search_calls: 0,
             code_interpreter_calls: 0,
             file_search_calls: 0,
+            mcp_calls: 0,
+            mcp_effective_snapshot: None,
+            mcp_tool_audit_records: Vec::new(),
             context_window: 128_000,
             assembled_context_tokens: 0,
             messages_truncated: false,

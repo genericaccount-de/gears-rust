@@ -688,7 +688,7 @@ fuzz-corpus: fuzz-install
 
 # Run server with mini-chat gear
 mini-chat:
-	cargo run --bin cf-gears-example-server --features mini-chat,static-authn,static-authz,single-tenant,static-credstore,otel -- --config config/mini-chat.yaml run
+	cargo run --bin cf-gears-example-server --features mini-chat,static-authn,static-authz,single-tenant,static-credstore,otel -- --config config/mini-chat-local-test.yaml run
 
 ## Build mini-chat Docker image for K8s (dev build by default, RELEASE=1 for optimized)
 ## On linux: builds on host (reuses local target/), then packages the binary.

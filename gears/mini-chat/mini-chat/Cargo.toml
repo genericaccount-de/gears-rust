@@ -53,6 +53,12 @@ bytes = { workspace = true }
 regex = { workspace = true }
 multer = "3.1"
 
+# Concurrency primitives (fast, non-poisoning locks)
+parking_lot = { workspace = true }
+
+# JSON Schema validation for MCP tool arguments
+jsonschema = { workspace = true }
+
 # Encoding
 base64 = { workspace = true }
 

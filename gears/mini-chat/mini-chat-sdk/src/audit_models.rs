@@ -98,11 +98,63 @@ pub struct PolicyDecisions {
 
 /// Tool call counts for a turn.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[allow(clippy::struct_field_names)] // each field names a distinct tool family
 pub struct ToolCalls {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_search_calls: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_search_calls: Option<u64>,
+    /// Completed MCP `tools/call` invocations during the turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_calls: Option<u64>,
+}
+
+/// One MCP server and its effective tool set for a turn (compliance snapshot).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpEffectiveServer {
+    /// MCP origin server identifier (`mcp_servers.id`).
+    pub server_id: String,
+    /// Original (upstream) tool names effective for this turn.
+    pub tools: Vec<String>,
+}
+
+/// Full effective MCP server/tool list for a turn.
+///
+/// Captured for compliance even when no MCP tool is ultimately called, so the
+/// audit trail records exactly which external tools were exposed to the model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpEffectiveSnapshot {
+    pub servers: Vec<McpEffectiveServer>,
+    /// Total number of exposed MCP tools across all servers.
+    pub tool_count: u32,
+}
+
+/// Per-call audit detail for a single MCP `tools/call` invocation.
+///
+/// Argument and output content is never stored verbatim — only stable,
+/// non-reversible hashes are retained (untrusted-data handling).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpToolAuditRecord {
+    /// MCP origin server identifier (`mcp_servers.id`).
+    pub server_id: String,
+    /// Provider-facing exposed tool name (`mcp__<hash>__<tool>`).
+    pub exposed_name: String,
+    /// Original (upstream) tool name.
+    pub original_name: String,
+    /// Provider tool-call correlation ID.
+    pub call_id: String,
+    /// Dispatch duration in milliseconds.
+    pub duration_ms: u64,
+    /// Outcome class (`ok`, `error`, `timeout`, `invalid_args`, `unavailable`).
+    pub status: String,
+    /// Stable error class when the call failed; absent on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    /// FNV-1a hash of the serialized arguments (never the raw arguments).
+    pub arguments_hash: String,
+    /// FNV-1a hash of the sanitized output; absent when no output was produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_hash: Option<String>,
 }
 
 /// Discriminator for [`TurnAuditEvent`].
@@ -158,6 +210,17 @@ pub struct TurnAuditEvent {
     pub attachments: Vec<AttachmentMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<ToolCalls>,
+    /// Completed MCP `tools/call` count for the turn. Present when MCP tools
+    /// were exposed to the model (even if none were ultimately called).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_tool_calls: Option<u32>,
+    /// Full effective MCP server/tool list exposed during the turn (compliance
+    /// snapshot). Present when MCP tools were exposed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_effective_snapshot: Option<McpEffectiveSnapshot>,
+    /// Per-call MCP audit detail (hashed arguments/output; never raw content).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_tool_audit_records: Vec<McpToolAuditRecord>,
 }
 
 /// Discriminator for [`TurnMutationAuditEvent`].

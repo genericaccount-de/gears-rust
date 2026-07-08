@@ -67,6 +67,13 @@ pub struct MiniChatMetricsMeter {
     knowledge_search_latency_ms: Histogram<f64>,
     knowledge_search_chunks: Histogram<f64>,
 
+    // ── P1: MCP tool execution ─────────────────────────────────────────
+    mcp_call: Counter<u64>,
+    mcp_call_latency_ms: Histogram<f64>,
+    mcp_call_output_chars: Histogram<f64>,
+    mcp_tool_discovery_ms: Histogram<f64>,
+    mcp_role_server_assignments: Gauge<u64>,
+
     // ════════════════════════════════════════════════════════════════════
     // DEFERRED INSTRUMENTS — declared but not wired to the domain port.
     // ════════════════════════════════════════════════════════════════════
@@ -357,6 +364,28 @@ impl MiniChatMetricsMeter {
             knowledge_search_chunks: meter
                 .f64_histogram(format!("{prefix}_knowledge_search_chunks"))
                 .with_description("Chunks returned per knowledge search call")
+                .build(),
+
+            // ── P1: MCP tool execution ─────────────────────────────────
+            mcp_call: meter
+                .u64_counter(format!("{prefix}_mcp_tool_calls"))
+                .with_description("MCP tool call outcomes by server, tool, and status")
+                .build(),
+            mcp_call_latency_ms: meter
+                .f64_histogram(format!("{prefix}_mcp_tool_call_duration_ms"))
+                .with_description("MCP tool call dispatch latency (ms)")
+                .build(),
+            mcp_call_output_chars: meter
+                .f64_histogram(format!("{prefix}_mcp_call_output_chars"))
+                .with_description("Sanitized MCP tool output size (chars)")
+                .build(),
+            mcp_tool_discovery_ms: meter
+                .f64_histogram(format!("{prefix}_mcp_tool_discovery_duration_ms"))
+                .with_description("MCP tools/list discovery latency (ms)")
+                .build(),
+            mcp_role_server_assignments: meter
+                .u64_gauge(format!("{prefix}_mcp_role_server_assignments"))
+                .with_description("Current number of role-server MCP assignments")
                 .build(),
 
             // ════════════════════════════════════════════════════════════
@@ -954,6 +983,42 @@ impl MiniChatMetricsPort for MiniChatMetricsMeter {
 
     fn record_knowledge_search_chunks(&self, count: f64) {
         self.knowledge_search_chunks.record(count, &[]);
+    }
+
+    // ── P1: MCP tool execution ───────────────────────────────────────
+
+    fn record_mcp_call(&self, server_id: &str, tool_name: &str, status: &str) {
+        self.mcp_call.add(
+            1,
+            &[
+                KeyValue::new(key::SERVER_ID, server_id.to_owned()),
+                KeyValue::new(key::TOOL_NAME, tool_name.to_owned()),
+                KeyValue::new(key::STATUS, status.to_owned()),
+            ],
+        );
+    }
+
+    fn record_mcp_call_latency_ms(&self, server_id: &str, tool_name: &str, ms: f64) {
+        self.mcp_call_latency_ms.record(
+            ms,
+            &[
+                KeyValue::new(key::SERVER_ID, server_id.to_owned()),
+                KeyValue::new(key::TOOL_NAME, tool_name.to_owned()),
+            ],
+        );
+    }
+
+    fn record_mcp_call_output_chars(&self, count: f64) {
+        self.mcp_call_output_chars.record(count, &[]);
+    }
+
+    fn record_mcp_tool_discovery_ms(&self, server_id: &str, ms: f64) {
+        self.mcp_tool_discovery_ms
+            .record(ms, &[KeyValue::new(key::SERVER_ID, server_id.to_owned())]);
+    }
+
+    fn set_mcp_role_server_assignments(&self, count: u64) {
+        self.mcp_role_server_assignments.record(count, &[]);
     }
 }
 

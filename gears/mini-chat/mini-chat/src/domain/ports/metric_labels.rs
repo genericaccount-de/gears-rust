@@ -22,6 +22,22 @@ pub mod key {
     #[allow(dead_code)] // declared ahead of call site (metrics infra uses string literals)
     pub const STATE: &str = "state";
     pub const PROVIDER_KIND: &str = "provider_kind";
+    /// MCP origin server identifier (`mcp_servers.id`).
+    pub const SERVER_ID: &str = "server_id";
+    /// MCP original (upstream) tool name.
+    pub const TOOL_NAME: &str = "tool_name";
+    /// MCP tool call outcome class (`ok`|`error`|`timeout`|`invalid_args`|`unavailable`).
+    pub const STATUS: &str = "status";
+}
+
+/// MCP tool call status labels (`status` label).
+pub mod mcp_status {
+    pub const OK: &str = "ok";
+    pub const ERROR: &str = "error";
+    pub const TIMEOUT: &str = "timeout";
+    pub const INVALID_ARGS: &str = "invalid_args";
+    pub const UNAVAILABLE: &str = "unavailable";
+    pub const RATE_LIMITED: &str = "rate_limited";
 }
 
 // ── Label values ─────────────────────────────────────────────────────────

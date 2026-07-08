@@ -5,6 +5,7 @@ use toolkit_gts::gts_id;
 
 use crate::gear::AppState;
 
+mod oauth;
 mod proxy;
 mod route;
 mod upstream;
@@ -34,6 +35,7 @@ pub fn register_routes(
     let writable = state.config.management_api_enabled;
     router = upstream::register(router, openapi, writable);
     router = route::register(router, openapi, writable);
+    router = oauth::register(router, openapi, writable);
     router = proxy::register(router);
     router.layer(axum::Extension(state))
 }
@@ -49,7 +51,9 @@ pub fn register_routes(
 /// gets through api-gateway's middleware stack.
 #[cfg(any(test, feature = "test-utils"))]
 pub fn test_router(state: AppState, ctx: toolkit_security::SecurityContext) -> Router {
-    use crate::api::rest::handlers::{proxy as proxy_h, route as route_h, upstream as upstream_h};
+    use crate::api::rest::handlers::{
+        oauth as oauth_h, proxy as proxy_h, route as route_h, upstream as upstream_h,
+    };
     use axum::routing::{any, get, post};
 
     Router::new()
@@ -74,6 +78,19 @@ pub fn test_router(state: AppState, ctx: toolkit_security::SecurityContext) -> R
             get(route_h::get_route)
                 .put(route_h::update_route)
                 .delete(route_h::delete_route),
+        )
+        // Interactive OAuth authorization management
+        .route(
+            "/oagw/v1/upstreams/{id}/oauth",
+            get(oauth_h::connection_status).delete(oauth_h::revoke_authorization),
+        )
+        .route(
+            "/oagw/v1/upstreams/{id}/oauth/authorize",
+            post(oauth_h::begin_authorization),
+        )
+        .route(
+            "/oagw/v1/oauth/complete",
+            post(oauth_h::complete_authorization),
         )
         // Proxy
         .route("/oagw/v1/proxy/{*path}", any(proxy_h::proxy_handler))

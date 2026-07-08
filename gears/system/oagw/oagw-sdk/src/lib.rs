@@ -5,6 +5,7 @@ pub mod error;
 pub mod field;
 pub mod gts;
 pub mod multipart;
+pub mod oauth;
 pub mod quota;
 pub mod reason;
 pub mod sse;
@@ -25,6 +26,10 @@ pub use models::{
 
 pub use api::ServiceGatewayClientV1;
 pub use body::Body;
+pub use oauth::{
+    BeginOAuthAuthorizationRequest, BeginOAuthAuthorizationResponse,
+    CompleteOAuthAuthorizationRequest, OAuthConnectionStatus,
+};
 pub use codec::Json;
 pub use error::{ServiceGatewayError, StreamingError};
 pub use gts::{
