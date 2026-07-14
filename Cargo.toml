@@ -600,3 +600,17 @@ gts-macros = "0.11.0"
 
 [workspace.metadata.cargo-shear]
 ignored-paths = ["**/tests/ui/**"]
+# Gear crate deps only consumed by macro-generated re-exports in #[toolkit::gear(deps = [...])].
+# cargo-shear cannot trace usage through proc-macro expansion, so these appear unused.
+ignored = [
+    "account-management",
+    "authn-resolver",
+    "authz-resolver",
+    "credstore",
+    "grpc_hub",
+    "oagw",
+    "resource-group",
+    "tenant-resolver",
+    "types-registry",
+    "usage-collector",
+]

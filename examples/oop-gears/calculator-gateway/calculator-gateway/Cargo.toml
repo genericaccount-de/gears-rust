@@ -36,3 +36,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 inventory = { workspace = true }
+
+[package.metadata.cargo-shear]
+# Gear dep only consumed by macro-generated re-export in #[toolkit::gear(deps = [...])].
+ignored = ["calculator"]
