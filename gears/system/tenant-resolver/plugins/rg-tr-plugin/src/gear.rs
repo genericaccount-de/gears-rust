@@ -21,7 +21,7 @@ use crate::domain::Service;
 /// Does not seed the tenant RG type — it must be created externally.
 #[toolkit::gear(
     name = "rg-tr-plugin",
-    deps = ["types-registry", "resource-group"]
+    deps = [types_registry, resource_group]
 )]
 pub struct RgTrPlugin {
     service: OnceLock<Arc<Service>>,

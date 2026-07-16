@@ -17,7 +17,7 @@ use crate::domain::Service;
 /// Static `AuthZ` resolver plugin gear.
 #[toolkit::gear(
     name = "static-authz-plugin",
-    deps = ["types-registry"]
+    deps = [types_registry]
 )]
 pub struct StaticAuthZPlugin {
     service: OnceLock<Arc<Service>>,

@@ -17,7 +17,7 @@ use super::service::Service;
 /// Provides a config-driven model catalog for development and testing.
 #[toolkit::gear(
     name = "static-mini-chat-model-policy-plugin",
-    deps = ["types-registry"]
+    deps = [types_registry]
 )]
 pub struct StaticMiniChatModelPolicyPlugin {
     service: OnceLock<Arc<Service>>,

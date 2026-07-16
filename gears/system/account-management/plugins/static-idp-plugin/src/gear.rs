@@ -34,7 +34,7 @@ use crate::domain::Service;
 ///      on the chosen `gts_id`.
 #[toolkit::gear(
     name = "static-idp-plugin",
-    deps = ["types-registry"]
+    deps = [types_registry]
 )]
 pub struct StaticIdpPlugin {
     service: OnceLock<Arc<Service>>,

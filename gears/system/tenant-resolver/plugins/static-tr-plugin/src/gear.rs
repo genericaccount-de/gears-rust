@@ -24,7 +24,7 @@ use crate::domain::Service;
 /// - This plugin registers its scoped client (implementation in `ClientHub`)
 #[toolkit::gear(
     name = "static-tr-plugin",
-    deps = ["types-registry"]
+    deps = [types_registry]
 )]
 pub struct StaticTrPlugin {
     service: OnceLock<Arc<Service>>,

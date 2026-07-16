@@ -21,7 +21,7 @@ use crate::domain::Service;
 /// accessing Resource Group directly.
 #[toolkit::gear(
     name = "tr-authz-plugin",
-    deps = ["types-registry", "tenant-resolver"]
+    deps = [types_registry, tenant_resolver]
 )]
 pub struct TrAuthZPlugin {
     service: OnceLock<Arc<Service>>,

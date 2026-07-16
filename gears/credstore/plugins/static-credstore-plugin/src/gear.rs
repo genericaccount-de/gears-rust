@@ -17,7 +17,7 @@ use crate::domain::Service;
 /// Serves pre-configured secrets from YAML configuration for development and testing.
 #[toolkit::gear(
     name = "static-credstore-plugin",
-    deps = ["types-registry"]
+    deps = [types_registry]
 )]
 pub struct StaticCredStorePlugin {
     service: OnceLock<Arc<Service>>,

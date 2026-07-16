@@ -27,7 +27,7 @@ use crate::infra::runtime::build_oidc_authn_plugin;
 /// in types-registry before this gear registers plugin instance metadata.
 #[toolkit::gear(
     name = "oidc-authn-plugin",
-    deps = ["types-registry", "authn-resolver"]
+    deps = [types_registry, authn_resolver]
 )]
 #[derive(Default)]
 pub struct OidcAuthNPluginGear;

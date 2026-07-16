@@ -24,7 +24,7 @@ use crate::domain::{Service, TenantResolverLocalClient};
 /// call after types-registry is ready.
 #[toolkit::gear(
     name = "tenant-resolver",
-    deps = ["types-registry"],
+    deps = [types_registry],
     capabilities = [system]
 )]
 pub(crate) struct TenantResolver {

@@ -24,7 +24,7 @@ use crate::domain::{AuthZResolverLocalClient, Service};
 /// call after types-registry is ready.
 #[toolkit::gear(
     name = "authz-resolver",
-    deps = ["types-registry"],
+    deps = [types_registry],
     capabilities = [system]
 )]
 pub(crate) struct AuthZResolver {

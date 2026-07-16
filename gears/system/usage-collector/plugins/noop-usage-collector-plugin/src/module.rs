@@ -19,7 +19,7 @@ use crate::plugin::NoopBackend;
 /// resolves end-to-end in development and testing without a real DB backend.
 #[toolkit::gear(
     name = "noop-usage-collector-plugin",
-    deps = ["types-registry"]
+    deps = [types_registry]
 )]
 #[derive(Default)]
 pub struct NoopUsageCollectorPlugin;

@@ -40,7 +40,7 @@ pub struct AppState {
 /// Outbound API Gateway gear: wires repos, services, and routes.
 #[toolkit::gear(
     name = "oagw",
-    deps = ["types-registry", "authz-resolver", "credstore", "tenant-resolver"],
+    deps = [types_registry, authz_resolver, credstore, tenant_resolver],
     capabilities = [system, rest]
 )]
 pub struct OutboundApiGatewayGear {

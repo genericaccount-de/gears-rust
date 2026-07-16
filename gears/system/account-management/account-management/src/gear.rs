@@ -82,7 +82,7 @@ struct BootstrapParams {
 
 #[toolkit::gear(
     name = "account-management",
-    deps = ["authz-resolver", "types-registry", "resource-group", "tenant-resolver"],
+    deps = [authz_resolver, types_registry, resource_group, tenant_resolver],
     capabilities = [db, rest, stateful],
     lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
 )]

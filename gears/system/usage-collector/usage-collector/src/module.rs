@@ -43,7 +43,7 @@ use crate::domain::{Service, UsageCollectorLocalClient};
 /// registration is needed.
 #[toolkit::gear(
     name = "usage-collector",
-    deps = ["types-registry", "authz-resolver"],
+    deps = [types_registry, authz_resolver],
     capabilities = [rest, stateful],
     lifecycle(entry = "serve", stop_timeout = "30s")
 )]

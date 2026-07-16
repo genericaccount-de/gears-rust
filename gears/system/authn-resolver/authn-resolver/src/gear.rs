@@ -24,7 +24,7 @@ use crate::domain::{AuthNResolverLocalClient, Service};
 /// call after types-registry is ready.
 #[toolkit::gear(
     name = "authn-resolver",
-    deps = ["types-registry"],
+    deps = [types_registry],
     capabilities = [system]
 )]
 pub(crate) struct AuthNResolver {

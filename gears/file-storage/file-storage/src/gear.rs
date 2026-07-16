@@ -45,7 +45,7 @@ const MEMORY_ID: &str = "memory";
 /// is used only for the cooperative background cleanup sweep.
 #[toolkit::gear(
     name = "file-storage",
-    deps = ["authz-resolver"],
+    deps = [authz_resolver],
     capabilities = [db, rest, stateful]
 )]
 pub struct FileStorageGear {

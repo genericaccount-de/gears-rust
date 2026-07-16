@@ -20,7 +20,7 @@ use crate::domain::Service;
 /// Returns the tenant from security context as the only accessible tenant.
 #[toolkit::gear(
     name = "single-tenant-tr-plugin",
-    deps = ["types-registry"]
+    deps = [types_registry]
 )]
 pub struct SingleTenantTrPlugin;
 

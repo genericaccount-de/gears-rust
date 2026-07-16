@@ -23,7 +23,7 @@ type ConcreteService = Service<SeaOrmSettingsRepository>;
 
 #[toolkit::gear(
     name = "simple-user-settings",
-    deps = ["authz-resolver"],
+    deps = [authz_resolver],
     capabilities = [rest, db]
 )]
 pub struct SettingsGear {

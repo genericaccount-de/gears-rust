@@ -63,7 +63,7 @@ use crate::web;
 #[toolkit::gear(
 	name = "api-gateway",
 	capabilities = [rest_host, rest, stateful],
-    deps = ["grpc-hub", "authn-resolver"],
+    deps = [grpc_hub, authn_resolver],
 	lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
 )]
 pub struct ApiGateway {

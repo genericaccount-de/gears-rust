@@ -169,7 +169,7 @@ pub(crate) struct LedgerRuntime {
 // broker-free no-op/metrics-only publisher). Declaring it would make the gear
 // unschedulable (the orchestrator can't satisfy a dep no gear provides). Re-add
 // it here once the broker gear exists and `events_enabled` is wired to it.
-#[toolkit::gear(name = "bss-ledger", capabilities = [db, rest, stateful], deps = ["types-registry", "authz-resolver", "account-management"], lifecycle(entry = "serve", stop_timeout = "30s"))]
+#[toolkit::gear(name = "bss-ledger", capabilities = [db, rest, stateful], deps = [types_registry, authz_resolver, account_management], lifecycle(entry = "serve", stop_timeout = "30s"))]
 pub struct BssLedgerGear {
     /// Typed runtime built inside [`Gear::init`] and consumed by
     /// [`RestApiCapability::register_rest`] and [`BssLedgerGear::serve`].

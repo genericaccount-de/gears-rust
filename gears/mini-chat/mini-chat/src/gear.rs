@@ -53,7 +53,7 @@ pub const DEFAULT_URL_PREFIX: &str = "/mini-chat";
 /// The mini-chat gear: multi-tenant AI chat with SSE streaming.
 #[toolkit::gear(
     name = "mini-chat",
-    deps = ["types-registry", "authn-resolver", "authz-resolver", "oagw"],
+    deps = [types_registry, authn_resolver, authz_resolver, oagw],
     capabilities = [db, rest, stateful],
 )]
 pub struct MiniChatGear {

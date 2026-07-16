@@ -23,7 +23,7 @@ use crate::domain::{CredStoreLocalClient, Service};
 /// registration is needed.
 #[toolkit::gear(
     name = "credstore",
-    deps = ["types-registry"],
+    deps = [types_registry],
     capabilities = [system]
 )]
 pub struct CredStoreGear {

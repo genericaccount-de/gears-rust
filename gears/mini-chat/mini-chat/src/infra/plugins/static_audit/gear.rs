@@ -20,7 +20,7 @@ use super::service::Service;
 /// all emit methods return immediately without logging.
 #[toolkit::gear(
     name = "static-mini-chat-audit-plugin",
-    deps = ["types-registry"]
+    deps = [types_registry]
 )]
 pub struct StaticMiniChatAuditPlugin {
     service: OnceLock<Arc<Service>>,

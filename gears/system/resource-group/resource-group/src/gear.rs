@@ -33,7 +33,7 @@ pub type ConcreteRgService = RgService<GroupRepository, TypeRepository, Membersh
 /// Main gear struct for the resource-group gear.
 #[toolkit::gear(
     name = "resource-group",
-    deps = ["authz-resolver", "types-registry"],
+    deps = [authz_resolver, types_registry],
     capabilities = [db, rest]
 )]
 #[allow(clippy::struct_field_names)]
