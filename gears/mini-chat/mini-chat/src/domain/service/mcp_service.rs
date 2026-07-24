@@ -901,7 +901,84 @@ impl<MSR: McpServerRepository, MTR: McpServerToolRepository, RMSR: RoleMcpServer
                 CompleteOAuthAuthorizationRequest { state, code },
             )
             .await
-            .map_err(map_gateway_err)
+            .map_err(map_gateway_err)?;
+
+        // Eagerly discover the just-connected server's tools with the caller's
+        // context. The background refresh worker runs as the service principal,
+        // which has no per-user auth-code token and therefore can never discover
+        // tools for interactive-OAuth servers; without this, tools would stay
+        // absent until (and unless) a differently-scoped refresh happened to
+        // succeed. Best-effort: discovery failures never fail the connection.
+        self.discover_tools_for_connected_user_servers(ctx).await;
+        Ok(())
+    }
+
+    /// Discover and persist tools for every enabled config-seeded auth-code
+    /// server the caller currently has a stored token for, using the caller's
+    /// context. Invoked after a successful interactive connection so a freshly
+    /// connected server's tools appear without waiting on the service-identity
+    /// background worker (which cannot read per-user tokens).
+    ///
+    /// The completion endpoint is server-agnostic (OAGW returns no id), so all
+    /// connected auth-code servers are probed; discovery for an already-populated
+    /// server is idempotent. Every failure path is logged and swallowed — tool
+    /// discovery must never fail the connection the user just completed.
+    async fn discover_tools_for_connected_user_servers(&self, ctx: &SecurityContext) {
+        let conn = match self.db.conn() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "on-connect MCP tool discovery: db conn failed");
+                return;
+            }
+        };
+        let servers = match self
+            .server_repo
+            .list_by_source(&conn, None, McpSource::Config)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "on-connect MCP tool discovery: list servers failed");
+                return;
+            }
+        };
+        for srv in &servers {
+            if !srv.enabled || srv.auth_kind != McpAuthKind::OAuth2AuthCode {
+                continue;
+            }
+            let Some(upstream_id) = srv.oagw_upstream_id.as_deref() else {
+                continue;
+            };
+            let Ok(upstream_uuid) = Uuid::from_str(upstream_id) else {
+                continue;
+            };
+            // Only discover for servers the caller actually holds a token for;
+            // probing an unconnected server would just 401.
+            match self.gateway.oauth_connection_status(ctx.clone(), upstream_uuid).await {
+                Ok(status) if status.connected => {}
+                Ok(_) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        server = %srv.external_id,
+                        error = %e,
+                        "on-connect MCP tool discovery: connection status check failed"
+                    );
+                    continue;
+                }
+            }
+            match self.refresh_server_tools(&conn, ctx, srv).await {
+                Ok(count) => tracing::info!(
+                    server = %srv.external_id,
+                    tools = count,
+                    "on-connect MCP tool discovery succeeded"
+                ),
+                Err(e) => tracing::warn!(
+                    server = %srv.external_id,
+                    error = %e,
+                    "on-connect MCP tool discovery failed"
+                ),
+            }
+        }
     }
 
     /// Revoke the caller's stored authorization for a server.
